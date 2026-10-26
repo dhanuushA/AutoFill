@@ -1705,12 +1705,87 @@ async def _process_application_turn(
         )
 
     intent = detect_control_intent(text) if text else detect_control_intent("")
+    if intent.kind == "go_back":
+        from .app_stage import application_go_back
+
+        page = getattr(session, "page", None) if session else None
+        if page is None:
+            speech = app_question_for_step(step, session)
+            ctrl.last_speech = speech
+            return TurnResult(
+                speech=speech,
+                phase="application",
+                turn_id=turn_id,
+                detail="go_back_failed",
+            )
+        pending = _app_browser_tasks.get(call_id)
+        if pending is not None and not pending.done():
+            pending.cancel()
+        _begin_elig_navigation(ctrl)
+        result = await application_go_back(call_id, session, page)
+        speech = str(result.get("spoken") or app_question_for_step(step, session))
+        if speech.startswith("ASK: "):
+            speech = speech[5:]
+        ctrl.last_speech = speech
+        ctrl.phase = "application"
+        return TurnResult(
+            speech=speech,
+            phase="application",
+            turn_id=turn_id,
+            detail="go_back" if result.get("ok") else "go_back_failed",
+        )
     if intent.kind == "repeat":
         speech = app_question_for_step(step)
         ctrl.last_speech = speech
         return TurnResult(
             speech=speech, phase="application", turn_id=turn_id, detail="repeat"
         )
+
+    page = getattr(session, "page", None) if session else None
+    if page is not None and text:
+        from .app_stage import (
+            _app_step_parent,
+            _prepare_resume_speech,
+            detect_application_screen,
+            expanded_immigration_active,
+            immigration_member_radios_visible,
+        )
+
+        live = await detect_application_screen(page)
+        radios = False
+        if step in (
+            "app_citizenship",
+            "app_immigration",
+            "app_immigration_who",
+        ) or live in ("app_citizenship", "app_immigration"):
+            radios = await immigration_member_radios_visible(page)
+        if expanded_immigration_active(session, step, live, radios):
+            # The citizenship heading is still on the page. The answer belongs
+            # to the open member radios, including after No was already saved.
+            if step not in ("app_immigration", "app_immigration_who"):
+                session.app_step = "app_immigration"
+                step = "app_immigration"
+                logger.info(
+                    "application_immigration_restored call_id=%s",
+                    call_id,
+                )
+        elif live and _app_step_parent(live) != _app_step_parent(step):
+            synced_step, speech = await _prepare_resume_speech(session, page, live)
+            session.app_step = synced_step
+            ctrl.last_speech = speech
+            ctrl.phase = "application"
+            logger.info(
+                "application_resynced call_id=%s from=%s to=%s",
+                call_id,
+                step,
+                synced_step,
+            )
+            return TurnResult(
+                speech=speech,
+                phase="application",
+                turn_id=turn_id,
+                detail="app_resynced",
+            )
 
     if not text:
         speech = app_question_for_step(step)

@@ -8276,11 +8276,11 @@ class StageEYesNoResolverTests(unittest.IsolatedAsyncioTestCase):
                 "cit-no", session, AsyncMock(), "No", 0.0
             )
         click.assert_awaited_once_with(ANY, False)
-        self.assertTrue(result.get("ok"))
-        # Empty scrape falls back to asking which members need a status.
-        self.assertEqual(result.get("step"), "app_immigration_who")
-        self.assertEqual(session.app_step, "app_immigration_who")
-        self.assertIn("which household members", (result.get("spoken") or "").lower())
+        self.assertFalse(result.get("ok"))
+        self.assertEqual(result.get("error"), "citizenship_members_missing")
+        self.assertEqual(result.get("step"), "app_citizenship")
+        self.assertEqual(session.app_step, "app_citizenship")
+        self.assertIn("member", (result.get("spoken") or "").lower())
 
     async def test_repeated_yes_reconciles_when_browser_already_on_insurance(
         self,
@@ -8985,7 +8985,9 @@ class StageEResumeDobImmigrationTests(unittest.IsolatedAsyncioTestCase):
                 "imm-flow", session, page, "Satisfactory immigration status", 0.0
             )
         set_status.assert_awaited_once_with(
-            page, "Mickey Mouse", "Satisfactory immigration status"
+            page,
+            "Mickey Mouse",
+            "Satisfactory immigration status (green card, etc.)",
         )
         self.assertEqual(status.get("step"), "app_immigration")
         self.assertIn("angel", (status.get("spoken") or "").lower())
@@ -9067,10 +9069,141 @@ class StageEResumeDobImmigrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             _map_immigration_status("he has a green card"),
-            "Satisfactory immigration status",
+            "Satisfactory immigration status (green card, etc.)",
         )
         self.assertEqual(_map_immigration_status("citizen"), "U.S. Citizen")
         self.assertEqual(_map_immigration_status("national"), "U.S. National")
+        self.assertIsNone(_map_immigration_status("citizen or national"))
+        self.assertIsNone(_map_immigration_status("not a citizen"))
+
+    def test_citizenship_question_uses_listed_names(self) -> None:
+        from pc_liveagent.app_stage import _citizenship_question, _split_listed_names
+
+        self.assertEqual(
+            _split_listed_names("Agent and john"),
+            ["Agent", "john"],
+        )
+        self.assertEqual(
+            _citizenship_question(["Agent", "john"]),
+            "Are Agent and john all U.S. Citizens? Please say Yes or No.",
+        )
+        self.assertEqual(
+            _citizenship_question(["Don"]),
+            "Is Don a U.S. Citizen? Please say Yes or No.",
+        )
+
+    def test_named_status_stays_with_that_member(self) -> None:
+        from pc_liveagent.app_stage import _parse_immigration_assignment
+
+        members = [
+            {"name": "Agent", "selected": "U.S. Citizen"},
+            {"name": "john", "selected": "U.S. Citizen"},
+            {"name": "Don", "selected": "U.S. Citizen"},
+        ]
+        name, status, clarify = _parse_immigration_assignment(
+            "john has a green card", members, "Agent"
+        )
+        self.assertIsNone(clarify)
+        self.assertEqual(name, "john")
+        self.assertEqual(status, "Satisfactory immigration status (green card, etc.)")
+        name, status, clarify = _parse_immigration_assignment(
+            "Agent is a U.S. National", members, "john"
+        )
+        self.assertIsNone(clarify)
+        self.assertEqual((name, status), ("Agent", "U.S. National"))
+        name, status, clarify = _parse_immigration_assignment(
+            "Don is a citizen", members, "Agent"
+        )
+        self.assertIsNone(clarify)
+        self.assertEqual((name, status), ("Don", "U.S. Citizen"))
+        _name, _status, clarify = _parse_immigration_assignment(
+            "Alex has a green card", members, "Agent"
+        )
+        self.assertIsNotNone(clarify)
+        _name, _status, clarify = _parse_immigration_assignment(
+            "john and Don are citizens", members, "Agent"
+        )
+        self.assertIsNotNone(clarify)
+
+    async def test_preselected_citizen_is_not_clicked_again(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="imm-default",
+            url="https://example.test",
+            app_step="app_immigration",
+        )
+        session.filled["app_immigration_current"] = "Don"
+        session.filled["app_immigration_queue"] = '["Don", "Agent"]'
+        session.filled["app_citizenship_no"] = "1"
+        members = [
+            {"name": "Don", "selected": "U.S. Citizen", "index": 0},
+            {"name": "Agent", "selected": "U.S. Citizen", "index": 1},
+        ]
+        page = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_immigration"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_immigration_members",
+                new=AsyncMock(return_value=members),
+            ),
+            patch(
+                "pc_liveagent.app_stage._set_member_immigration_status",
+                new=AsyncMock(return_value=True),
+            ) as set_status,
+            patch(
+                "pc_liveagent.app_stage._verify_member_immigration_status",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_next_or_continue",
+                new=AsyncMock(return_value=True),
+            ) as nxt,
+        ):
+            result = await submit_application_answer(
+                "imm-default", session, page, "Don is a citizen", 0.0
+            )
+        set_status.assert_awaited_once()
+        self.assertEqual(set_status.await_args.args[1], "Don")
+        self.assertEqual(set_status.await_args.args[2], "U.S. Citizen")
+        nxt.assert_not_awaited()
+        self.assertEqual(result.get("step"), "app_immigration")
+        self.assertIn("agent", (result.get("spoken") or "").lower())
+        self.assertEqual(
+            session.filled.get("app_immigration_confirmed"),
+            '{"Don": "U.S. Citizen"}',
+        )
+
+    async def test_citizenship_member_sentence_does_not_click_yes_no(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="cit-name",
+            url="https://example.test",
+            app_step="app_citizenship",
+        )
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_citizenship"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_yes_no",
+                new=AsyncMock(side_effect=AssertionError("must not click")),
+            ),
+        ):
+            result = await submit_application_answer(
+                "cit-name", session, AsyncMock(), "john has a green card", 0.0
+            )
+        self.assertFalse(result.get("ok"))
+        self.assertEqual(result.get("error"), "citizenship_clarify")
+        self.assertEqual(session.app_step, "app_citizenship")
 
     async def test_insurance_yes_members_then_coverage_types(self) -> None:
         from pc_liveagent.app_stage import submit_application_answer
@@ -9103,10 +9236,10 @@ class StageEResumeDobImmigrationTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch(
                 "pc_liveagent.app_stage._click_yes_no",
-                new=AsyncMock(return_value="Yes"),
+                new=AsyncMock(return_value="Yes — Someone has coverage"),
             ),
             patch(
-                "pc_liveagent.app_stage._scrape_insurance_members",
+                "pc_liveagent.app_stage._scrape_coverage_members",
                 new=AsyncMock(return_value=members),
             ),
         ):
@@ -9114,6 +9247,20 @@ class StageEResumeDobImmigrationTests(unittest.IsolatedAsyncioTestCase):
                 "ins-flow", session, page, "Yes", 0.0
             )
         self.assertEqual(first.get("step"), "app_insurance_members")
+        self.assertIn("mickey", (first.get("spoken") or "").lower())
+        self.assertIn("angel", (first.get("spoken") or "").lower())
+
+        state = {"members": [dict(item) for item in members]}
+
+        async def _scrape(_page):
+            return [dict(item) for item in state["members"]]
+
+        async def _check(_page, name, checked=True):
+            for item in state["members"]:
+                if item["name"].lower() == name.lower():
+                    item["checked"] = checked
+                    return True
+            return False
 
         with (
             patch(
@@ -9121,39 +9268,32 @@ class StageEResumeDobImmigrationTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(return_value="app_insurance"),
             ),
             patch(
-                "pc_liveagent.app_stage._scrape_insurance_members",
-                new=AsyncMock(return_value=members),
+                "pc_liveagent.app_stage._scrape_coverage_members",
+                new=AsyncMock(side_effect=_scrape),
             ),
             patch(
                 "pc_liveagent.app_stage._set_member_insurance_checked",
-                new=AsyncMock(return_value=True),
+                new=AsyncMock(side_effect=_check),
             ) as check,
+            patch(
+                "pc_liveagent.app_stage._next_button_enabled",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_next_or_continue",
+                new=AsyncMock(return_value=True),
+            ) as nxt,
+            patch(
+                "pc_liveagent.app_stage._advance_after_answer",
+                new=AsyncMock(return_value="app_insurance_coverage_type"),
+            ),
         ):
             who = await submit_application_answer(
                 "ins-flow", session, page, "Mickey and Angel", 0.0
             )
         self.assertEqual(check.await_count, 2)
-        self.assertEqual(who.get("step"), "app_insurance_members")
-
-        checked = [
-            {**members[0], "checked": True},
-            {**members[1], "checked": True},
-        ]
-        with (
-            patch(
-                "pc_liveagent.app_stage.detect_application_screen",
-                new=AsyncMock(return_value="app_insurance"),
-            ),
-            patch(
-                "pc_liveagent.app_stage._scrape_insurance_members",
-                new=AsyncMock(return_value=checked),
-            ),
-        ):
-            cont = await submit_application_answer(
-                "ins-flow", session, page, "continue", 0.0
-            )
-        self.assertEqual(cont.get("step"), "app_insurance_coverage_type")
-        self.assertIn("mickey", (cont.get("spoken") or "").lower())
+        nxt.assert_awaited()
+        self.assertEqual(who.get("step"), "app_insurance_coverage_type")
 
         with (
             patch(
@@ -9194,6 +9334,182 @@ class StageEResumeDobImmigrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set_cov.await_count, 2)
         self.assertEqual(cov.get("step"), "app_insurance_coverage_type")
         self.assertIn("medicare", (cov.get("spoken") or "").lower())
+
+    def test_coverage_question_uses_listed_names(self) -> None:
+        from pc_liveagent.app_stage import (
+            _coverage_question,
+            _who_has_coverage_question,
+            resolve_stage_e_yes_no_label,
+        )
+
+        self.assertEqual(
+            _coverage_question(["Agent", "john"]),
+            "Do Agent and john have health insurance or health coverage? "
+            "Please say Yes or No.",
+        )
+        self.assertIn("Agent and john", _who_has_coverage_question(["Agent", "john"]))
+        labels = [
+            "Yes — Someone has coverage",
+            "No — No one has coverage",
+        ]
+        self.assertEqual(resolve_stage_e_yes_no_label(True, labels), labels[0])
+        self.assertEqual(resolve_stage_e_yes_no_label(False, labels), labels[1])
+
+    async def test_coverage_no_goes_next_without_member_selection(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="cov-no",
+            url="https://example.test",
+            app_step="app_insurance",
+        )
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_insurance"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_yes_no",
+                new=AsyncMock(return_value="No — No one has coverage"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_coverage_members",
+                new=AsyncMock(side_effect=AssertionError("must not list members")),
+            ),
+            patch(
+                "pc_liveagent.app_stage._set_member_insurance_checked",
+                new=AsyncMock(side_effect=AssertionError("must not check members")),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_next_or_continue",
+                new=AsyncMock(return_value=True),
+            ) as nxt,
+            patch(
+                "pc_liveagent.app_stage._advance_after_answer",
+                new=AsyncMock(return_value="app_dob_review"),
+            ),
+        ):
+            result = await submit_application_answer(
+                "cov-no", session, AsyncMock(), "No", 0.0
+            )
+        nxt.assert_awaited()
+        self.assertEqual(result.get("step"), "app_dob_review")
+        self.assertNotEqual(session.app_step, "app_insurance_members")
+
+    async def test_coverage_empty_selection_does_not_click_next(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="cov-empty",
+            url="https://example.test",
+            app_step="app_insurance_members",
+        )
+        members = [
+            {"name": "Agent", "checked": False, "index": 0},
+            {"name": "john", "checked": False, "index": 1},
+        ]
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_insurance"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_coverage_members",
+                new=AsyncMock(return_value=members),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_next_or_continue",
+                new=AsyncMock(side_effect=AssertionError("must not click next")),
+            ),
+        ):
+            result = await submit_application_answer(
+                "cov-empty", session, AsyncMock(), "continue", 0.0
+            )
+        self.assertFalse(result.get("ok"))
+        self.assertEqual(result.get("error"), "insurance_members_incomplete")
+        self.assertEqual(session.app_step, "app_insurance_members")
+        self.assertIn("who has coverage", (result.get("spoken") or "").lower())
+
+    async def test_coverage_ambiguous_name_does_not_click(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="cov-amb",
+            url="https://example.test",
+            app_step="app_insurance_members",
+        )
+        members = [
+            {"name": "John D.", "checked": False, "index": 0},
+            {"name": "John M.", "checked": False, "index": 1},
+        ]
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_insurance"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_coverage_members",
+                new=AsyncMock(return_value=members),
+            ),
+            patch(
+                "pc_liveagent.app_stage._set_member_insurance_checked",
+                new=AsyncMock(side_effect=AssertionError("must not check")),
+            ),
+        ):
+            result = await submit_application_answer(
+                "cov-amb", session, AsyncMock(), "John", 0.0
+            )
+        self.assertFalse(result.get("ok"))
+        self.assertEqual(result.get("error"), "insurance_members_ambiguous")
+        self.assertEqual(session.app_step, "app_insurance_members")
+
+    async def test_already_checked_coverage_box_is_not_clicked_again(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="cov-already",
+            url="https://example.test",
+            app_step="app_insurance_members",
+        )
+        members = [
+            {"name": "Agent", "checked": True, "index": 0},
+            {"name": "john", "checked": False, "index": 1},
+        ]
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_insurance"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_coverage_members",
+                new=AsyncMock(return_value=members),
+            ),
+            patch(
+                "pc_liveagent.app_stage._set_member_insurance_checked",
+                new=AsyncMock(side_effect=AssertionError("must not click")),
+            ),
+            patch(
+                "pc_liveagent.app_stage._next_button_enabled",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_next_or_continue",
+                new=AsyncMock(return_value=True),
+            ) as nxt,
+            patch(
+                "pc_liveagent.app_stage._advance_after_answer",
+                new=AsyncMock(return_value="app_dob_review"),
+            ),
+        ):
+            result = await submit_application_answer(
+                "cov-already", session, AsyncMock(), "Agent", 0.0
+            )
+        nxt.assert_awaited()
+        self.assertEqual(result.get("step"), "app_dob_review")
 
     def test_map_coverage_types(self) -> None:
         from pc_liveagent.app_stage import _map_coverage_types
@@ -9664,6 +9980,258 @@ class StageEResumeDobImmigrationTests(unittest.IsolatedAsyncioTestCase):
         agent = next(c for c in cards if c["name"] == "Agent H.")
         self.assertTrue(agent.get("needs_add"))
 
+    def test_parse_dob_natural_formats_and_limits(self) -> None:
+        from datetime import date
+
+        from pc_liveagent.app_stage import _parse_dob_answer
+        from pc_liveagent.live_form import _normalize_dob
+
+        accepted = {
+            "01/23/2001": "01/23/2001",
+            "23/01/2001": "01/23/2001",
+            "2001-01-23": "01/23/2001",
+            "01-23-2001": "01/23/2001",
+            "23-01-2001": "01/23/2001",
+            "01.23.2001": "01/23/2001",
+            "23.01.2001": "01/23/2001",
+            "2001.01.23": "01/23/2001",
+            "January 23, 2001": "01/23/2001",
+            "Jan 23, 2001": "01/23/2001",
+            "Nov 2, 2000": "11/02/2000",
+            "23 January 2001": "01/23/2001",
+            "23 Jan 2001": "01/23/2001",
+            "November 23rd, 2001": "11/23/2001",
+            "November 2nd, 2000": "11/02/2000",
+            "March 1st, 1990": "03/01/1990",
+            "November twenty-third, two thousand one": "11/23/2001",
+            "the second of December, nineteen ninety-five": "12/02/1995",
+            "02/29/2000": "02/29/2000",
+            "02/29/2024": "02/29/2024",
+        }
+        for raw, expected in accepted.items():
+            self.assertEqual(_parse_dob_answer(raw), (expected, None), raw)
+        self.assertEqual(_parse_dob_answer("02/29/1900"), (None, None))
+        self.assertEqual(_parse_dob_answer("02/29/2019"), (None, None))
+        self.assertEqual(_normalize_dob("10/11/2024"), "10/11/2024")
+        ambiguous, note = _parse_dob_answer("05.06.2001")
+        self.assertIsNone(ambiguous)
+        self.assertIn("ambiguous", (note or "").lower())
+        month_only, month_note = _parse_dob_answer("November")
+        self.assertIsNone(month_only)
+        self.assertIn("day", (month_note or "").lower())
+        self.assertIn("year", (month_note or "").lower())
+        day_only, day_note = _parse_dob_answer("the 23rd")
+        self.assertIsNone(day_only)
+        self.assertIn("month", (day_note or "").lower())
+        year_note = _parse_dob_answer("01/23/01")[1] or ""
+        self.assertIn("century", year_note.lower())
+        future, future_note = _parse_dob_answer("01/01/2099")
+        self.assertIsNone(future)
+        self.assertIn("future", (future_note or "").lower())
+        today = date.today()
+        if today.month == 12 and today.day == 31:
+            return
+        tomorrow = date.fromordinal(today.toordinal() + 1)
+        spoken_tomorrow = f"{tomorrow.month:02d}/{tomorrow.day:02d}/{tomorrow.year}"
+        self.assertIn("future", (_parse_dob_answer(spoken_tomorrow)[1] or "").lower())
+
+    async def test_existing_dob_is_not_rewritten(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="dob-keep",
+            url="https://example.test",
+            app_step="app_dob_collect",
+        )
+        session.filled["app_dob_current"] = "Murali M."
+        session.filled["app_dob_queue"] = '["Murali M."]'
+        cards = [
+            {"name": "Murali M.", "dob": "01/02/1990", "needs_add": False, "index": 0},
+            {"name": "Mickey Mouse", "dob": "", "needs_add": True, "index": 1},
+        ]
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_dob_review"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_dob_cards",
+                new=AsyncMock(return_value=cards),
+            ),
+            patch(
+                "pc_liveagent.app_stage._fill_and_save_dob",
+                new=AsyncMock(return_value=True),
+            ) as fill,
+            patch(
+                "pc_liveagent.app_stage._click_member_add_dob",
+                new=AsyncMock(return_value=True),
+            ) as click,
+            patch(
+                "pc_liveagent.app_stage._verify_member_dob",
+                new=AsyncMock(return_value=True),
+            ),
+        ):
+            result = await submit_application_answer(
+                "dob-keep", session, AsyncMock(), "January 2, 1990", 0.0
+            )
+        fill.assert_not_awaited()
+        click.assert_not_awaited()
+        self.assertTrue(result.get("ok"))
+        self.assertEqual(session.app_step, "app_dob_collect")
+
+    async def test_different_saved_dob_is_not_overwritten(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="dob-exist",
+            url="https://example.test",
+            app_step="app_dob_collect",
+        )
+        session.filled["app_dob_current"] = "Murali M."
+        session.filled["app_dob_queue"] = '["Murali M."]'
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_dob_review"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_dob_cards",
+                new=AsyncMock(
+                    return_value=[
+                        {
+                            "name": "Murali M.",
+                            "dob": "01/02/1990",
+                            "needs_add": False,
+                            "index": 0,
+                        }
+                    ]
+                ),
+            ),
+            patch(
+                "pc_liveagent.app_stage._fill_and_save_dob",
+                new=AsyncMock(return_value=True),
+            ) as fill,
+        ):
+            result = await submit_application_answer(
+                "dob-exist", session, AsyncMock(), "March 15 2018", 0.0
+            )
+        fill.assert_not_awaited()
+        self.assertEqual(result.get("error"), "dob_existing")
+        self.assertEqual(session.app_step, "app_dob_collect")
+
+    async def test_other_member_dob_change_blocks_progress(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="dob-wrong",
+            url="https://example.test",
+            app_step="app_dob_collect",
+        )
+        session.filled["app_dob_current"] = "Mickey Mouse"
+        session.filled["app_dob_queue"] = '["Mickey Mouse"]'
+        before = [
+            {"name": "Mickey Mouse", "dob": "", "needs_add": True, "index": 0},
+            {"name": "Murali M.", "dob": "01/02/1990", "needs_add": False, "index": 1},
+        ]
+        after = [
+            {"name": "Mickey Mouse", "dob": "03/15/2018", "needs_add": False, "index": 0},
+            {"name": "Murali M.", "dob": "03/15/2018", "needs_add": False, "index": 1},
+        ]
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_dob_review"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_dob_cards",
+                new=AsyncMock(side_effect=[before, after]),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_member_add_dob",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "pc_liveagent.app_stage._fill_and_save_dob",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "pc_liveagent.app_stage._verify_member_dob",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_next_or_continue",
+                new=AsyncMock(return_value=True),
+            ) as nxt,
+        ):
+            result = await submit_application_answer(
+                "dob-wrong", session, AsyncMock(), "March 15 2018", 0.0
+            )
+        nxt.assert_not_awaited()
+        self.assertEqual(result.get("error"), "dob_wrong_member")
+        self.assertEqual(session.app_step, "app_dob_collect")
+
+    async def test_missing_dob_does_not_click_next(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="dob-next",
+            url="https://example.test",
+            app_step="app_dob_review",
+        )
+        cards = [
+            {"name": "Mickey Mouse", "dob": "", "needs_add": False, "index": 0}
+        ]
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_dob_review"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_dob_cards",
+                new=AsyncMock(return_value=cards),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_next_or_continue",
+                new=AsyncMock(return_value=True),
+            ) as nxt,
+        ):
+            result = await submit_application_answer(
+                "dob-next", session, AsyncMock(), "Yes", 0.0
+            )
+        nxt.assert_not_awaited()
+        self.assertEqual(result.get("step"), "app_dob_collect")
+
+    async def test_save_validation_error_is_not_success(self) -> None:
+        from pc_liveagent.app_stage import _fill_and_save_dob
+
+        page = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+        page.evaluate = AsyncMock(return_value=True)
+        with (
+            patch(
+                "pc_liveagent.app_stage._inspect_dob_editor",
+                new=AsyncMock(return_value={"count": 3, "hasSave": True}),
+            ),
+            patch(
+                "pc_liveagent.app_stage._fill_dob_editor_fields",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "pc_liveagent.app_stage._read_dob_editor_value",
+                new=AsyncMock(return_value="03/15/2018"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_dob_save",
+                new=AsyncMock(return_value=True),
+            ),
+        ):
+            ok = await _fill_and_save_dob(page, "03/15/2018", "Mickey Mouse")
+        self.assertFalse(ok)
+
 
 class FullCallFlowIntegrationTests(unittest.IsolatedAsyncioTestCase):
     """Intro → Stage D → programs consent → Stage E with shortcuts off."""
@@ -9980,6 +10548,555 @@ class FullCallFlowIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.filled.get("programs_permission_speech"), speech)
 
 
+class AddressStageTests(unittest.IsolatedAsyncioTestCase):
+    def test_street_unit_split_and_suggestion_match(self) -> None:
+        from pc_liveagent.app_stage import _split_street_and_unit, _suggestion_matches
+
+        street, unit = _split_street_and_unit("123 Main St apartment 4")
+        self.assertEqual(street, "123 Main St")
+        self.assertEqual(unit, "4")
+        suggestions = [
+            "999 Other Rd, Austin, TX 78701",
+            "123 Main St, San Jose, CA 95112",
+            "123 Main St, Austin, TX 78701",
+        ]
+        self.assertEqual(
+            _suggestion_matches("123 Main St", suggestions[:2]),
+            ["123 Main St, San Jose, CA 95112"],
+        )
+        self.assertEqual(
+            _suggestion_matches("123 Main St", suggestions[1:]),
+            suggestions[1:],
+        )
+        self.assertEqual(_suggestion_matches("500 Oak Ave", suggestions), [])
+
+    async def test_saved_addresses_are_confirmed_before_next(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="addr-review",
+            url="https://example.test",
+            app_step="app_address_review",
+        )
+        cards = [
+            {
+                "name": "Mickey Mouse",
+                "home": "10 First St",
+                "mailing": "Same mailing address",
+                "home_same": False,
+                "mailing_same": True,
+                "no_home": False,
+                "no_mailing": False,
+                "needs_home": False,
+                "needs_mailing": False,
+                "needs_add": False,
+            },
+            {
+                "name": "Murali M.",
+                "home": "Same home address",
+                "mailing": "200 Oak Ave",
+                "home_same": True,
+                "mailing_same": False,
+                "no_home": False,
+                "no_mailing": False,
+                "needs_home": False,
+                "needs_mailing": False,
+                "needs_add": False,
+            },
+        ]
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_address_review"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_address_cards",
+                new=AsyncMock(return_value=cards),
+            ),
+            patch(
+                "pc_liveagent.app_stage._commit_member_address",
+                new=AsyncMock(return_value={"ok": True}),
+            ) as commit,
+            patch(
+                "pc_liveagent.app_stage._click_stage_next",
+                new=AsyncMock(side_effect=AssertionError("must not advance")),
+            ),
+        ):
+            first = await submit_application_answer(
+                "addr-review", session, AsyncMock(), "Yes", 0.0
+            )
+        commit.assert_not_awaited()
+        self.assertTrue(first.get("ok"))
+        self.assertEqual(first.get("step"), "app_address_review")
+        self.assertIn("same mailing", (first.get("spoken") or "").lower())
+        self.assertIn("mickey", (first.get("spoken") or "").lower())
+
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_address_review"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_address_cards",
+                new=AsyncMock(return_value=cards),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_stage_next",
+                new=AsyncMock(side_effect=AssertionError("must not advance")),
+            ),
+        ):
+            second = await submit_application_answer(
+                "addr-review", session, AsyncMock(), "Yes", 0.0
+            )
+        self.assertIn("same home", (second.get("spoken") or "").lower())
+        self.assertEqual(session.app_step, "app_address_review")
+
+    async def test_yes_after_review_syncs_detected_screen(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="addr-next",
+            url="https://example.test",
+            app_step="app_address_review",
+        )
+        session.filled["app_address_confirmed"] = '["Mickey Mouse"]'
+        session.filled["app_address_ready"] = "1"
+        cards = [
+            {
+                "name": "Mickey Mouse",
+                "home": "10 First St",
+                "mailing": "Same mailing address",
+                "mailing_same": True,
+                "needs_add": False,
+                "needs_home": False,
+                "needs_mailing": False,
+            }
+        ]
+        page = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(side_effect=["app_address_review", "app_marital_review"]),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_address_cards",
+                new=AsyncMock(return_value=cards),
+            ),
+            patch(
+                "pc_liveagent.app_stage._next_button_enabled",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_stage_next",
+                new=AsyncMock(return_value=True),
+            ) as nxt,
+            patch(
+                "pc_liveagent.app_stage._advance_after_answer",
+                new=AsyncMock(side_effect=AssertionError("must detect the screen")),
+            ),
+        ):
+            result = await submit_application_answer(
+                "addr-next", session, page, "Yes", 0.0
+            )
+        nxt.assert_awaited_once()
+        self.assertEqual(result.get("step"), "app_marital_review")
+
+    async def test_disabled_next_stays_on_address(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="addr-disabled",
+            url="https://example.test",
+            app_step="app_address_review",
+        )
+        session.filled["app_address_confirmed"] = '["Mickey Mouse"]'
+        session.filled["app_address_ready"] = "1"
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_address_review"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_address_cards",
+                new=AsyncMock(
+                    return_value=[
+                        {
+                            "name": "Mickey Mouse",
+                            "home": "10 First St",
+                            "mailing": "10 First St",
+                            "needs_add": False,
+                            "needs_home": False,
+                            "needs_mailing": False,
+                        }
+                    ]
+                ),
+            ),
+            patch(
+                "pc_liveagent.app_stage._next_button_enabled",
+                new=AsyncMock(return_value=False),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_stage_next",
+                new=AsyncMock(side_effect=AssertionError("must not advance")),
+            ),
+        ):
+            result = await submit_application_answer(
+                "addr-disabled", session, AsyncMock(), "Yes", 0.0
+            )
+        self.assertEqual(result.get("error"), "address_next_disabled")
+        self.assertEqual(session.app_step, "app_address_review")
+
+    async def test_edit_one_member_does_not_touch_another(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="addr-edit",
+            url="https://example.test",
+            app_step="app_address_review",
+        )
+        session.filled["app_address_current"] = "Mickey Mouse"
+        session.filled["app_address_field"] = "mailing"
+        saved = {
+            "name": "Mickey Mouse",
+            "home": "10 First St",
+            "mailing": "200 Oak Ave",
+            "mailing_same": False,
+            "needs_home": False,
+            "needs_mailing": False,
+            "needs_add": False,
+        }
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_address_review"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_address_cards",
+                new=AsyncMock(
+                    return_value=[
+                        saved,
+                        {
+                            "name": "Murali M.",
+                            "home": "9 Pine St",
+                            "mailing": "Same mailing address",
+                            "mailing_same": True,
+                            "needs_add": False,
+                            "needs_home": False,
+                            "needs_mailing": False,
+                        },
+                    ]
+                ),
+            ),
+            patch(
+                "pc_liveagent.app_stage._commit_member_address",
+                new=AsyncMock(return_value={"ok": True, "card": saved}),
+            ) as commit,
+            patch(
+                "pc_liveagent.app_stage._click_stage_next",
+                new=AsyncMock(side_effect=AssertionError("must not advance")),
+            ),
+        ):
+            result = await submit_application_answer(
+                "addr-edit", session, AsyncMock(), "200 Oak Ave", 0.0
+            )
+        commit.assert_awaited_once()
+        self.assertEqual(commit.await_args.args[1], "Mickey Mouse")
+        self.assertEqual(commit.await_args.args[2], "mailing")
+        self.assertTrue(result.get("ok"))
+        self.assertEqual(result.get("step"), "app_address_review")
+        self.assertNotIn("9 pine", (result.get("spoken") or "").lower())
+
+    async def test_unclear_field_does_not_save(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="addr-which",
+            url="https://example.test",
+            app_step="app_address_review",
+        )
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_address_review"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_address_cards",
+                new=AsyncMock(
+                    return_value=[
+                        {
+                            "name": "Mickey Mouse",
+                            "home": "10 First St",
+                            "mailing": "200 Oak Ave",
+                            "needs_add": False,
+                            "needs_home": False,
+                            "needs_mailing": False,
+                        }
+                    ]
+                ),
+            ),
+            patch(
+                "pc_liveagent.app_stage._commit_member_address",
+                new=AsyncMock(return_value={"ok": True}),
+            ) as commit,
+        ):
+            result = await submit_application_answer(
+                "addr-which", session, AsyncMock(), "10 First St", 0.0
+            )
+        commit.assert_not_awaited()
+        self.assertEqual(result.get("error"), "address_field_needed")
+        self.assertIn("home", (result.get("spoken") or "").lower())
+        self.assertIn("mailing", (result.get("spoken") or "").lower())
+
+    async def test_ambiguous_suggestion_does_not_save(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="addr-amb",
+            url="https://example.test",
+            app_step="app_address_review",
+        )
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_address_review"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_address_cards",
+                new=AsyncMock(
+                    return_value=[
+                        {
+                            "name": "Mickey Mouse",
+                            "home": "",
+                            "mailing": "200 Oak Ave",
+                            "needs_home": True,
+                            "needs_mailing": False,
+                            "needs_add": True,
+                        }
+                    ]
+                ),
+            ),
+            patch(
+                "pc_liveagent.app_stage._commit_member_address",
+                new=AsyncMock(
+                    return_value={
+                        "ok": False,
+                        "error": "address_ambiguous",
+                        "suggestions": ["123 Main St, San Jose", "123 Main St, Austin"],
+                    }
+                ),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_stage_next",
+                new=AsyncMock(side_effect=AssertionError("must not advance")),
+            ),
+        ):
+            result = await submit_application_answer(
+                "addr-amb",
+                session,
+                AsyncMock(),
+                "home address 123 Main St",
+                0.0,
+            )
+        self.assertEqual(result.get("error"), "address_ambiguous")
+        self.assertEqual(session.app_step, "app_address_review")
+
+    async def test_failed_save_stays_on_address(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="addr-save",
+            url="https://example.test",
+            app_step="app_address_review",
+        )
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_address_review"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_address_cards",
+                new=AsyncMock(
+                    return_value=[
+                        {
+                            "name": "Mickey Mouse",
+                            "needs_home": True,
+                            "needs_mailing": False,
+                            "needs_add": True,
+                        }
+                    ]
+                ),
+            ),
+            patch(
+                "pc_liveagent.app_stage._commit_member_address",
+                new=AsyncMock(return_value={"ok": False, "error": "address_save_failed"}),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_stage_next",
+                new=AsyncMock(side_effect=AssertionError("must not advance")),
+            ),
+        ):
+            result = await submit_application_answer(
+                "addr-save", session, AsyncMock(), "123 Main St", 0.0
+            )
+        self.assertEqual(result.get("error"), "address_save_failed")
+        self.assertEqual(session.app_step, "app_address_review")
+
+    async def test_no_home_address_is_saved_for_the_named_member(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="addr-none",
+            url="https://example.test",
+            app_step="app_address_review",
+        )
+        before = [
+            {
+                "name": "Mickey Mouse",
+                "home": "",
+                "mailing": "200 Oak Ave",
+                "no_home": False,
+                "no_mailing": False,
+                "needs_home": True,
+                "needs_mailing": False,
+                "needs_add": True,
+            },
+            {
+                "name": "Murali M.",
+                "home": "9 Pine St",
+                "mailing": "Same mailing address",
+                "mailing_same": True,
+                "no_home": False,
+                "no_mailing": False,
+                "needs_add": False,
+                "needs_home": False,
+                "needs_mailing": False,
+            },
+        ]
+        after = [
+            {
+                "name": "Mickey Mouse",
+                "home": "",
+                "mailing": "200 Oak Ave",
+                "no_home": True,
+                "no_mailing": False,
+                "needs_home": False,
+                "needs_mailing": False,
+                "needs_add": False,
+            },
+            before[1],
+        ]
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_address_review"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_address_cards",
+                new=AsyncMock(side_effect=[before, after]),
+            ),
+            patch(
+                "pc_liveagent.app_stage._open_member_address_editor",
+                new=AsyncMock(return_value=True),
+            ) as opened,
+            patch(
+                "pc_liveagent.app_stage._set_member_no_address",
+                new=AsyncMock(return_value=True),
+            ) as checked,
+            patch(
+                "pc_liveagent.app_stage._click_member_address_action",
+                new=AsyncMock(return_value=True),
+            ) as action,
+            patch(
+                "pc_liveagent.app_stage._address_validation_visible",
+                new=AsyncMock(return_value=False),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_stage_next",
+                new=AsyncMock(side_effect=AssertionError("must not advance")),
+            ),
+        ):
+            result = await submit_application_answer(
+                "addr-none",
+                session,
+                AsyncMock(),
+                "No Home Address for Mickey Mouse",
+                0.0,
+            )
+        opened.assert_awaited_once()
+        self.assertEqual(opened.await_args.args[1], "Mickey Mouse")
+        self.assertEqual(checked.await_args.args[2], "home")
+        self.assertEqual(action.await_args.args[2], "save")
+        self.assertTrue(result.get("ok"))
+        self.assertEqual(result.get("step"), "app_address_review")
+
+    async def test_cancel_restores_snapshot_without_saving(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="addr-cancel",
+            url="https://example.test",
+            app_step="app_address_review",
+        )
+        session.filled["app_address_current"] = "Mickey Mouse"
+        session.filled["app_address_snapshot"] = (
+            '{"name":"Mickey Mouse","home":"10 First St","mailing":"Same mailing address"}'
+        )
+        draft = {
+            "name": "Mickey Mouse",
+            "home": "999 Other Rd",
+            "mailing": "Same mailing address",
+            "expanded": True,
+            "needs_add": False,
+            "needs_home": False,
+            "needs_mailing": False,
+        }
+        restored = {
+            "name": "Mickey Mouse",
+            "home": "10 First St",
+            "mailing": "Same mailing address",
+            "mailing_same": True,
+            "expanded": False,
+            "needs_add": False,
+            "needs_home": False,
+            "needs_mailing": False,
+        }
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_address_review"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_address_cards",
+                new=AsyncMock(side_effect=[[draft], [restored]]),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_member_address_action",
+                new=AsyncMock(return_value=True),
+            ) as action,
+            patch(
+                "pc_liveagent.app_stage._commit_member_address",
+                new=AsyncMock(side_effect=AssertionError("must not save")),
+            ),
+        ):
+            result = await submit_application_answer(
+                "addr-cancel", session, AsyncMock(), "cancel", 0.0
+            )
+        self.assertEqual(action.await_args.args[2], "cancel")
+        self.assertTrue(result.get("ok"))
+        self.assertEqual(result.get("step"), "app_address_review")
+        self.assertIsNone(session.filled.get("app_address_snapshot"))
+
+
 class AddressDetectTests(unittest.IsolatedAsyncioTestCase):
     async def test_detect_address_review_without_add_cue(self) -> None:
         from pc_liveagent.app_stage import detect_application_screen
@@ -9995,6 +11112,1173 @@ class AddressDetectTests(unittest.IsolatedAsyncioTestCase):
         page.url = "https://my.pointcare.com/application"
         page.locator = lambda _s: _Body()
         self.assertEqual(await detect_application_screen(page), "app_address_review")
+
+
+class ApplicationSyncBackDobTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stale_server_step_follows_open_screen(self) -> None:
+        from pc_liveagent.call_turn import (
+            _process_application_turn,
+            drop_controller,
+            get_controller,
+        )
+        from pc_liveagent.live_form import LiveFormSession
+
+        call_id = "sync-later-screen"
+        await drop_controller(call_id)
+        ctrl = await get_controller(call_id)
+        ctrl.phase = "application"
+        session = LiveFormSession(
+            call_id=call_id, url="https://example.test", app_step="app_insurance"
+        )
+        session.page = AsyncMock()
+
+        async def fake_session(_cid: str):
+            return session
+
+        with (
+            patch(
+                "pc_liveagent.call_turn.get_session",
+                new=AsyncMock(side_effect=fake_session),
+            ),
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_dob_review"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._prepare_resume_speech",
+                new=AsyncMock(
+                    return_value=(
+                        "app_dob_collect",
+                        "What is Agent T.'s date of birth?",
+                    )
+                ),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_application_back",
+                new=AsyncMock(side_effect=AssertionError("must not click Back")),
+            ),
+            patch(
+                "pc_liveagent.call_turn.submit_field",
+                new=AsyncMock(side_effect=AssertionError("must not submit")),
+            ),
+        ):
+            result = await _process_application_turn(
+                call_id,
+                ctrl,
+                text="Yes",
+                fp="yes",
+                dedupe_ctx="",
+                turn_id="t1",
+                form_url="https://example.test",
+            )
+        self.assertEqual(result.detail, "app_resynced")
+        self.assertEqual(session.app_step, "app_dob_collect")
+        self.assertIn("Agent T.", result.speech)
+
+    async def test_question_one_server_follows_question_five_screen(self) -> None:
+        from pc_liveagent.call_turn import (
+            _process_application_turn,
+            drop_controller,
+            get_controller,
+        )
+        from pc_liveagent.live_form import LiveFormSession
+
+        call_id = "sync-q1-vs-later"
+        await drop_controller(call_id)
+        ctrl = await get_controller(call_id)
+        session = LiveFormSession(
+            call_id=call_id, url="https://example.test", app_step="app_citizenship"
+        )
+        session.page = AsyncMock()
+
+        async def fake_session(_cid: str):
+            return session
+
+        with (
+            patch(
+                "pc_liveagent.call_turn.get_session",
+                new=AsyncMock(side_effect=fake_session),
+            ),
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_address_review"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._prepare_resume_speech",
+                new=AsyncMock(
+                    return_value=(
+                        "app_address_review",
+                        "Please confirm the home and mailing addresses.",
+                    )
+                ),
+            ),
+            patch(
+                "pc_liveagent.call_turn.submit_field",
+                new=AsyncMock(side_effect=AssertionError("must not submit")),
+            ),
+        ):
+            result = await _process_application_turn(
+                call_id,
+                ctrl,
+                text="Yes",
+                fp="yes-2",
+                dedupe_ctx="",
+                turn_id="t2",
+                form_url="https://example.test",
+            )
+        self.assertEqual(result.detail, "app_resynced")
+        self.assertEqual(session.app_step, "app_address_review")
+        self.assertIn("address", result.speech.lower())
+
+    async def test_new_application_asks_first_screen_only_after_verify(self) -> None:
+        from pc_liveagent.app_stage import _start_application_from_permission
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="new-app", url="https://example.test", elig_step="proceed_application"
+        )
+        page = AsyncMock()
+        page.url = "https://my.pointcare.com/application"
+        with (
+            patch(
+                "pc_liveagent.app_stage.classify_saved_household_page",
+                new=AsyncMock(return_value="programs"),
+            ),
+            patch(
+                "pc_liveagent.app_stage.click_start_applications",
+                new=AsyncMock(return_value="Start Applications"),
+            ),
+            patch(
+                "pc_liveagent.app_stage.wait_for_application_started",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "pc_liveagent.app_stage.store_program_summary",
+                new=AsyncMock(),
+            ),
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_citizenship"),
+            ),
+            patch(
+                "pc_liveagent.app_stage.restart_application_to_first_question",
+                new=AsyncMock(side_effect=AssertionError("must not reset")),
+            ),
+        ):
+            result = await _start_application_from_permission(
+                "new-app", session, page, "Yes"
+            )
+        self.assertTrue(result.get("ok"))
+        self.assertEqual(result.get("step"), "app_citizenship")
+        self.assertIn("citizen", str(result.get("spoken") or "").lower())
+
+    async def test_open_draft_resumes_visible_step_without_back(self) -> None:
+        from pc_liveagent.app_stage import _start_application_from_permission
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="resume-app",
+            url="https://example.test",
+            elig_step="proceed_application",
+        )
+        page = AsyncMock()
+        with (
+            patch(
+                "pc_liveagent.app_stage.classify_saved_household_page",
+                new=AsyncMock(return_value="app_dob_review"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._prepare_resume_speech",
+                new=AsyncMock(
+                    return_value=(
+                        "app_dob_collect",
+                        "What is Agent T.'s date of birth?",
+                    )
+                ),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_application_back",
+                new=AsyncMock(side_effect=AssertionError("must not click Back")),
+            ),
+        ):
+            result = await _start_application_from_permission(
+                "resume-app", session, page, "Yes"
+            )
+        self.assertTrue(result.get("ok"))
+        self.assertEqual(session.app_step, "app_dob_collect")
+        self.assertIn("Agent T.", str(result.get("spoken") or ""))
+
+    async def test_go_back_is_navigation_on_each_application_step(self) -> None:
+        from pc_liveagent.app_stage import application_go_back
+        from pc_liveagent.call_turn import (
+            _process_application_turn,
+            drop_controller,
+            get_controller,
+        )
+        from pc_liveagent.live_form import LiveFormSession
+
+        pairs = [
+            ("app_citizenship", "app_agent_offer"),
+            ("app_insurance", "app_citizenship"),
+            ("app_dob_review", "app_insurance"),
+            ("app_dob_collect", "app_insurance"),
+            ("app_address_review", "app_dob_review"),
+        ]
+        for before, after in pairs:
+            session = LiveFormSession(
+                call_id=f"back-{before}",
+                url="https://example.test",
+                app_step=before,
+            )
+            page = AsyncMock()
+            clicks = AsyncMock(return_value=True)
+            with (
+                patch("pc_liveagent.app_stage._click_application_back", clicks),
+                patch(
+                    "pc_liveagent.app_stage.detect_application_screen",
+                    new=AsyncMock(return_value=after),
+                ),
+                patch(
+                    "pc_liveagent.app_stage._prepare_resume_speech",
+                    new=AsyncMock(return_value=(after, f"Question for {after}")),
+                ),
+            ):
+                result = await application_go_back(session.call_id, session, page)
+            self.assertTrue(result.get("ok"), before)
+            self.assertEqual(clicks.await_count, 1, before)
+            self.assertEqual(session.app_step, after)
+
+        call_id = "go-back-not-an-answer"
+        await drop_controller(call_id)
+        ctrl = await get_controller(call_id)
+        session = LiveFormSession(
+            call_id=call_id, url="https://example.test", app_step="app_insurance"
+        )
+        session.page = AsyncMock()
+
+        async def fake_session(_cid: str):
+            return session
+
+        with (
+            patch(
+                "pc_liveagent.call_turn.get_session",
+                new=AsyncMock(side_effect=fake_session),
+            ),
+            patch(
+                "pc_liveagent.app_stage.application_go_back",
+                new=AsyncMock(
+                    return_value={
+                        "ok": True,
+                        "step": "app_citizenship",
+                        "spoken": "Is everyone a U.S. citizen?",
+                    }
+                ),
+            ) as backed,
+            patch(
+                "pc_liveagent.call_turn.submit_field",
+                new=AsyncMock(side_effect=AssertionError("must not submit Go back")),
+            ),
+        ):
+            result = await _process_application_turn(
+                call_id,
+                ctrl,
+                text="Go back.",
+                fp="go-back",
+                dedupe_ctx="",
+                turn_id="t-back",
+                form_url="https://example.test",
+            )
+        backed.assert_awaited_once()
+        self.assertEqual(result.detail, "go_back")
+        self.assertIn("citizen", result.speech.lower())
+
+    def test_spoken_dob_examples_and_accumulation(self) -> None:
+        from pc_liveagent.app_stage import (
+            _dob_pieces,
+            _merge_dob_pieces,
+            _parse_dob_answer,
+        )
+        from pc_liveagent.live_form import LiveFormSession
+
+        self.assertEqual(
+            _parse_dob_answer(
+                "Monday's October. Date is twenty two. Year is two thousand three."
+            ),
+            ("10/22/2003", None),
+        )
+        self.assertEqual(_parse_dob_answer("March 15 2018"), ("03/15/2018", None))
+        self.assertEqual(
+            _parse_dob_answer("October twenty-second two thousand three"),
+            ("10/22/2003", None),
+        )
+        pieces = _dob_pieces("Date is twenty two. Year is two thousand three.")
+        self.assertEqual(pieces.get("day"), 22)
+        self.assertEqual(pieces.get("year"), 2003)
+        self.assertIsNone(pieces.get("month"))
+        corrupted = _dob_pieces("October twenty twenty to")
+        self.assertEqual(corrupted.get("month"), 10)
+        self.assertIsNone(corrupted.get("day"))
+        self.assertIsNone(corrupted.get("year"))
+        self.assertTrue(corrupted.get("ambiguous"))
+        self.assertEqual(_parse_dob_answer("February 31 2018"), (None, None))
+        _dob, amb = _parse_dob_answer("10/11/2024")
+        self.assertIsNone(_dob)
+        self.assertIn("ambiguous", (amb or "").lower())
+
+        session = LiveFormSession(
+            call_id="dob-parts", url="https://example.test", app_step="app_dob_collect"
+        )
+        _date, clarify = _merge_dob_pieces(
+            session, "Agent T.", _dob_pieces("October twenty twenty to")
+        )
+        self.assertIsNone(_date)
+        self.assertIn("day", (clarify or "").lower())
+        self.assertIn("year", (clarify or "").lower())
+        _date, clarify = _merge_dob_pieces(
+            session,
+            "Agent T.",
+            _dob_pieces("Date is twenty two. Year is two thousand three."),
+        )
+        self.assertEqual(_date, "10/22/2003")
+        self.assertIsNone(clarify)
+
+    async def test_parser_failure_does_not_fill_or_advance(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="dob-no-fill",
+            url="https://example.test",
+            app_step="app_dob_collect",
+        )
+        session.filled["app_dob_current"] = "Agent T."
+        session.filled["app_dob_queue"] = '["Agent T."]'
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_dob_review"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._fill_and_save_dob",
+                new=AsyncMock(side_effect=AssertionError("must not fill")),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_member_add_dob",
+                new=AsyncMock(side_effect=AssertionError("must not open editor")),
+            ),
+            patch(
+                "pc_liveagent.app_stage._advance_after_answer",
+                new=AsyncMock(side_effect=AssertionError("must not advance")),
+            ),
+        ):
+            result = await submit_application_answer(
+                "dob-no-fill",
+                session,
+                AsyncMock(),
+                "October twenty twenty to",
+                0.0,
+            )
+        self.assertFalse(result.get("ok"))
+        self.assertEqual(result.get("error"), "dob_incomplete")
+        self.assertEqual(session.app_step, "app_dob_collect")
+        self.assertNotIn("10/", str(result.get("spoken") or ""))
+
+    async def test_accumulated_dob_is_saved_for_the_named_member(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="dob-save-agent",
+            url="https://example.test",
+            app_step="app_dob_collect",
+        )
+        session.filled["app_dob_current"] = "Agent T."
+        session.filled["app_dob_queue"] = '["Agent T."]'
+        session.filled["app_dob_partial"] = (
+            '{"name": "Agent T.", "month": 10, "day": null, "year": null}'
+        )
+        cards = [
+            {"name": "Agent T.", "dob": "", "needs_add": True, "editor_open": True},
+            {"name": "john D.", "dob": "02/22/2003", "needs_add": False},
+            {"name": "Don D.", "dob": "12/05/2005", "needs_add": False},
+        ]
+        saved_cards = [
+            {"name": "Agent T.", "dob": "10/22/2003", "needs_add": False},
+            {"name": "john D.", "dob": "02/22/2003", "needs_add": False},
+            {"name": "Don D.", "dob": "12/05/2005", "needs_add": False},
+        ]
+        fill = AsyncMock(return_value=True)
+
+        async def scrape(_page):
+            scrape.calls += 1
+            return cards if scrape.calls == 1 else saved_cards
+
+        scrape.calls = 0
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_dob_review"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_dob_cards",
+                new=AsyncMock(side_effect=scrape),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_member_add_dob",
+                new=AsyncMock(return_value=True),
+            ),
+            patch("pc_liveagent.app_stage._fill_and_save_dob", fill),
+            patch(
+                "pc_liveagent.app_stage._verify_member_dob",
+                new=AsyncMock(return_value=True),
+            ),
+        ):
+            result = await submit_application_answer(
+                "dob-save-agent",
+                session,
+                AsyncMock(),
+                "Date is twenty two. Year is two thousand three.",
+                0.0,
+            )
+        self.assertTrue(result.get("ok"))
+        self.assertEqual(fill.await_args.args[1], "10/22/2003")
+        self.assertEqual(fill.await_args.args[2], "Agent T.")
+        self.assertIn("Agent T.", str(result.get("spoken") or ""))
+
+    async def test_exit_control_is_not_a_household_member(self) -> None:
+        from pc_liveagent.app_stage import (
+            _prepare_dob_collect_speech,
+            _scrape_dob_cards_from_body,
+        )
+        from pc_liveagent.live_form import LiveFormSession
+
+        class _Body:
+            async def inner_text(self) -> str:
+                return (
+                    "Date of birth\n"
+                    "Please add and confirm for all household members\n"
+                    "Exit\n"
+                    "Agent T.\n"
+                    "Cancel\n"
+                    "Save\n"
+                    "john D.\n"
+                    "02/22/2003\n"
+                    "Don D.\n"
+                    "12/05/2005\n"
+                )
+
+        page = AsyncMock()
+        page.locator = lambda _sel: _Body()
+        cards = await _scrape_dob_cards_from_body(page)
+        names = [card["name"] for card in cards]
+        self.assertIn("Agent T.", names)
+        self.assertNotIn("Exit", names)
+        session = LiveFormSession(
+            call_id="dob-name", url="https://example.test", app_step="app_dob_review"
+        )
+        with patch(
+            "pc_liveagent.app_stage._scrape_dob_cards",
+            new=AsyncMock(return_value=cards),
+        ):
+            step, speech = await _prepare_dob_collect_speech(session, page)
+        self.assertEqual(step, "app_dob_collect")
+        self.assertIn("Agent T", speech)
+        self.assertNotIn("Exit", speech)
+
+
+class CitizenshipImmigrationSyncTests(unittest.IsolatedAsyncioTestCase):
+    def _members(self) -> list[dict[str, str]]:
+        return [
+            {"name": "Agent T.", "selected": "U.S. Citizen"},
+            {"name": "john D.", "selected": "U.S. Citizen"},
+            {"name": "Don D.", "selected": "U.S. Citizen"},
+        ]
+
+    async def test_overlapping_heading_still_detects_citizenship_screen(self) -> None:
+        from pc_liveagent.app_stage import detect_application_screen
+
+        class _Body:
+            async def inner_text(self) -> str:
+                return (
+                    "Are Agent T, john D, and Don D all U.S. Citizens? "
+                    "Yes Everyone listed is a U.S. Citizen "
+                    "No Some or all are not U.S. Citizens "
+                    "Agent T. U.S. Citizen U.S. National "
+                    "Satisfactory immigration status Prefer not to answer"
+                )
+
+        page = AsyncMock()
+        page.locator = lambda _sel: _Body()
+        self.assertEqual(await detect_application_screen(page), "app_citizenship")
+
+    async def test_us_national_selects_current_member_without_repeating_yes_no(
+        self,
+    ) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="imm-sync",
+            url="https://example.test",
+            app_step="app_immigration",
+        )
+        session.filled["app_citizenship_no"] = "1"
+        session.filled["app_immigration_current"] = "Agent T."
+        session.filled["app_immigration_queue"] = '["Agent T.", "john D.", "Don D."]'
+        set_status = AsyncMock(return_value=True)
+        yes_no = AsyncMock(side_effect=AssertionError("must not treat this as Yes/No"))
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_citizenship"),
+            ),
+            patch(
+                "pc_liveagent.app_stage.immigration_member_radios_visible",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_immigration_members",
+                new=AsyncMock(return_value=self._members()),
+            ),
+            patch("pc_liveagent.app_stage._set_member_immigration_status", set_status),
+            patch(
+                "pc_liveagent.app_stage._verify_member_immigration_status",
+                new=AsyncMock(return_value=True),
+            ),
+            patch("pc_liveagent.app_stage._click_yes_no", yes_no),
+            patch(
+                "pc_liveagent.app_stage._click_next_or_continue",
+                new=AsyncMock(side_effect=AssertionError("must not advance yet")),
+            ),
+        ):
+            result = await submit_application_answer(
+                "imm-sync", session, AsyncMock(), "US national.", 0.0
+            )
+        self.assertTrue(result.get("ok"))
+        self.assertEqual(session.app_step, "app_immigration")
+        self.assertEqual(set_status.await_args.args[1], "Agent T.")
+        self.assertEqual(set_status.await_args.args[2], "U.S. National")
+        spoken = str(result.get("spoken") or "")
+        self.assertNotIn("all U.S. Citizens", spoken)
+        self.assertIn("john D", spoken)
+        self.assertEqual(session.filled.get("app_immigration_current"), "john D.")
+
+    async def test_other_statuses_walk_each_member_then_advance(self) -> None:
+        from pc_liveagent.app_stage import (
+            _map_immigration_status,
+            submit_application_answer,
+        )
+        from pc_liveagent.live_form import LiveFormSession
+
+        self.assertEqual(_map_immigration_status("us national"), "U.S. National")
+        self.assertEqual(_map_immigration_status("u.s. national"), "U.S. National")
+        self.assertEqual(
+            _map_immigration_status("green card"),
+            "Satisfactory immigration status (green card, etc.)",
+        )
+        self.assertEqual(
+            _map_immigration_status("prefer not to answer"),
+            "Prefer not to answer",
+        )
+        session = LiveFormSession(
+            call_id="imm-walk",
+            url="https://example.test",
+            app_step="app_immigration",
+        )
+        session.filled["app_citizenship_no"] = "1"
+        session.filled["app_immigration_current"] = "Agent T."
+        session.filled["app_immigration_queue"] = '["Agent T.", "john D.", "Don D."]'
+        set_status = AsyncMock(return_value=True)
+        nxt = AsyncMock(return_value=True)
+
+        async def scrape(_page):
+            saved = json.loads(session.filled.get("app_immigration_confirmed") or "{}")
+            return [
+                {
+                    "name": name,
+                    "selected": saved.get(name, "U.S. Citizen"),
+                }
+                for name in ("Agent T.", "john D.", "Don D.")
+            ]
+
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(
+                    side_effect=["app_citizenship", "app_citizenship", "app_citizenship", "app_insurance"]
+                ),
+            ),
+            patch(
+                "pc_liveagent.app_stage.immigration_member_radios_visible",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_immigration_members",
+                new=AsyncMock(side_effect=scrape),
+            ),
+            patch("pc_liveagent.app_stage._set_member_immigration_status", set_status),
+            patch(
+                "pc_liveagent.app_stage._verify_member_immigration_status",
+                new=AsyncMock(return_value=True),
+            ),
+            patch("pc_liveagent.app_stage._click_enabled_application_next", nxt),
+            patch(
+                "pc_liveagent.app_stage._next_button_enabled",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "pc_liveagent.app_stage._prepare_resume_speech",
+                new=AsyncMock(
+                    return_value=(
+                        "app_insurance",
+                        "Do they have health coverage?",
+                    )
+                ),
+            ),
+        ):
+            first = await submit_application_answer(
+                "imm-walk", session, AsyncMock(), "U.S. National", 0.0
+            )
+            second = await submit_application_answer(
+                "imm-walk", session, AsyncMock(), "green card", 0.0
+            )
+            third = await submit_application_answer(
+                "imm-walk", session, AsyncMock(), "prefer not to answer", 0.0
+            )
+        self.assertTrue(first.get("ok"))
+        self.assertIn("john D", str(first.get("spoken") or ""))
+        self.assertTrue(second.get("ok"))
+        self.assertIn("Don D", str(second.get("spoken") or ""))
+        self.assertEqual(third.get("step"), "app_insurance")
+        self.assertEqual(
+            [call.args[1:] for call in set_status.await_args_list],
+            [
+                ("Agent T.", "U.S. National"),
+                ("john D.", "Satisfactory immigration status (green card, etc.)"),
+                ("Don D.", "Prefer not to answer"),
+            ],
+        )
+        nxt.assert_awaited_once()
+
+    async def test_preselected_citizen_still_requires_an_explicit_answer(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="imm-pre",
+            url="https://example.test",
+            app_step="app_immigration",
+        )
+        session.filled["app_citizenship_no"] = "1"
+        session.filled["app_immigration_current"] = "Agent T."
+        nxt = AsyncMock(return_value=True)
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_citizenship"),
+            ),
+            patch(
+                "pc_liveagent.app_stage.immigration_member_radios_visible",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_immigration_members",
+                new=AsyncMock(return_value=self._members()),
+            ),
+            patch(
+                "pc_liveagent.app_stage._set_member_immigration_status",
+                new=AsyncMock(side_effect=AssertionError("must not click a radio")),
+            ),
+            patch("pc_liveagent.app_stage._click_next_or_continue", nxt),
+        ):
+            result = await submit_application_answer(
+                "imm-pre", session, AsyncMock(), "continue", 0.0
+            )
+        self.assertEqual(result.get("error"), "immigration_incomplete")
+        self.assertEqual(session.app_step, "app_immigration")
+        self.assertIn("Agent T", str(result.get("spoken") or ""))
+        nxt.assert_not_awaited()
+
+    async def test_turn_keeps_status_answer_after_citizenship_no_was_committed(
+        self,
+    ) -> None:
+        from pc_liveagent.call_turn import (
+            _app_browser_tasks,
+            _process_application_turn,
+            _user_fingerprint,
+            drop_controller,
+            get_controller,
+        )
+        from pc_liveagent.live_form import LiveFormSession
+
+        call_id = "imm-turn"
+        await drop_controller(call_id)
+        ctrl = await get_controller(call_id)
+        ctrl.phase = "application"
+        session = LiveFormSession(
+            call_id=call_id, url="https://example.test", app_step="app_immigration"
+        )
+        session.page = AsyncMock()
+        session.filled["app_citizenship_no"] = "1"
+        session.filled["app_immigration_current"] = "Agent T."
+        ctrl.committed.append(
+            {
+                "key": f"app:app_citizenship:{_user_fingerprint('No.')}",
+                "turn_id": "earlier-no",
+                "step": "app_citizenship",
+                "answer": "No.",
+                "at": 0,
+            }
+        )
+        submitted: list[str] = []
+
+        async def fake_session(_cid: str):
+            return session
+
+        async def fake_submit(_cid: str, _field: str, text: str, **_kwargs):
+            submitted.append(text)
+            return {
+                "ok": True,
+                "spoken": "Okay, U.S. National for Agent T.",
+                "step": "app_immigration",
+            }
+
+        with (
+            patch(
+                "pc_liveagent.call_turn.get_session",
+                new=AsyncMock(side_effect=fake_session),
+            ),
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_citizenship"),
+            ),
+            patch(
+                "pc_liveagent.app_stage.immigration_member_radios_visible",
+                new=AsyncMock(return_value=True),
+            ),
+            patch("pc_liveagent.call_turn.submit_field", new=AsyncMock(side_effect=fake_submit)),
+        ):
+            first = await _process_application_turn(
+                call_id,
+                ctrl,
+                text="U.S. National.",
+                fp=_user_fingerprint("U.S. National."),
+                dedupe_ctx="",
+                turn_id="imm-1",
+                form_url="https://example.test",
+            )
+            task = _app_browser_tasks.get(call_id)
+            if task is not None:
+                await task
+            second = await _process_application_turn(
+                call_id,
+                ctrl,
+                text="U.S. National.",
+                fp=_user_fingerprint("U.S. National."),
+                dedupe_ctx="",
+                turn_id="imm-2",
+                form_url="https://example.test",
+            )
+        self.assertEqual(first.detail, "app_ack")
+        self.assertNotIn("all U.S. Citizens", first.speech)
+        self.assertEqual(session.app_step, "app_immigration")
+        self.assertEqual(submitted, ["U.S. National."])
+        self.assertEqual(second.detail, "duplicate_app_answer")
+
+    async def test_downgraded_step_is_restored_before_the_status_answer(self) -> None:
+        from pc_liveagent.call_turn import (
+            _app_browser_tasks,
+            _process_application_turn,
+            _user_fingerprint,
+            drop_controller,
+            get_controller,
+        )
+        from pc_liveagent.live_form import LiveFormSession
+
+        call_id = "imm-restore"
+        await drop_controller(call_id)
+        ctrl = await get_controller(call_id)
+        session = LiveFormSession(
+            call_id=call_id, url="https://example.test", app_step="app_citizenship"
+        )
+        session.page = AsyncMock()
+        session.filled["app_citizenship_no"] = "1"
+        session.filled["app_immigration_current"] = "Agent T."
+        seen: list[str] = []
+
+        async def fake_session(_cid: str):
+            return session
+
+        async def fake_submit(_cid: str, _field: str, text: str, **_kwargs):
+            seen.append(session.app_step)
+            seen.append(text)
+            return {"ok": True, "spoken": "Okay.", "step": "app_immigration"}
+
+        with (
+            patch(
+                "pc_liveagent.call_turn.get_session",
+                new=AsyncMock(side_effect=fake_session),
+            ),
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_citizenship"),
+            ),
+            patch(
+                "pc_liveagent.app_stage.immigration_member_radios_visible",
+                new=AsyncMock(return_value=True),
+            ),
+            patch("pc_liveagent.call_turn.submit_field", new=AsyncMock(side_effect=fake_submit)),
+        ):
+            result = await _process_application_turn(
+                call_id,
+                ctrl,
+                text="US national.",
+                fp=_user_fingerprint("US national."),
+                dedupe_ctx="",
+                turn_id="restore-1",
+                form_url="https://example.test",
+            )
+            task = _app_browser_tasks.get(call_id)
+            if task is not None:
+                await task
+        self.assertEqual(result.detail, "app_ack")
+        self.assertEqual(seen, ["app_immigration", "US national."])
+
+    async def test_radios_gone_returns_to_the_citizenship_question(self) -> None:
+        from pc_liveagent.call_turn import (
+            _process_application_turn,
+            _user_fingerprint,
+            drop_controller,
+            get_controller,
+        )
+        from pc_liveagent.live_form import LiveFormSession
+
+        call_id = "imm-back-screen"
+        await drop_controller(call_id)
+        ctrl = await get_controller(call_id)
+        session = LiveFormSession(
+            call_id=call_id, url="https://example.test", app_step="app_immigration"
+        )
+        session.page = AsyncMock()
+        session.filled["app_citizenship_no"] = "1"
+
+        async def fake_session(_cid: str):
+            return session
+
+        with (
+            patch(
+                "pc_liveagent.call_turn.get_session",
+                new=AsyncMock(side_effect=fake_session),
+            ),
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_citizenship"),
+            ),
+            patch(
+                "pc_liveagent.app_stage.immigration_member_radios_visible",
+                new=AsyncMock(return_value=False),
+            ),
+            patch(
+                "pc_liveagent.app_stage._prepare_resume_speech",
+                new=AsyncMock(
+                    return_value=(
+                        "app_citizenship",
+                        "Are Agent T, john D, and Don D all U.S. Citizens?",
+                    )
+                ),
+            ),
+            patch(
+                "pc_liveagent.call_turn.submit_field",
+                new=AsyncMock(side_effect=AssertionError("must not submit")),
+            ),
+            patch(
+                "pc_liveagent.app_stage._set_member_immigration_status",
+                new=AsyncMock(side_effect=AssertionError("must not set a radio")),
+            ),
+        ):
+            result = await _process_application_turn(
+                call_id,
+                ctrl,
+                text="U.S. National.",
+                fp=_user_fingerprint("U.S. National."),
+                dedupe_ctx="",
+                turn_id="back-screen",
+                form_url="https://example.test",
+            )
+        self.assertEqual(result.detail, "app_resynced")
+        self.assertEqual(session.app_step, "app_citizenship")
+        self.assertIn("U.S. Citizens", result.speech)
+
+    async def test_go_back_from_immigration_is_navigation(self) -> None:
+        from pc_liveagent.call_turn import (
+            _process_application_turn,
+            drop_controller,
+            get_controller,
+        )
+        from pc_liveagent.live_form import LiveFormSession
+
+        call_id = "imm-go-back"
+        await drop_controller(call_id)
+        ctrl = await get_controller(call_id)
+        session = LiveFormSession(
+            call_id=call_id, url="https://example.test", app_step="app_immigration"
+        )
+        session.page = AsyncMock()
+        session.filled["app_citizenship_no"] = "1"
+
+        async def fake_session(_cid: str):
+            return session
+
+        with (
+            patch(
+                "pc_liveagent.call_turn.get_session",
+                new=AsyncMock(side_effect=fake_session),
+            ),
+            patch(
+                "pc_liveagent.app_stage.application_go_back",
+                new=AsyncMock(
+                    return_value={
+                        "ok": True,
+                        "step": "app_citizenship",
+                        "spoken": "Are they all U.S. Citizens?",
+                    }
+                ),
+            ) as backed,
+            patch(
+                "pc_liveagent.call_turn.submit_field",
+                new=AsyncMock(side_effect=AssertionError("must not submit")),
+            ),
+        ):
+            result = await _process_application_turn(
+                call_id,
+                ctrl,
+                text="Go back.",
+                fp="go back",
+                dedupe_ctx="",
+                turn_id="nav",
+                form_url="https://example.test",
+            )
+        backed.assert_awaited_once()
+        self.assertEqual(result.detail, "go_back")
+        self.assertIn("Citizens", result.speech)
+
+    async def test_last_member_advances_only_when_live_radios_match(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="imm-last",
+            url="https://example.test",
+            app_step="app_immigration",
+        )
+        session.filled["app_citizenship_no"] = "1"
+        session.filled["app_immigration_current"] = "Don D."
+        session.filled["app_immigration_queue"] = '["Don D."]'
+        session.filled["app_immigration_confirmed"] = json.dumps(
+            {"Agent T.": "U.S. Citizen", "john D.": "U.S. Citizen"}
+        )
+        members = [
+            {"name": "Agent T.", "selected": "U.S. Citizen"},
+            {"name": "john D.", "selected": "U.S. Citizen"},
+            {"name": "Don D.", "selected": "U.S. Citizen"},
+        ]
+        click = AsyncMock(return_value=True)
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(side_effect=["app_citizenship", "app_insurance"]),
+            ),
+            patch(
+                "pc_liveagent.app_stage.immigration_member_radios_visible",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_immigration_members",
+                new=AsyncMock(return_value=members),
+            ),
+            patch(
+                "pc_liveagent.app_stage._set_member_immigration_status",
+                new=AsyncMock(return_value=True),
+            ) as set_status,
+            patch(
+                "pc_liveagent.app_stage._verify_member_immigration_status",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "pc_liveagent.app_stage._next_button_enabled",
+                new=AsyncMock(return_value=True),
+            ),
+            patch("pc_liveagent.app_stage._click_enabled_application_next", click),
+            patch(
+                "pc_liveagent.app_stage._prepare_resume_speech",
+                new=AsyncMock(
+                    return_value=("app_insurance", "Question 2. Who has coverage?")
+                ),
+            ),
+        ):
+            result = await submit_application_answer(
+                "imm-last", session, AsyncMock(), "Don D. is a U.S. Citizen", 0.0
+            )
+        set_status.assert_awaited()
+        self.assertEqual(set_status.await_args.args[1], "Don D.")
+        click.assert_awaited_once()
+        self.assertEqual(result.get("step"), "app_insurance")
+        self.assertIn("Question 2", str(result.get("spoken") or ""))
+
+    async def test_session_flag_without_matching_radio_does_not_click_next(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="imm-mismatch",
+            url="https://example.test",
+            app_step="app_immigration",
+        )
+        session.filled["app_citizenship_no"] = "1"
+        session.filled["app_immigration_confirmed"] = json.dumps(
+            {
+                "Agent T.": "U.S. Citizen",
+                "john D.": "U.S. Citizen",
+                "Don D.": "U.S. National",
+            }
+        )
+        members = [
+            {"name": "Agent T.", "selected": "U.S. Citizen"},
+            {"name": "john D.", "selected": "U.S. Citizen"},
+            {"name": "Don D.", "selected": "U.S. Citizen"},
+        ]
+        click = AsyncMock(return_value=True)
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_citizenship"),
+            ),
+            patch(
+                "pc_liveagent.app_stage.immigration_member_radios_visible",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_immigration_members",
+                new=AsyncMock(return_value=members),
+            ),
+            patch("pc_liveagent.app_stage._click_enabled_application_next", click),
+        ):
+            result = await submit_application_answer(
+                "imm-mismatch", session, AsyncMock(), "Now move to next question.", 0.0
+            )
+        click.assert_not_awaited()
+        self.assertEqual(result.get("error"), "immigration_incomplete")
+        self.assertIn("Don D.", str(result.get("spoken") or ""))
+        self.assertEqual(session.app_step, "app_immigration")
+
+    async def test_disabled_next_reports_validation_and_repeat_does_not_click(
+        self,
+    ) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="imm-disabled",
+            url="https://example.test",
+            app_step="app_immigration",
+        )
+        session.filled["app_citizenship_no"] = "1"
+        session.filled["app_immigration_confirmed"] = json.dumps(
+            {
+                "Agent T.": "U.S. Citizen",
+                "john D.": "U.S. Citizen",
+                "Don D.": "U.S. Citizen",
+            }
+        )
+        members = self._members()
+        click = AsyncMock(return_value=True)
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_citizenship"),
+            ),
+            patch(
+                "pc_liveagent.app_stage.immigration_member_radios_visible",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_immigration_members",
+                new=AsyncMock(return_value=members),
+            ),
+            patch(
+                "pc_liveagent.app_stage._next_button_enabled",
+                new=AsyncMock(return_value=False),
+            ),
+            patch(
+                "pc_liveagent.app_stage._visible_form_validation",
+                new=AsyncMock(return_value="Select a status for each person."),
+            ),
+            patch("pc_liveagent.app_stage._click_enabled_application_next", click),
+        ):
+            first = await submit_application_answer(
+                "imm-disabled", session, AsyncMock(), "Now move to next question.", 0.0
+            )
+            second = await submit_application_answer(
+                "imm-disabled", session, AsyncMock(), "We have done everything.", 0.0
+            )
+        click.assert_not_awaited()
+        self.assertEqual(first.get("error"), "immigration_next_disabled")
+        self.assertIn("Select a status", str(first.get("spoken") or ""))
+        self.assertNotIn("still needs an immigration status before I can continue", str(first.get("spoken") or "").lower())
+        self.assertEqual(second.get("error"), "immigration_next_disabled")
+        self.assertEqual(session.app_step, "app_immigration")
+
+    async def test_second_continue_does_not_click_next_again(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="imm-once",
+            url="https://example.test",
+            app_step="app_immigration",
+        )
+        session.filled["app_citizenship_no"] = "1"
+        session.filled["app_immigration_confirmed"] = json.dumps(
+            {
+                "Agent T.": "U.S. Citizen",
+                "john D.": "U.S. Citizen",
+                "Don D.": "U.S. Citizen",
+            }
+        )
+        click = AsyncMock(return_value=True)
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_citizenship"),
+            ),
+            patch(
+                "pc_liveagent.app_stage.immigration_member_radios_visible",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_immigration_members",
+                new=AsyncMock(return_value=self._members()),
+            ),
+            patch(
+                "pc_liveagent.app_stage._next_button_enabled",
+                new=AsyncMock(return_value=True),
+            ),
+            patch("pc_liveagent.app_stage._click_enabled_application_next", click),
+            patch(
+                "pc_liveagent.app_stage._visible_form_validation",
+                new=AsyncMock(return_value=""),
+            ),
+        ):
+            first = await submit_application_answer(
+                "imm-once", session, AsyncMock(), "move to next question", 0.0
+            )
+            second = await submit_application_answer(
+                "imm-once", session, AsyncMock(), "we have done everything", 0.0
+            )
+        click.assert_awaited_once()
+        self.assertEqual(first.get("error"), "immigration_next_unchanged")
+        self.assertEqual(second.get("error"), "immigration_next_unchanged")
+        self.assertIn("already tried Next", str(second.get("spoken") or ""))
 
 
 if __name__ == "__main__":
