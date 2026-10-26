@@ -28,7 +28,7 @@ from .answer_parse import (
     resolve_with_claude,
     sanitize_person_name,
 )
-from .control_intent import detect_control_intent
+from .control_intent import detect_control_intent, parse_member_correction
 from .elig_meta import format_question, get_field_meta
 from .live_fill_prompt import LIVE_FILL_GREETING
 from .call_trace import clear_call_trace, trace_event
@@ -379,10 +379,16 @@ def _begin_elig_navigation(ctrl: CallController) -> int:
 
 
 def _correction_prompt(field: str) -> str:
+    if not (field or "").strip():
+        return (
+            "Which detail should I change — first name, last name, "
+            "relationship, or age?"
+        )
+    if field == "name":
+        return "Do you mean the first name or the last name?"
     labels = {
         "first_name": "first name",
         "last_name": "last name",
-        "name": "name",
         "age": "age",
         "relationship": "relationship",
         "answer": "answer",
@@ -421,8 +427,6 @@ def _field_from_confirm_utterance(text: str) -> str:
     if not m:
         return ""
     raw = re.sub(r"\s+", "_", m.group("field").lower())
-    if raw == "name":
-        return "first_name"
     return raw
 
 
@@ -1652,9 +1656,7 @@ async def _repeat_with_context(call_id: str, ctrl: CallController) -> str:
         if ctrl.pending_correction:
             return (
                 ctrl.pending_correction.get("prompt")
-                or _correction_prompt(
-                    ctrl.pending_correction.get("field") or "first_name"
-                )
+                or _correction_prompt(ctrl.pending_correction.get("field") or "")
             )
         if step == "programs" and session is not None:
             stored = (session.filled.get("programs_permission_speech") or "").strip()
@@ -2498,14 +2500,15 @@ async def process_user_turn(
             step = (session.elig_step if session else "") or elig_step or "marital"
             meta = get_field_meta(step)
 
-            # Pending correction consumes the next utterance as the replacement value.
+            # Pending correction: field and value must both be explicit.
+            # Never treat a missing field as the first name.
             if ctrl.pending_correction and text:
                 intent_peek = detect_control_intent(text)
                 if intent_peek.kind == "repeat":
                     prompt = (
                         ctrl.pending_correction.get("prompt")
                         or _correction_prompt(
-                            ctrl.pending_correction.get("field") or "first_name"
+                            ctrl.pending_correction.get("field") or ""
                         )
                     )
                     ctrl.last_speech = prompt
@@ -2515,19 +2518,36 @@ async def process_user_turn(
                         turn_id=turn_id,
                         detail="correction_prompt_repeat",
                     )
-                # "age" / "first name" alone after "which field?" — pin the field.
-                if ctrl.pending_correction.get("need_field") or not (
-                    ctrl.pending_correction.get("field") or ""
-                ).strip():
-                    named = _field_from_confirm_utterance(text) or (
-                        intent_peek.target
-                        if intent_peek.kind == "change"
-                        else ""
+                if intent_peek.kind in ("go_back", "skip", "next"):
+                    ctrl.pending_correction = None
+                    # Fall through to normal intent handling below.
+                else:
+                    parsed_field, parsed_value = parse_member_correction(text)
+                    field = parsed_field or (
+                        intent_peek.target if intent_peek.kind == "change" else ""
                     )
-                    if named and not intent_peek.value:
-                        prompt = _correction_prompt(named)
+                    value = parsed_value or (
+                        intent_peek.value if intent_peek.kind == "change" else ""
+                    )
+                    stored_field = (
+                        ctrl.pending_correction.get("field") or ""
+                    ).strip()
+                    stored_value = (
+                        ctrl.pending_correction.get("value") or ""
+                    ).strip()
+                    member_fields = (
+                        "first_name",
+                        "last_name",
+                        "age",
+                        "relationship",
+                    )
+                    if field == "name" or (not field and stored_field == "name"):
+                        kept = value or stored_value
+                        prompt = _correction_prompt("name")
                         ctrl.pending_correction = {
-                            "field": named,
+                            "field": "name",
+                            "value": kept,
+                            "need_field": True,
                             "prompt": prompt,
                         }
                         ctrl.last_speech = prompt
@@ -2535,41 +2555,65 @@ async def process_user_turn(
                             speech=prompt,
                             phase=ctrl.phase,
                             turn_id=turn_id,
-                            detail="correction_prompt",
+                            detail="correction_clarify_name",
                         )
-                if intent_peek.kind == "change" and not intent_peek.value:
-                    field = intent_peek.target or ctrl.pending_correction.get(
-                        "field"
-                    ) or "first_name"
-                    prompt = _correction_prompt(field)
-                    ctrl.pending_correction = {"field": field, "prompt": prompt}
-                    ctrl.last_speech = prompt
-                    return TurnResult(
-                        speech=prompt,
-                        phase=ctrl.phase,
-                        turn_id=turn_id,
-                        detail="correction_prompt",
-                    )
-                if intent_peek.kind in ("go_back", "skip", "next"):
-                    ctrl.pending_correction = None
-                    # Fall through to normal intent handling below.
-                else:
-                    field = ctrl.pending_correction.get("field") or "first_name"
-                    if intent_peek.kind == "change" and intent_peek.value:
-                        field = intent_peek.target or field
-                        value = intent_peek.value
-                    else:
-                        value = text
+                    if field in member_fields and not value:
+                        if stored_value and stored_field in ("", "name"):
+                            value = stored_value
+                        else:
+                            prompt = _correction_prompt(field)
+                            ctrl.pending_correction = {
+                                "field": field,
+                                "prompt": prompt,
+                            }
+                            ctrl.last_speech = prompt
+                            return TurnResult(
+                                speech=prompt,
+                                phase=ctrl.phase,
+                                turn_id=turn_id,
+                                detail="correction_prompt",
+                            )
+                    if not field:
+                        if stored_field in member_fields:
+                            field = stored_field
+                            value = text
+                        else:
+                            prompt = (
+                                ctrl.pending_correction.get("prompt")
+                                or _correction_prompt("")
+                            )
+                            ctrl.pending_correction = {
+                                "field": stored_field,
+                                "value": stored_value,
+                                "need_field": True,
+                                "prompt": prompt,
+                            }
+                            ctrl.last_speech = prompt
+                            return TurnResult(
+                                speech=prompt,
+                                phase=ctrl.phase,
+                                turn_id=turn_id,
+                                detail="correction_clarify_field",
+                            )
+                    if field not in member_fields or not (value or "").strip():
+                        prompt = _correction_prompt(
+                            field if field in member_fields else ""
+                        )
+                        ctrl.pending_correction = {
+                            "field": field if field in member_fields else "",
+                            "value": stored_value,
+                            "need_field": field not in member_fields,
+                            "prompt": prompt,
+                        }
+                        ctrl.last_speech = prompt
+                        return TurnResult(
+                            speech=prompt,
+                            phase=ctrl.phase,
+                            turn_id=turn_id,
+                            detail="correction_clarify_field",
+                        )
                     # Same-form corrections (child/spouse/person): never click Back.
-                    if _same_member_form_step(step) or field in (
-                        "first_name",
-                        "last_name",
-                        "name",
-                        "age",
-                        "relationship",
-                    ):
-                        if field in ("name",):
-                            field = "first_name"
+                    if _same_member_form_step(step) or field in member_fields:
                         if field in ("first_name", "last_name"):
                             value = sanitize_person_name(value) or value
                         ctrl.last_user_fp = fp
@@ -2585,11 +2629,10 @@ async def process_user_turn(
                                 or step
                             )
                         else:
-                            # Keep pending so the caller can retry the value.
                             ctrl.pending_correction = {
                                 "field": field,
-                                "prompt": speech
-                                or _correction_prompt(field),
+                                "value": value,
+                                "prompt": speech or _correction_prompt(field),
                             }
                         ctrl.last_speech = speech
                         return TurnResult(
@@ -2601,28 +2644,6 @@ async def process_user_turn(
                             if edit.get("ok")
                             else "member_correct_failed",
                         )
-                    ctrl.pending_correction = None
-                    target_step = _step_for_correction_field(field, step)
-                    # Only leave the form when the target is a different page group.
-                    if _step_group_safe(step) != _step_group_safe(target_step):
-                        for _ in range(4):
-                            session = await get_session(call_id)
-                            cur = (session.elig_step if session else "") or step
-                            if cur == target_step:
-                                step = cur
-                                break
-                            nav = await navigate_back_one(call_id)
-                            if not nav.get("ok"):
-                                break
-                            step = str(nav.get("step") or target_step)
-                    else:
-                        step = target_step
-                        session = await get_session(call_id)
-                        if session is not None:
-                            session.elig_step = target_step
-                    meta = get_field_meta(step)
-                    text = value
-                    # Fall through to normal resolve/submit for target_step.
 
             intent = detect_control_intent(text)
             if intent.kind in ("repeat", "list_options"):
@@ -2801,11 +2822,23 @@ async def process_user_turn(
                 )
             if intent.kind == "change":
                 field = intent.target or ""
-                if not field:
-                    prompt = (
-                        "Which field should I change — first name, last name, "
-                        "relationship, or age?"
+                if field == "name":
+                    prompt = _correction_prompt("name")
+                    ctrl.pending_correction = {
+                        "field": "name",
+                        "value": intent.value or "",
+                        "need_field": True,
+                        "prompt": prompt,
+                    }
+                    ctrl.last_speech = prompt
+                    return TurnResult(
+                        speech=prompt,
+                        phase=ctrl.phase,
+                        turn_id=turn_id,
+                        detail="correction_clarify_name",
                     )
+                if not field:
+                    prompt = _correction_prompt("")
                     ctrl.pending_correction = {
                         "field": "",
                         "prompt": prompt,
@@ -2818,8 +2851,6 @@ async def process_user_turn(
                         turn_id=turn_id,
                         detail="correction_clarify_field",
                     )
-                if field == "name":
-                    field = "first_name"
                 if not intent.value:
                     # Start a correction dialog — do not fall through to answer parse.
                     prompt = _correction_prompt(field)
@@ -2951,8 +2982,18 @@ async def process_user_turn(
                 )
 
             # Fast path: clear Yes/No, exact option, mapped age/income, names.
-            # Otherwise ask Haiku for structured resolution (validated).
-            if not is_fast_path_resolve(resolved):
+            # Support clarifies stay local so a timeout cannot replace them
+            # with a guessed option. Clear support matches are fast-path above.
+            deterministic_support = (
+                step == "support"
+                and bool(resolved.answer)
+                and resolved.detail in ("support_yes", "support_no")
+            )
+            if (
+                not deterministic_support
+                and not is_fast_path_resolve(resolved)
+                and resolved.detail not in ("support_clarify", "support_unclear")
+            ):
                 step_before = step
                 seq_before = ctrl.turn_seq
                 committed_before = len(ctrl.committed)
@@ -3049,7 +3090,17 @@ async def process_user_turn(
                         local_fallback = build_options_help_speech(
                             step, resolve_opts
                         )
-                    if claude.reject_reason in ("timeout", "error"):
+                    kept_support = (
+                        claude.reject_reason in ("timeout", "error")
+                        and bool(resolved.answer)
+                        and resolved.detail in ("support_yes", "support_no")
+                    )
+                    if kept_support:
+                        # A late Claude failure must not throw away a clear match.
+                        answer = resolved.answer
+                        clarify = None
+                        resolver_used = "python"
+                    elif claude.reject_reason in ("timeout", "error"):
                         # Prefer local contextual speech over Claude's delayed prompt.
                         clarify = local_fallback or clarify or format_question(step)
                     else:
@@ -3059,20 +3110,21 @@ async def process_user_turn(
                             or clarify
                             or format_question(step)
                         )
-                    # Strip any leaked internal validation wording.
-                    clarify = re.sub(
-                        r"\s*This field is required to continue\.?",
-                        "",
-                        clarify or "",
-                        flags=re.I,
-                    ).strip()
-                    clarify = re.sub(
-                        r"\s*Options include:.*$",
-                        "",
-                        clarify,
-                        flags=re.I,
-                    ).strip() or local_fallback or format_question(step)
-                    answer = None
+                    if not kept_support:
+                        # Strip any leaked internal validation wording.
+                        clarify = re.sub(
+                            r"\s*This field is required to continue\.?",
+                            "",
+                            clarify or "",
+                            flags=re.I,
+                        ).strip()
+                        clarify = re.sub(
+                            r"\s*Options include:.*$",
+                            "",
+                            clarify,
+                            flags=re.I,
+                        ).strip() or local_fallback or format_question(step)
+                        answer = None
                     logger.info(
                         "answer_resolver=claude call_id=%s step=%s verified=0 "
                         "reason=%s latency_ms=%.0f",

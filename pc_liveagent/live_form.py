@@ -2530,6 +2530,8 @@ async def peek_choice_labels(call_id: str) -> list[str]:
         return []
     async with session.lock:
         try:
+            if (session.elig_step or "") == "support":
+                return await _visible_support_option_labels(session.page)
             return await _visible_choice_labels(session.page)
         except Exception:
             logger.exception("peek_choice_labels failed call_id=%s", call_id)
@@ -3576,12 +3578,61 @@ def _join_spoken_choices(labels: list[str]) -> str:
     return ", ".join(clean[:-1]) + f", or {clean[-1]}"
 
 
+_REL_LEADING_WORDS = frozenset(
+    {
+        "child",
+        "stepchild",
+        "step",
+        "grandchild",
+        "grand",
+        "foster",
+        "other",
+        "spouse",
+        "partner",
+        "parent",
+        "sibling",
+        "brother",
+        "sister",
+        "relative",
+        "niece",
+        "nephew",
+        "cousin",
+        "aunt",
+        "uncle",
+        "guardian",
+        "friend",
+        "roommate",
+        "son",
+        "daughter",
+        "wife",
+        "husband",
+        "in-law",
+        "in",
+    }
+)
+
+
+def _looks_like_household_member_chip(label: str) -> bool:
+    """Household summary tabs such as 'john Partner' or 'Agent You'."""
+    low = re.sub(r"\s+", " ", (label or "").strip().lower())
+    if not low:
+        return False
+    if "your household" in low or low in {"agent you", "you"}:
+        return True
+    if " " not in low:
+        return False
+    first = re.split(r"\s+", low, maxsplit=1)[0].rstrip(".,")
+    return first not in _REL_LEADING_WORDS
+
+
 def _relationship_option_labels(labels: list[str] | None) -> list[str]:
-    """Keep relationship chips; drop name/age/form chrome."""
+    """Keep relationship chips; drop name/age/form chrome and household tabs."""
     out: list[str] = []
     for label in labels or []:
         low = (label or "").strip().lower().rstrip(" *")
         if not low or low in _REL_OPTION_SKIP or len(label) > 60:
+            continue
+        if _looks_like_household_member_chip(label):
             continue
         if re.match(r"^\$?\d", low) or re.search(r"\d+\s*[-–—]\s*\d+", low):
             continue
@@ -3740,12 +3791,7 @@ async def _relationship_speech_for_page(
     session: LiveFormSession, page: Page, step: str
 ) -> str:
     """Build relationship speech from live chips when visible; cache on session."""
-    labels: list[str] = []
-    try:
-        labels = await _visible_choice_labels(page)
-    except Exception:
-        labels = []
-    rel_opts = _relationship_option_labels(labels)
+    rel_opts = await _visible_relationship_option_labels(page)
     speech = relationship_question_speech(step, rel_opts or None)
     session.filled[f"{step}_options_speech"] = speech
     return speech
@@ -4562,12 +4608,19 @@ async def correct_member_field(
             "spoken": "I can't edit that detail right now because the form is not open.",
         }
     key = (field or "").lower().replace(" ", "_")
-    if key in ("name", "first", "firstname"):
+    if key in ("first", "firstname"):
         key = "first_name"
     if key in ("last", "lastname"):
         key = "last_name"
     if key in ("role", "rel"):
         key = "relationship"
+    if key == "name":
+        return {
+            "ok": False,
+            "error": "name_ambiguous",
+            "spoken": "Do you mean the first name or the last name?",
+            "step": session.elig_step,
+        }
     if key not in ("first_name", "last_name", "age", "relationship"):
         return {
             "ok": False,
@@ -5575,16 +5628,67 @@ def _fuzzy_choice_label(spoken: str, labels: list[str]) -> str:
     return wanted
 
 
+_SUPPORT_CANONICAL = (
+    "Yes, I am a full-time student and my parent or legal guardian supports me.",
+    "Yes, I live more than half the year with the person that supports me.",
+    "Yes, I'm disabled and live year-round with the person that supports me.",
+    "Yes, I live more than half the year with a relative that supports me.",
+    "No",
+)
+
+
+def _support_option_labels(labels: list[str] | None) -> list[str]:
+    """Support answers only. Recover long wrappers; drop household tabs."""
+    found: list[str] = []
+
+    def add(label: str) -> None:
+        if label and label not in found:
+            found.append(label)
+
+    for raw in labels or []:
+        text = re.sub(r"\s+", " ", raw or "").strip()
+        if not text:
+            continue
+        low = text.lower()
+        if _looks_like_household_member_chip(text) and "support" not in low:
+            continue
+        if "your household" in low and "support" not in low:
+            continue
+        for canon in _SUPPORT_CANONICAL:
+            if canon == "No":
+                continue
+            if canon.lower().rstrip(".") in low:
+                add(canon)
+        if re.fullmatch(r"no\.?", low) or (
+            re.search(r"(?:^|\s)no(?:\s|[.!]|$)", low) and "none of" not in low
+        ):
+            add("No")
+        if "full-time student" in low or "parent or legal guardian" in low:
+            add(_SUPPORT_CANONICAL[0])
+        if "disabled" in low and "support" in low:
+            add(_SUPPORT_CANONICAL[2])
+        if "relative that supports" in low:
+            add(_SUPPORT_CANONICAL[3])
+        if "person that supports" in low and "relative" not in low:
+            add(_SUPPORT_CANONICAL[1])
+    return found
+
+
 def _map_support_yes_label(spoken: str, labels: list[str]) -> str:
     """Map a Yes answer onto one of the four half-support Pointcare buttons."""
     text = (spoken or "").lower()
     yes_labels = [
         item
-        for item in labels
-        if item.lower().startswith("yes") and item.lower().strip() != "yes"
+        for item in _support_option_labels(labels)
+        if item.lower().startswith("yes")
     ]
-    if not yes_labels:
-        yes_labels = [item for item in labels if item.lower().startswith("yes")]
+    # A clear situation still maps when the scrape missed the long buttons.
+    if not yes_labels and re.search(
+        r"\b(student|parent|guardian|school|disabled|relative|live|living|"
+        r"half the year)\b",
+        text,
+    ):
+        yes_labels = [item for item in _SUPPORT_CANONICAL if item != "No"]
 
     def pick(*needles: str) -> str:
         for label in yes_labels:
@@ -5594,21 +5698,135 @@ def _map_support_yes_label(spoken: str, labels: list[str]) -> str:
         return ""
 
     if re.search(r"\b(student|parent|guardian|school)\b", text):
-        return pick("student") or pick("parent")
+        return pick("student") or pick("parent") or _SUPPORT_CANONICAL[0]
     if re.search(r"\bdisabled\b", text):
-        return pick("disabled")
+        return pick("disabled") or _SUPPORT_CANONICAL[2]
     if re.search(r"\brelative\b", text):
-        return pick("relative")
+        return pick("relative") or _SUPPORT_CANONICAL[3]
     if re.search(r"\b(live|living|half the year|with (them|him|her|the person))\b", text):
-        # Prefer the non-relative "person that supports me" option.
         person = pick("person that supports")
         if person and "relative" not in person.lower():
             return person
-        return person or pick("half the year")
+        return person or pick("half the year") or _SUPPORT_CANONICAL[1]
     # Bare Yes with exactly one visible Yes option.
     if len(yes_labels) == 1:
         return yes_labels[0]
     return ""
+
+
+async def _visible_support_option_labels(page: Page) -> list[str]:
+    """Options for the financial-support question only.
+
+    Long Yes sentences stay even when a wrapper's full text exceeds the
+    generic choice-label cap. Household summary chips are not options.
+    """
+    try:
+        raw = await page.evaluate(
+            """() => {
+              const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+              const isVis = (el) => {
+                const r = el.getBoundingClientRect();
+                return r.width > 2 && r.height > 2;
+              };
+              const supportish = (t) => {
+                const low = t.toLowerCase();
+                return low === 'no'
+                  || low.startsWith('yes')
+                  || low.includes('full-time student')
+                  || low.includes('financial support')
+                  || low.includes('person that supports')
+                  || low.includes('relative that supports')
+                  || low.includes('parent or legal guardian');
+              };
+              let root = null;
+              const captions = [...document.querySelectorAll(
+                'h1, h2, h3, h4, p, label, legend, div, span, strong'
+              )];
+              for (const el of captions) {
+                const t = norm(el.innerText || el.textContent || '');
+                const low = t.toLowerCase();
+                if (!low.includes('financial support') && !low.includes('more than half')) continue;
+                if (t.length > 400) continue;
+                let cur = el.parentElement;
+                for (let depth = 0; depth < 6 && cur; depth++) {
+                  const buttons = [...cur.querySelectorAll(
+                    'button, [role=button], [role=radio], [role=option], label'
+                  )].filter(isVis);
+                  if (buttons.length >= 2) { root = cur; break; }
+                  cur = cur.parentElement;
+                }
+                if (root) break;
+              }
+              const scope = root || document;
+              const nodes = [...scope.querySelectorAll(
+                'button, [role=button], [role=radio], [role=option], label, li, div, p, span'
+              )];
+              const out = [];
+              for (const el of nodes) {
+                if (!isVis(el)) continue;
+                const t = norm(el.innerText || el.textContent || '');
+                if (!t || t.length > 800 || !supportish(t)) continue;
+                if (!out.includes(t)) out.push(t);
+              }
+              return out;
+            }"""
+        )
+    except Exception:
+        logger.exception("support option scrape failed")
+        return []
+    if not isinstance(raw, list):
+        return []
+    return _support_option_labels([str(item) for item in raw if item])
+
+
+async def _click_support_label(page: Page, label: str) -> None:
+    """Click one support option by its full sentence, without fuzzy remapping."""
+    wanted = (label or "").strip()
+    if not wanted:
+        raise RuntimeError("SUPPORT_CLARIFY: Please say which situation fits.")
+    pattern = re.compile(rf"^\s*{re.escape(wanted.rstrip('.'))}\.?\s*$", re.I)
+    candidates = [
+        page.get_by_role("radio", name=pattern).first,
+        page.get_by_role("button", name=pattern).first,
+        page.get_by_text(pattern, exact=True).first,
+    ]
+    for loc in candidates:
+        try:
+            if await loc.count() and await loc.is_visible():
+                await loc.click(timeout=6000)
+                return
+        except Exception:
+            continue
+    needle = wanted.rstrip(".").lower()
+    try:
+        clicked = await page.evaluate(
+            """(needle) => {
+              const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+              const nodes = [...document.querySelectorAll(
+                'button, [role=button], [role=radio], [role=option], label, li, div, span'
+              )];
+              let best = null;
+              for (const el of nodes) {
+                const t = norm(el.innerText || el.textContent || '');
+                if (!t || !t.includes(needle)) continue;
+                const r = el.getBoundingClientRect();
+                if (r.width < 2 || r.height < 2) continue;
+                if (!best || t.length < best.len) best = {el, len: t.length};
+              }
+              if (!best) return '';
+              best.el.click();
+              return (best.el.innerText || '').replace(/\\s+/g, ' ').trim();
+            }""",
+            needle,
+        )
+        if clicked:
+            return
+    except Exception:
+        logger.exception("support option click failed for %r", wanted[:80])
+    raise RuntimeError(
+        "SUPPORT_CLARIFY: I couldn't select that support situation. "
+        "Please say it again."
+    )
 
 
 async def _click_support_choice(
@@ -5617,9 +5835,13 @@ async def _click_support_choice(
     yes: bool,
     labels: list[str] | None = None,
 ) -> None:
-    visible = labels if labels is not None else await _visible_choice_labels(page)
+    visible = (
+        labels
+        if labels is not None
+        else await _visible_support_option_labels(page)
+    )
     if not yes:
-        await _click_exact_choice(page, "No")
+        await _click_support_label(page, "No")
         return
     mapped = _map_support_yes_label(answer, visible)
     if not mapped:
@@ -5628,7 +5850,7 @@ async def _click_support_choice(
             "by a parent, you live with the person who supports you, disabled and "
             "live with them year-round, or a relative supports you."
         )
-    await _click_exact_choice(page, mapped)
+    await _click_support_label(page, mapped)
 
 
 async def _ensure_age_choices_visible(page: Page) -> list[str]:
@@ -5781,6 +6003,41 @@ const selectedMark = (el) => {
   return !!(input && input.checked);
 };
 """
+
+
+async def _visible_relationship_option_labels(page: Page) -> list[str]:
+    """Leaf labels inside the active relationship field only.
+
+    Household summary tabs sit outside that caption container and are dropped
+    even if a parent node also contains them.
+    """
+    try:
+        raw = await page.evaluate(
+            f"""() => {{
+              {_RELATIONSHIP_CHIP_JS}
+              const root = findRelRoot();
+              if (!root || root === document) return [];
+              const nodes = [...root.querySelectorAll(
+                'button, [role=button], [role=radio], [role=option], [role=checkbox], [role=listitem], a, label, li, div[tabindex], div[class*="choice"], div[class*="option"], span[class*="choice"]'
+              )].filter((n) => isVisible(n));
+              const leaves = nodes.filter(
+                (n) => !nodes.some((other) => other !== n && n.contains(other))
+              );
+              const out = [];
+              for (const el of leaves) {{
+                const t = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                if (!t || t.length > 48) continue;
+                if (!out.includes(t)) out.push(t);
+              }}
+              return out;
+            }}"""
+        )
+    except Exception:
+        logger.exception("relationship option scrape failed")
+        return []
+    if not isinstance(raw, list):
+        return []
+    return _relationship_option_labels([str(item) for item in raw if item])
 
 
 async def _relationship_chip_selected(page: Page, value: str) -> bool:
@@ -6341,11 +6598,120 @@ def _resolve_kinship_to_member(
     return None
 
 
+_MEMBER_ROLE_WORDS = frozenset(
+    {
+        "you",
+        "partner",
+        "spouse",
+        "child",
+        "stepchild",
+        "grandchild",
+        "sibling",
+        "parent",
+        "relative",
+        "self",
+    }
+)
+
+
+def _split_member_identity(label: str) -> tuple[str, str]:
+    """Separate a displayed chip into the person's name and a trailing role.
+
+    ``Agent You`` is the applicant named Agent, not a person named "Agent You".
+    ``john Partner`` is john. A name like ``John D.`` has no role suffix.
+    """
+    text = re.sub(r"\s+", " ", (label or "").strip())
+    words = text.split()
+    if len(words) >= 3 and " ".join(words[-2:]).lower() == "foster child":
+        return " ".join(words[:-2]), "Foster Child"
+    if len(words) >= 2 and words[-1].lower().rstrip(".") in _MEMBER_ROLE_WORDS:
+        return " ".join(words[:-1]), words[-1]
+    return text, ""
+
+
+def _expand_household_member_bar(label: str) -> list[dict[str, str]]:
+    """Split a combined household bar into individual member chips.
+
+    ``Your household Agent You john Partner`` becomes Agent (role You) and
+    john (role Partner). The summary container itself is not a member.
+    """
+    text = re.sub(r"\s+", " ", (label or "").strip())
+    if not text:
+        return []
+    had_summary = "your household" in text.lower()
+    body = re.sub(r"\byour household\b", " ", text, flags=re.I)
+    body = re.sub(r"\s+", " ", body).strip(" -")
+    words = body.split()
+    roles: list[tuple[int, int, str]] = []
+    index = 0
+    while index < len(words):
+        pair = " ".join(words[index : index + 2]).lower()
+        if pair == "foster child" and index > 0:
+            roles.append((index, index + 2, "Foster Child"))
+            index += 2
+            continue
+        token = words[index].lower().rstrip(".")
+        if token in _MEMBER_ROLE_WORDS and index > 0:
+            roles.append((index, index + 1, words[index]))
+        index += 1
+    if len(roles) >= 2 or (had_summary and roles):
+        found: list[dict[str, str]] = []
+        previous = 0
+        for start, end, role in roles:
+            name = " ".join(words[previous:start]).strip()
+            previous = end
+            if not name:
+                continue
+            found.append(
+                {"label": name, "role": role, "chip": f"{name} {role}".strip()}
+            )
+        return found
+    if had_summary and not body:
+        return []
+    identity, role = _split_member_identity(body or text)
+    if not identity or identity.lower() == "your household":
+        return []
+    return [{"label": identity, "role": role, "chip": body or text}]
+
+
+def _utterance_is_household_member(
+    spoken: str, labels: list[str] | None = None
+) -> bool:
+    """True when the utterance names a household member, not a condition."""
+    text = re.sub(r"[.!?…]+$", "", (spoken or "").strip())
+    if not text:
+        return False
+    if re.search(
+        r"\b(pregnant|cancer|blind|disabled|ssdi|foster|none|neither|above)\b",
+        text,
+        re.I,
+    ):
+        return False
+    norm = _normalize_member_label(text)
+    if not norm:
+        return False
+    for label in labels or []:
+        for piece in _expand_household_member_bar(label):
+            identity = _normalize_member_label(piece.get("label") or "")
+            chip = _normalize_member_label(piece.get("chip") or "")
+            role = _normalize_member_label(piece.get("role") or "")
+            if norm and norm in {identity, chip, role} and identity:
+                return True
+            if identity and (norm == identity or identity.startswith(norm + " ")):
+                return True
+    return False
+
+
 def _is_plausible_member_label(label: str) -> bool:
     text = (label or "").strip()
     if not text or len(text) > 60:
         return False
     key = re.sub(r"\s+", " ", text).lower().rstrip(" *.")
+    if "your household" in key:
+        return False
+    # A lone "You" can be the applicant. "Partner" by itself is only a role.
+    if key in _MEMBER_ROLE_WORDS and key not in {"you", "me"}:
+        return False
     if key in _NON_MEMBER_LABELS and key != "me":
         return False
     if re.search(
@@ -6403,6 +6769,38 @@ def _short_special_condition_label(label: str) -> str:
     text = re.sub(r"\s*\(ssdi\)\s*", " ", text, flags=re.I)
     text = re.sub(r"\s+", " ", text).strip(" .")
     return text or (label or "").strip()
+
+
+def _special_person_question(condition: str, members: list[dict[str, Any]]) -> str:
+    """Ask who a verified condition applies to, using member names not role chips."""
+    names = [
+        str(member.get("label") or "").strip()
+        for member in members
+        if str(member.get("label") or "").strip()
+    ]
+    who = _join_spoken_choices(names[:8]) if names else "the person on the screen"
+    short = _short_special_condition_label(condition)
+    return f"Who does {short} apply to? The household members are {who}."
+
+
+_REAL_SPECIAL_CONDITIONS = (
+    "Someone is pregnant",
+    "Someone has breast cancer",
+    "Someone has cervical cancer",
+    "Someone is blind",
+    "Someone is disabled (SSDI)",
+    "Someone was in foster care when they turned 18",
+)
+
+
+async def _checked_real_special_conditions(page: Page) -> list[str]:
+    """Conditions whose checkbox is already checked. Excludes None of the above."""
+    checked: list[str] = []
+    for label in _REAL_SPECIAL_CONDITIONS:
+        state = await _special_condition_checkbox_state(page, label)
+        if state.get("found") and state.get("checked"):
+            checked.append(label)
+    return checked
 
 
 def _record_special_assignment_pairs(
@@ -6608,13 +7006,37 @@ def _map_special_condition_labels(spoken: str, labels: list[str]) -> list[str]:
         if label and label not in hits:
             hits.append(label)
 
-    # Direct containment / equality against visible options (non-negated).
+    # Full-label equality only. A fragment such as "of the above" must not
+    # select "None of the above".
+    _condition_stop = {"the", "and", "for", "above", "of", "any", "these"}
+    _condition_tokens = {
+        "none",
+        "neither",
+        "pregnant",
+        "pregnancy",
+        "blind",
+        "disabled",
+        "ssdi",
+        "foster",
+        "breast",
+        "cervical",
+        "cancer",
+    }
     for label in pool:
-        low = label.lower()
+        low = label.lower().rstrip(" .")
         if label in hits:
             continue
-        if text == low or (len(text) >= 8 and (text in low or low in text)):
-            # Skip if the matching cue words are negated in the utterance.
+        if text != low:
+            spoken_words = set(re.findall(r"[a-z0-9]{3,}", text)) - _condition_stop
+            label_words = set(re.findall(r"[a-z0-9]{3,}", low))
+            distinctive = spoken_words & label_words & _condition_tokens
+            if not (spoken_words and spoken_words <= label_words and distinctive):
+                continue
+            if any(
+                _special_condition_negated(text, word) for word in distinctive
+            ):
+                continue
+        else:
             cue = next(
                 (
                     word
@@ -6632,14 +7054,7 @@ def _map_special_condition_labels(spoken: str, labels: list[str]) -> list[str]:
             )
             if cue and _special_condition_negated(text, cue):
                 continue
-            hits.append(label)
-            continue
-        spoken_words = set(re.findall(r"[a-z0-9]{3,}", text))
-        label_words = set(re.findall(r"[a-z0-9]{3,}", low))
-        if spoken_words and spoken_words <= label_words:
-            if any(_special_condition_negated(text, w) for w in spoken_words & label_words):
-                continue
-            hits.append(label)
+        hits.append(label)
 
     # "None of the above" is exclusive — drop it when real conditions were selected.
     none_labels = [label for label in hits if "none of the above" in label.lower()]
@@ -6670,6 +7085,7 @@ def _map_relationship_label(spoken: str, labels: list[str]) -> str | None:
         label
         for label in labels
         if label
+        and not _looks_like_household_member_chip(label)
         and label.lower().rstrip(" *")
         not in {
             "first name",
@@ -6680,7 +7096,9 @@ def _map_relationship_label(spoken: str, labels: list[str]) -> str | None:
             "date of birth (optional)",
             "age",
         }
-    ] or list(labels)
+    ]
+    if not pool:
+        return None
 
     for label in pool:
         if label.lower() == text:
@@ -6839,6 +7257,7 @@ _SPECIAL_MEMBER_DISCOVER_JS = """(conditionLabel) => {
   };
   const isPersonLike = (t) => {
     if (!t || t.length > 60 || t.length < 1) return false;
+    if (/your household/i.test(t || '')) return false;
     if (isCondition(t) || isNav(t) || isMultiName(t)) return false;
     if (/^\\$?\\d/.test(t)) return false;
     if (/^me$/i.test(t)) return true;
@@ -6884,9 +7303,15 @@ _SPECIAL_MEMBER_DISCOVER_JS = """(conditionLabel) => {
       const leaves = leafPersonTexts(cur);
       if (leaves.length === 1) return leaves[0];
       if (leaves.length > 1) {
-        // Same row usually has exactly one name; take shortest unique leaf.
-        leaves.sort((a, b) => a.length - b.length);
-        if (!isMultiName(leaves[0])) return leaves[0];
+        // A row is a name plus a role badge ("john" + "Partner").
+        // Return that chip only when this checkbox has exactly one name.
+        // Do not take the shorter role word, and do not pick a name from a
+        // parent that contains several household members.
+        const roleOnly = /^(you|partner|spouse|child|stepchild|grandchild|sibling|parent|relative|self|foster child)$/i;
+        const names = leaves.filter((item) => !roleOnly.test(item));
+        const roles = leaves.filter((item) => roleOnly.test(item));
+        if (names.length === 1 && roles.length === 1) return names[0] + ' ' + roles[0];
+        if (names.length === 1 && !isMultiName(names[0])) return names[0];
       }
       const own = norm(cur.innerText || cur.textContent || '');
       if (isPersonLike(own)) return own;
@@ -7086,12 +7511,28 @@ async def _discover_special_person_members(
         has_marital = bool(data.get("hasMarital"))
         url = str(data.get("url") or "")[:160]
 
-    filtered = [
-        row
-        for row in members_raw
-        if isinstance(row, dict)
-        and _is_plausible_member_label(str(row.get("label") or ""))
-    ]
+    filtered: list[dict[str, Any]] = []
+    for row in members_raw:
+        if not isinstance(row, dict):
+            continue
+        raw_label = str(row.get("label") or "")
+        pieces = _expand_household_member_bar(raw_label)
+        # A combined "Your household …" bar is not one person. Individual
+        # chips are discovered on their own rows.
+        if "your household" in raw_label.lower() and len(pieces) != 1:
+            continue
+        piece = pieces[0] if len(pieces) == 1 else {"label": raw_label, "role": "", "chip": raw_label}
+        identity = str(piece.get("label") or "")
+        if not _is_plausible_member_label(identity):
+            continue
+        filtered.append(
+            {
+                **row,
+                "label": identity,
+                "role": str(piece.get("role") or ""),
+                "chip": str(piece.get("chip") or raw_label),
+            }
+        )
     # Re-index after Python filtering while preserving dupIndex per label.
     seen: dict[str, int] = {}
     members: list[dict[str, Any]] = []
@@ -7103,6 +7544,8 @@ async def _discover_special_person_members(
         members.append(
             {
                 "label": label,
+                "role": str(row.get("role") or ""),
+                "chip": str(row.get("chip") or label),
                 "index": len(members),
                 "dupIndex": int(row.get("dupIndex") if "dupIndex" in row else dup),
                 "checked": bool(row.get("checked")),
@@ -7467,7 +7910,12 @@ def _match_member_rows(
     exact = [
         m
         for m in members
-        if _normalize_member_label(str(m.get("label") or "")) == target_norm
+        if target_norm
+        in {
+            _normalize_member_label(str(m.get("label") or "")),
+            _normalize_member_label(str(m.get("chip") or "")),
+            _normalize_member_label(str(m.get("role") or "")),
+        }
     ]
     if exact:
         return exact
@@ -7566,6 +8014,7 @@ async def _assign_one_special_person_member(
         chosen = matches[0]
 
     label = str(chosen.get("label") or "")
+    click_label = str(chosen.get("chip") or label)
     dup_index = int(chosen.get("dupIndex") or 0)
     # Already checked — preserve selection (do not toggle off).
     if chosen.get("checked"):
@@ -7579,10 +8028,12 @@ async def _assign_one_special_person_member(
     # One click only — never retry-toggle when a generic reader fails.
     if condition:
         ok = await _click_special_person_member(
-            page, label, dup_index=dup_index, condition=condition
+            page, click_label, dup_index=dup_index, condition=condition
         )
     else:
-        ok = await _click_special_person_member(page, label, dup_index=dup_index)
+        ok = await _click_special_person_member(
+            page, click_label, dup_index=dup_index
+        )
     if not ok:
         # Re-read only this condition's list. Never click another condition.
         if condition:
@@ -8193,7 +8644,10 @@ async def _submit_eligibility_answer(
                 "No to change them, or say Spouse or Partner to correct the role."
             )
     elif step in ("children", "student", "disabled", "relatives", "support"):
-        visible_labels = await _visible_choice_labels(page)
+        if step == "support":
+            visible_labels = await _visible_support_option_labels(page)
+        else:
+            visible_labels = await _visible_choice_labels(page)
         if step == "support":
             if _is_no(answer):
                 yes = False
@@ -8735,6 +9189,45 @@ async def _submit_eligibility_answer(
                 pass
             labels = await _visible_choice_labels(page)
             selected = _map_special_condition_labels(answer, labels)
+        if not selected and _utterance_is_household_member(answer, labels):
+            checked = await _checked_real_special_conditions(page)
+            if len(checked) != 1:
+                raise RuntimeError(
+                    "SPECIAL_CLARIFY: Which condition applies to that person? "
+                    "Please say pregnant, blind, disabled, or another condition. "
+                    "I have not selected anyone yet."
+                )
+            # The condition is already checked in the browser. Reconcile, then
+            # assign this member without clicking another condition.
+            session.filled["special_conditions"] = checked[0]
+            session.filled["special_active_conditions"] = checked[0]
+            session.filled["special_person_queue"] = checked[0]
+            ready = await _wait_for_special_apply_to_members(
+                page, timeout_ms=3500, call_id=call_id, condition=checked[0]
+            )
+            if not list(ready.get("members") or []):
+                raise RuntimeError(
+                    "SPECIAL_CLARIFY: I see "
+                    f"{_short_special_condition_label(checked[0])} is selected, "
+                    "but the member list is not open. Please say the condition again."
+                )
+            await _assign_special_person_member(page, answer, session)
+            session.filled["special_member_labels"] = "|".join(
+                str(m.get("label") or "")
+                for m in (ready.get("members") or [])[:12]
+                if m.get("label")
+            )
+            spoken_override = _special_more_confirm_speech(session)
+            next_step = "special_more"
+            _mark(call_id, "verified", started)
+            return _elig_ok(
+                call_id,
+                session,
+                answer,
+                next_step,
+                "Assigned the named household member to the selected condition.",
+                spoken_override=spoken_override,
+            )
         if not selected:
             shown = ", ".join(
                 label
@@ -8803,11 +9296,9 @@ async def _submit_eligibility_answer(
                 if m.get("label")
             )
             next_step = "special_person"
-            if len(need_person) > 1:
-                spoken_override = (
-                    f"Okay. Who does {_short_special_condition_label(current)} "
-                    "apply to?"
-                )
+            spoken_override = _special_person_question(
+                current, list(ready.get("members") or [])
+            )
     elif step == "special_person":
         before_assigned = [
             item
@@ -8874,8 +9365,8 @@ async def _submit_eligibility_answer(
                 if m.get("label")
             )
             next_step = "special_person"
-            spoken_override = (
-                f"Okay. Who does {_short_special_condition_label(nxt)} apply to?"
+            spoken_override = _special_person_question(
+                nxt, list(ready.get("members") or [])
             )
         else:
             session.filled.pop("special_person_queue", None)

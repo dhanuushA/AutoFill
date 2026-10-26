@@ -33,6 +33,7 @@ from .live_form import (
     _map_income_range_label,
     _map_relationship_label,
     _map_special_condition_labels,
+    _map_support_yes_label,
     _resolve_income_period_label,
     _spoken_has_age_range_connector,
     _wants_income_period_reselect,
@@ -58,6 +59,7 @@ _FAST_PATH_DETAILS = frozenset(
         "relationship_other_text",
         "special_mapped",
         "special_multi",
+        "special_member_name",
         "age_mapped",
         "age_free",  # clear spoken age; Playwright opens chips and verifies
         "income_period",
@@ -67,6 +69,7 @@ _FAST_PATH_DETAILS = frozenset(
         "name",
         "special_person",
         "support_no",
+        "support_yes",
     }
 )
 
@@ -422,6 +425,30 @@ def _options_clarify(step: str, options: list[str] | None, fallback: str) -> str
     return _with_full_question(step, fallback)
 
 
+def _support_choice(text: str, options: list[str] | None) -> str:
+    """Map a clear support answer to the full option, or 'ambiguous'.
+
+    An empty string means the utterance does not name a situation.
+    """
+    categories: set[str] = set()
+    if re.search(r"\b(student|school|parent|guardian)\b", text, re.I):
+        categories.add("student")
+    if re.search(r"\bdisabled\b", text, re.I):
+        categories.add("disabled")
+    if re.search(r"\brelative\b", text, re.I):
+        categories.add("relative")
+    if not categories and re.search(
+        r"\b(live|living|half the year|with them)\b", text, re.I
+    ):
+        categories.add("live")
+    if len(categories) > 1:
+        return "ambiguous"
+    if not categories:
+        return "ambiguous" if _is_yes(text) else ""
+    mapped = _map_support_yes_label(text, list(options or []))
+    return mapped or text
+
+
 def resolve_answer(
     step: str,
     utterance: str,
@@ -461,29 +488,20 @@ def resolve_answer(
     if step == "support":
         if _is_no(text):
             return ResolveResult(answer="No", detail="support_no")
-        if _is_yes(text) or re.search(
-            r"\b(student|parent|guardian|disabled|relative|half the year|"
-            r"supports me|live with)\b",
-            text,
-            re.I,
-        ):
-            if _is_yes(text) and not re.search(
-                r"\b(student|parent|guardian|disabled|relative|half|"
-                r"live|living|school)\b",
-                text,
-                re.I,
-            ):
-                return ResolveResult(
-                    clarify=_with_full_question(
-                        step,
-                        "Please say which situation fits: student supported by a "
-                        "parent, you live with the person who supports you, disabled "
-                        "and live with them year-round, or a relative supports you.",
-                        options=options,
-                    ),
-                    detail="support_clarify",
-                )
-            return ResolveResult(answer=text, detail="support_yes")
+        support_choice = _support_choice(text, options)
+        if support_choice == "ambiguous":
+            return ResolveResult(
+                clarify=_with_full_question(
+                    step,
+                    "Please say which situation fits: student supported by a "
+                    "parent, you live with the person who supports you, disabled "
+                    "and live with them year-round, or a relative supports you.",
+                    options=options,
+                ),
+                detail="support_clarify",
+            )
+        if support_choice:
+            return ResolveResult(answer=support_choice, detail="support_yes")
         return ResolveResult(
             clarify=_with_full_question(
                 step,
@@ -862,6 +880,11 @@ def resolve_answer(
             if len(mapped_special) > 1:
                 # Multi-select: keep the spoken utterance; Playwright maps again.
                 return ResolveResult(answer=text, detail="special_multi")
+            from .live_form import _utterance_is_household_member
+
+            if _utterance_is_household_member(text, choice_opts or options):
+                # A person name is not a condition and must not skip member selection.
+                return ResolveResult(answer=text, detail="special_member_name")
             return ResolveResult(
                 clarify=_options_clarify(
                     step,

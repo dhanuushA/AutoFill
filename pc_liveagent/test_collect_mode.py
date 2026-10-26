@@ -1731,6 +1731,95 @@ class SupportScreenTests(unittest.TestCase):
         self.assertEqual(answer, "No")
         self.assertIsNone(clarify)
 
+    def test_support_paraphrases_map_before_claude(self) -> None:
+        from pc_liveagent.answer_parse import is_fast_path_resolve, resolve_answer
+
+        labels = [
+            "Yes, I am a full-time student and my parent or legal guardian supports me.",
+            "Yes, I live more than half the year with the person that supports me.",
+            "Yes, I'm disabled and live year-round with the person that supports me.",
+            "Yes, I live more than half the year with a relative that supports me.",
+            "No",
+        ]
+        student = labels[0]
+        for utterance in ("I'm a student", "Student supported by parent"):
+            resolved = resolve_answer("support", utterance, options=labels)
+            self.assertEqual(resolved.answer, student, utterance)
+            self.assertEqual(resolved.detail, "support_yes")
+            self.assertTrue(is_fast_path_resolve(resolved), utterance)
+        live = resolve_answer(
+            "support", "I live with the person who supports me", options=labels
+        )
+        self.assertEqual(live.answer, labels[1])
+        self.assertTrue(is_fast_path_resolve(live))
+        disabled = resolve_answer("support", "I'm disabled", options=labels)
+        self.assertEqual(disabled.answer, labels[2])
+        relative = resolve_answer(
+            "support", "a relative supports me", options=labels
+        )
+        self.assertEqual(relative.answer, labels[3])
+        no = resolve_answer("support", "No", options=labels)
+        self.assertEqual(no.answer, "No")
+        self.assertEqual(no.detail, "support_no")
+        self.assertTrue(is_fast_path_resolve(no))
+
+    def test_support_ambiguous_asks_clarification(self) -> None:
+        from pc_liveagent.answer_parse import is_fast_path_resolve, resolve_answer
+
+        labels = [
+            "Yes, I am a full-time student and my parent or legal guardian supports me.",
+            "Yes, I live more than half the year with the person that supports me.",
+            "Yes, I'm disabled and live year-round with the person that supports me.",
+            "Yes, I live more than half the year with a relative that supports me.",
+            "No",
+        ]
+        for utterance in ("Yes", "maybe", "I'm a student and also disabled"):
+            resolved = resolve_answer("support", utterance, options=labels)
+            self.assertIsNone(resolved.answer, utterance)
+            self.assertIn(
+                resolved.detail, ("support_clarify", "support_unclear"), utterance
+            )
+            self.assertFalse(is_fast_path_resolve(resolved), utterance)
+            self.assertTrue(resolved.clarify, utterance)
+
+    def test_support_long_wrapper_drops_household_chips(self) -> None:
+        from pc_liveagent.live_form import (
+            _SUPPORT_CANONICAL,
+            _map_support_yes_label,
+            _support_option_labels,
+        )
+
+        student, lives, disabled, relative, no = _SUPPORT_CANONICAL
+        long_wrapper = (
+            "Your household Agent You john Partner "
+            + " ".join(_SUPPORT_CANONICAL)
+            + " extra wrapper text so this label is longer than the generic "
+            "one hundred forty character choice cap and must still be read."
+        )
+        labels = _support_option_labels(
+            ["Your household", "Agent You", "john Partner", long_wrapper]
+        )
+        self.assertEqual(labels, [student, lives, disabled, relative, no])
+        self.assertNotIn("john Partner", labels)
+        self.assertNotIn("Agent You", labels)
+        self.assertEqual(_map_support_yes_label("I'm a student", []), student)
+        self.assertEqual(
+            _map_support_yes_label("Student supported by parent", [long_wrapper]),
+            student,
+        )
+        self.assertEqual(_map_support_yes_label("I'm disabled", labels), disabled)
+        self.assertIn(
+            "person that supports",
+            _map_support_yes_label(
+                "I live with the person who supports me", labels
+            ).lower(),
+        )
+        self.assertIn(
+            "relative",
+            _map_support_yes_label("a relative supports me", labels).lower(),
+        )
+        self.assertEqual(_map_support_yes_label("No", labels), "")
+
 
 class ConfigTests(unittest.TestCase):
     def test_websocket_url_from_webhook(self) -> None:
@@ -2868,6 +2957,7 @@ class ControlIntentAndMetaTests(unittest.TestCase):
         from pc_liveagent.elig_meta import get_field_meta
         from pc_liveagent.live_form import (
             _map_relationship_label,
+            _relationship_option_labels,
             relationship_question_speech,
         )
 
@@ -2896,6 +2986,30 @@ class ControlIntentAndMetaTests(unittest.TestCase):
             "person_rel", ["Child", "Stepchild", "Grandchild"]
         )
         self.assertNotIn("other", no_other.lower())
+        mixed = [
+            "Your household",
+            "Agent You",
+            "john Partner",
+            "Child",
+            "Stepchild",
+            "Grandchild",
+            "Foster Child",
+            "Other",
+        ]
+        kept = _relationship_option_labels(mixed)
+        self.assertEqual(
+            kept, ["Child", "Stepchild", "Grandchild", "Foster Child", "Other"]
+        )
+        spoken = relationship_question_speech("child_rel", mixed).lower()
+        self.assertNotIn("john partner", spoken)
+        self.assertNotIn("agent you", spoken)
+        self.assertNotIn("your household", spoken)
+        self.assertIn("foster child", spoken)
+        self.assertIn("other", spoken)
+        self.assertEqual(
+            _map_relationship_label("partner", ["john Partner", "Spouse", "Partner"]),
+            "Partner",
+        )
 
     def test_resolve_age_with_options(self) -> None:
         from pc_liveagent.answer_parse import resolve_answer
@@ -3899,6 +4013,85 @@ class SpecialConditionAndPersonTests(unittest.TestCase):
             _map_special_condition_labels("none of the above", self.SPECIAL_OPTS),
             ["None of the above"],
         )
+        self.assertEqual(
+            _map_special_condition_labels("none", self.SPECIAL_OPTS),
+            ["None of the above"],
+        )
+        self.assertEqual(
+            _map_special_condition_labels("of the above", self.SPECIAL_OPTS),
+            [],
+        )
+        self.assertEqual(
+            _map_special_condition_labels("of the above.", self.SPECIAL_OPTS),
+            [],
+        )
+
+    def test_household_bar_splits_into_member_identities(self) -> None:
+        from pc_liveagent.answer_parse import is_fast_path_resolve, resolve_answer
+        from pc_liveagent.elig_meta import get_field_meta
+        from pc_liveagent.live_form import (
+            _expand_household_member_bar,
+            _is_plausible_member_label,
+            _match_member_rows,
+        )
+
+        pieces = _expand_household_member_bar(
+            "Your household Agent You john Partner"
+        )
+        self.assertEqual(
+            [(item["label"], item["role"]) for item in pieces],
+            [("Agent", "You"), ("john", "Partner")],
+        )
+        self.assertFalse(
+            _is_plausible_member_label("Your household Agent You john Partner")
+        )
+        self.assertFalse(_is_plausible_member_label("Partner"))
+        self.assertTrue(_is_plausible_member_label("Agent"))
+        self.assertTrue(_is_plausible_member_label("john"))
+        members = [
+            {
+                "label": "Agent",
+                "role": "You",
+                "chip": "Agent You",
+                "dupIndex": 0,
+                "checked": False,
+            },
+            {
+                "label": "john",
+                "role": "Partner",
+                "chip": "john Partner",
+                "dupIndex": 0,
+                "checked": False,
+            },
+        ]
+        john = _match_member_rows("john", members)
+        self.assertEqual([item["chip"] for item in john], ["john Partner"])
+        partner = _match_member_rows("partner", members)
+        self.assertEqual([item["label"] for item in partner], ["john"])
+        self.assertEqual(_match_member_rows("Alex", members), [])
+        ambiguous = members + [
+            {
+                "label": "john",
+                "role": "Child",
+                "chip": "john Child",
+                "dupIndex": 1,
+                "checked": False,
+            }
+        ]
+        self.assertEqual(len(_match_member_rows("john", ambiguous)), 2)
+        self.assertEqual(
+            [item["label"] for item in _match_member_rows("partner", ambiguous)],
+            ["john"],
+        )
+        named = resolve_answer(
+            "special",
+            "john",
+            options=["Your household Agent You john Partner", *self.SPECIAL_OPTS],
+            meta=get_field_meta("special"),
+        )
+        self.assertEqual(named.detail, "special_member_name")
+        self.assertTrue(is_fast_path_resolve(named))
+        self.assertNotEqual(named.answer, "None of the above")
 
     def test_relationship_synonyms(self) -> None:
         from pc_liveagent.live_form import _map_relationship_label
@@ -7271,6 +7464,165 @@ class MemberConfirmCorrectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("13-to-15", (result.speech or "").lower())
         self.assertEqual(session.filled.get("child_first"), "Jackie")
         nav.assert_not_awaited()
+        await drop_controller(call_id)
+
+    async def test_support_student_survives_claude_timeout(self) -> None:
+        from pc_liveagent.answer_parse import ClaudeResolveResult
+        from pc_liveagent.call_turn import drop_controller, get_controller, process_user_turn
+        from pc_liveagent.live_form import LiveFormSession, _SUPPORT_CANONICAL
+
+        call_id = "support-student-timeout"
+        await drop_controller(call_id)
+        ctrl = await get_controller(call_id)
+        ctrl.phase = "eligibility"
+        ctrl.eligibility_question_sent = True
+        ctrl.active_websocket_status = "connected"
+        session = LiveFormSession(
+            call_id=call_id, url="https://example.test", elig_step="support"
+        )
+        submitted: list[str] = []
+
+        async def fake_submit(_cid, _field, answer, **_kwargs):
+            submitted.append(answer)
+            session.elig_step = "income_when"
+            return {
+                "ok": True,
+                "spoken": "What is your household income?",
+                "step": "income_when",
+            }
+
+        claude = AsyncMock(
+            return_value=ClaudeResolveResult(
+                accepted=False,
+                needs_clarify=True,
+                reject_reason="timeout",
+                latency_ms=1500,
+            )
+        )
+        with (
+            patch("pc_liveagent.call_turn.get_session", AsyncMock(return_value=session)),
+            patch("pc_liveagent.call_turn.peek_choice_labels", AsyncMock(return_value=[])),
+            patch("pc_liveagent.call_turn.resolve_with_claude", claude),
+            patch("pc_liveagent.call_turn.submit_field", side_effect=fake_submit),
+        ):
+            await process_user_turn(call_id, "I'm a student.", response_id=3)
+            task = __import__(
+                "pc_liveagent.call_turn", fromlist=["_elig_browser_tasks"]
+            )._elig_browser_tasks.get(call_id)
+            if task:
+                await asyncio.wait_for(task, timeout=2.0)
+        claude.assert_not_awaited()
+        self.assertEqual(submitted, [_SUPPORT_CANONICAL[0]])
+        await drop_controller(call_id)
+
+    async def test_correction_phrases_edit_only_named_field(self) -> None:
+        from pc_liveagent.call_turn import drop_controller, get_controller, process_user_turn
+        from pc_liveagent.control_intent import parse_member_correction
+        from pc_liveagent.live_form import LiveFormSession
+
+        self.assertEqual(
+            parse_member_correction("change the last name to Patel"),
+            ("last_name", "Patel"),
+        )
+        self.assertEqual(
+            parse_member_correction("the age is seven"),
+            ("age", "seven"),
+        )
+        self.assertEqual(
+            parse_member_correction("their relationship is Grandchild"),
+            ("relationship", "Grandchild"),
+        )
+        self.assertEqual(parse_member_correction("change the name"), ("name", ""))
+
+        call_id = "corr-phrases"
+        await drop_controller(call_id)
+        ctrl = await get_controller(call_id)
+        ctrl.phase = "eligibility"
+        ctrl.eligibility_question_sent = True
+        ctrl.active_websocket_status = "connected"
+        session = LiveFormSession(
+            call_id=call_id, url="https://example.test", elig_step="child_confirm"
+        )
+        session.filled.update(
+            {
+                "child_first": "Jackie",
+                "child_last": "Smith",
+                "child_rel": "Child",
+                "child_age": "(1-5) Toddler",
+            }
+        )
+        ctrl.pending_correction = {
+            "field": "",
+            "need_field": True,
+            "prompt": "Which detail should I change?",
+        }
+        edits: list[tuple[str, str]] = []
+
+        async def fake_edit(_cid, field, value):
+            edits.append((field, value))
+            key = {
+                "first_name": "child_first",
+                "last_name": "child_last",
+                "age": "child_age",
+                "relationship": "child_rel",
+            }[field]
+            session.filled[key] = value
+            return {
+                "ok": True,
+                "step": "child_confirm",
+                "spoken": f"Updated the {field}.",
+            }
+
+        with (
+            patch("pc_liveagent.call_turn.get_session", AsyncMock(return_value=session)),
+            patch("pc_liveagent.call_turn.correct_member_field", side_effect=fake_edit),
+            patch("pc_liveagent.call_turn.submit_field", AsyncMock()),
+            patch("pc_liveagent.call_turn.navigate_back_one", AsyncMock()),
+        ):
+            unclear = await process_user_turn(call_id, "hmm", response_id=1)
+            self.assertEqual(unclear.detail, "correction_clarify_field")
+            self.assertEqual(edits, [])
+            self.assertIsNotNone(ctrl.pending_correction)
+            self.assertEqual(session.filled["child_first"], "Jackie")
+
+            named = await process_user_turn(call_id, "change the name", response_id=2)
+            self.assertEqual(named.detail, "correction_clarify_name")
+            self.assertIn("first name or the last name", named.speech.lower())
+            self.assertEqual(edits, [])
+            self.assertEqual(session.filled["child_first"], "Jackie")
+            self.assertEqual((ctrl.pending_correction or {}).get("field"), "name")
+
+            last = await process_user_turn(
+                call_id, "change the last name to Patel", response_id=3
+            )
+            self.assertEqual(last.detail, "member_corrected")
+            self.assertEqual(edits, [("last_name", "Patel")])
+            self.assertEqual(session.filled["child_first"], "Jackie")
+            self.assertEqual(session.filled["child_rel"], "Child")
+            self.assertEqual(session.filled["child_age"], "(1-5) Toddler")
+
+            ctrl.pending_correction = {
+                "field": "",
+                "need_field": True,
+                "prompt": "Which detail should I change?",
+            }
+            age = await process_user_turn(call_id, "the age is seven", response_id=4)
+            ctrl.pending_correction = {
+                "field": "",
+                "need_field": True,
+                "prompt": "Which detail should I change?",
+            }
+            rel = await process_user_turn(
+                call_id, "their relationship is Grandchild", response_id=5
+            )
+        self.assertEqual(age.detail, "member_corrected")
+        self.assertEqual(rel.detail, "member_corrected")
+        self.assertEqual(
+            edits[1:],
+            [("age", "seven"), ("relationship", "Grandchild")],
+        )
+        self.assertEqual(session.filled["child_first"], "Jackie")
+        self.assertEqual(session.filled["child_last"], "Patel")
         await drop_controller(call_id)
 
     async def test_spouse_confirm_no_preserves_values(self) -> None:

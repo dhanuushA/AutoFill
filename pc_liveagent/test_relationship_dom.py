@@ -474,6 +474,140 @@ class RelationshipDomTests(unittest.IsolatedAsyncioTestCase):
         kept = await self._page.evaluate("() => document.querySelector('#first').value")
         self.assertEqual(kept, "Pat")
 
+    async def test_relationship_options_exclude_household_chips(self) -> None:
+        from pc_liveagent.live_form import (
+            LiveFormSession,
+            _relationship_speech_for_page,
+            _visible_relationship_option_labels,
+        )
+
+        await self._page.set_content(
+            """
+            <nav>
+              <button type="button">Your household</button>
+              <button type="button">Agent You</button>
+              <button type="button">john Partner</button>
+            </nav>
+            <section style="padding:12px">
+              <p>Relationship to me</p>
+              <div>
+                <button type="button">Child</button>
+                <button type="button">Stepchild</button>
+                <button type="button">Grandchild</button>
+                <button type="button">Foster Child</button>
+                <button type="button">Other</button>
+              </div>
+            </section>
+            """
+        )
+        labels = await _visible_relationship_option_labels(self._page)
+        self.assertEqual(
+            labels,
+            ["Child", "Stepchild", "Grandchild", "Foster Child", "Other"],
+        )
+        session = LiveFormSession(call_id="rel-chips", url="https://example.test")
+        speech = await _relationship_speech_for_page(session, self._page, "person_rel")
+        low = speech.lower()
+        self.assertNotIn("john partner", low)
+        self.assertNotIn("agent you", low)
+        self.assertNotIn("your household", low)
+        for option in ("child", "stepchild", "grandchild", "foster child", "other"):
+            self.assertIn(option, low)
+
+        await self._page.set_content(
+            """
+            <nav>
+              <button type="button">Agent You</button>
+              <button type="button">john Partner</button>
+            </nav>
+            <section style="padding:12px">
+              <p>Are they your spouse or your partner?</p>
+              <div>
+                <button type="button">Spouse</button>
+                <button type="button">Partner</button>
+              </div>
+            </section>
+            """
+        )
+        spouse = await _visible_relationship_option_labels(self._page)
+        self.assertEqual(spouse, ["Spouse", "Partner"])
+
+    async def test_support_options_keep_long_labels_without_household(self) -> None:
+        from pc_liveagent.live_form import (
+            _SUPPORT_CANONICAL,
+            _visible_support_option_labels,
+        )
+
+        student, lives, disabled, relative, no = _SUPPORT_CANONICAL
+        blob = " ".join(_SUPPORT_CANONICAL)
+        await self._page.set_content(
+            f"""
+            <nav>
+              <button type="button">Your household</button>
+              <button type="button">Agent You</button>
+              <button type="button">john Partner</button>
+            </nav>
+            <section style="padding:12px">
+              <p>Does someone provide more than half of your annual financial support?</p>
+              <div class="options">{blob}</div>
+            </section>
+            """
+        )
+        labels = await _visible_support_option_labels(self._page)
+        self.assertEqual(labels, [student, lives, disabled, relative, no])
+        joined = " ".join(labels).lower()
+        self.assertNotIn("john partner", joined)
+        self.assertNotIn("agent you", joined)
+        self.assertNotIn("your household", joined)
+
+    async def test_special_members_are_separate_from_household_bar(self) -> None:
+        from pc_liveagent.live_form import (
+            _click_special_person_member,
+            _discover_special_person_members,
+        )
+
+        await self._page.set_content(
+            """
+            <nav>
+              <div>Your household <span>Agent</span> <span>You</span>
+                <span>john</span> <span>Partner</span></div>
+            </nav>
+            <section>
+              <p>Someone is blind</p>
+              <p>Who does this apply to?</p>
+              <div>
+                <button id="agent" type="button" role="checkbox" aria-checked="false"
+                  onclick="this.setAttribute('aria-checked','true')"></button>
+                <span>Agent</span><span>You</span>
+              </div>
+              <div>
+                <button id="john" type="button" role="checkbox" aria-checked="false"
+                  onclick="this.setAttribute('aria-checked','true')"></button>
+                <span>john</span><span>Partner</span>
+              </div>
+            </section>
+            """
+        )
+        discovered = await _discover_special_person_members(
+            self._page, "Someone is blind"
+        )
+        labels = [member["label"] for member in discovered["members"]]
+        self.assertEqual(labels, ["Agent", "john"])
+        self.assertNotIn("Your household", labels)
+        self.assertNotIn("Partner", labels)
+        clicked = await _click_special_person_member(
+            self._page, "john Partner", condition="Someone is blind"
+        )
+        self.assertTrue(clicked)
+        state = await self._page.evaluate(
+            """() => ({
+              john: document.querySelector('#john').getAttribute('aria-checked'),
+              agent: document.querySelector('#agent').getAttribute('aria-checked'),
+            })"""
+        )
+        self.assertEqual(state["john"], "true")
+        self.assertEqual(state["agent"], "false")
+
 
 if __name__ == "__main__":
     unittest.main()

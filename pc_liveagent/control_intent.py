@@ -129,6 +129,89 @@ _CORRECT_NAME_RE = re.compile(
 )
 
 
+_CORRECTION_VALUE_PATTERNS: tuple[tuple[str, str], ...] = (
+    (
+        r"(?:change|correct|update|fix)\s+(?:the\s+|their\s+|his\s+|her\s+|my\s+)?"
+        r"first\s+name\s+(?:to|into|as|is)\s+(?P<value>.+)$",
+        "first_name",
+    ),
+    (
+        r"(?:change|correct|update|fix)\s+(?:the\s+|their\s+|his\s+|her\s+|my\s+)?"
+        r"last\s+name\s+(?:to|into|as|is)\s+(?P<value>.+)$",
+        "last_name",
+    ),
+    (
+        r"(?:change|correct|update|fix)\s+(?:the\s+|their\s+|his\s+|her\s+|my\s+)?"
+        r"age\s+(?:to|into|as|is)\s+(?P<value>.+)$",
+        "age",
+    ),
+    (
+        r"(?:change|correct|update|fix)\s+(?:the\s+|their\s+|his\s+|her\s+|my\s+)?"
+        r"relationship\s+(?:to|into|as|is)\s+(?P<value>.+)$",
+        "relationship",
+    ),
+    (
+        r"(?:the\s+|their\s+|his\s+|her\s+|my\s+)?first\s+name\s+is\s+(?P<value>.+)$",
+        "first_name",
+    ),
+    (
+        r"(?:the\s+|their\s+|his\s+|her\s+|my\s+)?last\s+name\s+is\s+(?P<value>.+)$",
+        "last_name",
+    ),
+    (
+        r"(?:the\s+|their\s+|his\s+|her\s+|my\s+)?age\s+is\s+(?P<value>.+)$",
+        "age",
+    ),
+    (
+        r"(?:the\s+|their\s+|his\s+|her\s+|my\s+)?relationship\s+is\s+(?P<value>.+)$",
+        "relationship",
+    ),
+    (
+        r"(?:change|correct|update|fix)\s+(?:the\s+|their\s+|his\s+|her\s+|my\s+)?"
+        r"name\s+(?:to|into|as|is)\s+(?P<value>.+)$",
+        "name",
+    ),
+)
+
+
+def parse_member_correction(utterance: str) -> tuple[str, str]:
+    """Return (field, value) for a member-detail correction.
+
+    ``field`` is first_name, last_name, age, relationship, or name.
+    ``name`` means the caller said name without first or last.
+    Both strings are empty when this utterance does not identify a field.
+    """
+    text = normalize_utterance(utterance)
+    if not text:
+        return "", ""
+    for pattern, field in _CORRECTION_VALUE_PATTERNS:
+        match = re.search(pattern, text, re.I)
+        if not match:
+            continue
+        value = re.sub(r"\s+", " ", (match.group("value") or "")).strip(" .")
+        return field, value
+    if re.search(r"\bfirst\s+name\b", text, re.I):
+        return "first_name", ""
+    if re.search(r"\blast\s+name\b", text, re.I):
+        return "last_name", ""
+    if re.search(r"\b(change|correct|update|fix|wrong)\b", text, re.I):
+        if re.search(r"\bage\b", text, re.I):
+            return "age", ""
+        if re.search(r"\brelationship\b", text, re.I):
+            return "relationship", ""
+        if re.search(r"\bname\b", text, re.I):
+            return "name", ""
+    only = re.fullmatch(
+        r"(?:the\s+)?(first\s+name|last\s+name|name|age|relationship)[.!]?",
+        text,
+        re.I,
+    )
+    if only:
+        raw = re.sub(r"\s+", "_", only.group(1).lower())
+        return raw, ""
+    return "", ""
+
+
 def detect_control_intent(utterance: str) -> ControlIntent:
     """Classify navigation/correction requests. Prefer specific intents over answers."""
     text = normalize_utterance(utterance)
@@ -169,7 +252,8 @@ def detect_control_intent(utterance: str) -> ControlIntent:
         elif re.search(r"\brelationship\b", text, re.I):
             target = "relationship"
         elif re.search(r"\bname\b", text, re.I):
-            target = "first_name"
+            # "name" alone is not the first name. Ask which one.
+            target = "name"
         return ControlIntent("change", target=target)
     if _REDO_RE.search(text):
         return ControlIntent("redo")
