@@ -43,7 +43,7 @@ def normalize_phone(raw: str) -> str:
 
 def _headers() -> dict[str, str]:
     return {
-        "Authorization": f"Bearer {config.RETELL_API_KEY}",
+        "Authorization": f"Bearer {config.PC_FORMFILLER_RETELL_API_KEY}",
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
@@ -212,20 +212,91 @@ def _engine_type_of(agent: dict[str, Any]) -> str:
     return ""
 
 
+def _list_voice_agents(*, query: str = "", limit: int = 100) -> list[dict[str, Any]]:
+    """List voice agents via POST /v2/list-agents (GET /list-agents is removed)."""
+    body: dict[str, Any] = {
+        "filter_criteria": {
+            "channel": {"type": "string", "op": "eq", "value": "voice"},
+        }
+    }
+    if query:
+        body["filter_criteria"]["query"] = query
+
+    out: list[dict[str, Any]] = []
+    pagination_key: str | None = None
+    while True:
+        params: dict[str, Any] = {"limit": limit}
+        if pagination_key:
+            params["pagination_key"] = pagination_key
+        status_code, parsed, _err = _request(
+            "POST", "/v2/list-agents", json_body=body, params=params
+        )
+        if status_code >= 400 or not isinstance(parsed, dict):
+            if not out:
+                # Older Retell accounts may still allow legacy GET.
+                status_code, parsed, _err = _request(
+                    "GET", "/list-agents", params={"limit": limit}
+                )
+                return _as_list(parsed)
+            break
+        items = parsed.get("items")
+        if isinstance(items, list):
+            out.extend(item for item in items if isinstance(item, dict))
+        if not parsed.get("has_more"):
+            break
+        next_key = str(parsed.get("pagination_key") or "").strip()
+        if not next_key or next_key == pagination_key:
+            break
+        pagination_key = next_key
+    return out
+
+
 def _find_agent_by_name(name: str) -> tuple[str, dict[str, Any]]:
-    status_code, parsed, _err = _request("GET", "/list-agents", params={"limit": 50})
-    if status_code >= 400:
-        status_code, parsed, _err = _request("GET", "/v2/list-agents", params={"limit": 50})
-    for item in _as_list(parsed):
-        if str(item.get("agent_name") or item.get("name") or "").strip() == name:
-            agent_id = _agent_id_of(item)
-            if not agent_id:
-                continue
-            _sc, full, _e = _request("GET", f"/get-agent/{agent_id}")
-            if _sc < 400 and isinstance(full, dict):
-                return agent_id, full
-            return agent_id, item
-    return "", {}
+    """Return an existing agent with this exact name (never creates).
+
+    With many duplicate Collect agents, only fetch full details for a few
+    candidates and prefer a published custom-llm with the current websocket URL.
+    """
+    desired_url = str((_response_engine() or {}).get("llm_websocket_url") or "").strip()
+    matches = [
+        item
+        for item in _list_voice_agents(query=name)
+        if str(item.get("agent_name") or item.get("name") or "").strip() == name
+    ]
+    if not matches:
+        matches = [
+            item
+            for item in _list_voice_agents()
+            if str(item.get("agent_name") or item.get("name") or "").strip() == name
+        ]
+
+    best_id = ""
+    best_agent: dict[str, Any] = {}
+    best_score = -1
+    # Cap lookups — dozens of duplicates from older create-on-every-call bugs.
+    for item in matches[:8]:
+        agent_id = _agent_id_of(item)
+        if not agent_id:
+            continue
+        _sc, full, _e = _request("GET", f"/get-agent/{agent_id}")
+        agent = full if _sc < 400 and isinstance(full, dict) else item
+        if config.USE_CUSTOM_LLM and _engine_type_of(agent) and _engine_type_of(agent) != "custom-llm":
+            continue
+        score = 0
+        if agent.get("is_published"):
+            score += 2
+        if _engine_type_of(agent) == "custom-llm":
+            score += 2
+        if desired_url and _custom_llm_websocket_url(agent) == desired_url:
+            score += 3
+        if score > best_score:
+            best_score = score
+            best_id = agent_id
+            best_agent = agent
+            # Perfect match: published custom-llm with current tunnel URL.
+            if score >= 7:
+                break
+    return best_id, best_agent
 
 
 def _create_custom_llm_agent(settings_body: dict[str, Any]) -> tuple[str, str, int | None]:
@@ -310,6 +381,13 @@ def _open_draft(agent_id: str, agent: dict[str, Any]) -> tuple[dict[str, Any], s
     return parsed, ""
 
 
+def _custom_llm_websocket_url(agent: dict[str, Any]) -> str:
+    engine = agent.get("response_engine")
+    if isinstance(engine, dict):
+        return str(engine.get("llm_websocket_url") or "").strip()
+    return ""
+
+
 def _ensure_agent(configured_id: str) -> tuple[str, str, int | None]:
     settings_body = dict(pointcare_agent_settings())
     # Eligibility flow is English-only; ignore any multi-language script defaults.
@@ -340,37 +418,49 @@ def _ensure_agent(configured_id: str) -> tuple[str, str, int | None]:
                         _engine_type_of(parsed) or "unknown",
                         _AGENT_NAME_CUSTOM_LLM,
                     )
+            else:
+                logger.warning(
+                    "FORM_FILLER_AGENT_ID %s not found in this Retell project "
+                    "(status=%s); searching by name instead of creating a new agent. %s",
+                    configured_id,
+                    status_code,
+                    (err or "")[:160],
+                )
         if not agent_id:
             for name in preferred_names:
                 found_id, found = _find_agent_by_name(name)
                 if found_id and _engine_type_of(found) == "custom-llm":
                     agent_id, agent = found_id, found
+                    logger.info(
+                        "Reusing existing Custom LLM agent by name=%s id=%s",
+                        name,
+                        agent_id,
+                    )
                     break
         if not agent_id:
+            # Last resort only when this Retell project has no matching agent.
             return _create_custom_llm_agent(settings_body)
 
-        agent, draft_err = _open_draft(agent_id, agent)
-        if draft_err:
-            return "", draft_err, None
+        desired = _response_engine()
+        desired_url = str(desired.get("llm_websocket_url") or "").strip()
+        current_url = _custom_llm_websocket_url(agent)
         version = _version_of(agent)
-        # Keep websocket URL current (allowed as settings-adjacent update when already custom-llm).
-        engine_err = _attach_response_engine(agent_id, version)
-        if engine_err and "Cannot update response engine" not in engine_err:
-            # Retry URL-only style: some accounts reject type change but allow same-type URL patch.
-            logger.warning("Custom LLM engine patch note: %s", engine_err[:200])
-        status_code, updated, err = _request(
-            "PATCH",
-            f"/update-agent/{agent_id}",
-            json_body=settings_body,
-            params={"version": version} if version is not None else None,
+        # Always reuse an existing custom-llm agent for calls. Do not open a draft
+        # or create a new agent/version just because the tunnel URL differs —
+        # call placement already works with the published agent id.
+        if current_url != desired_url:
+            logger.warning(
+                "Custom LLM websocket URL differs on agent %s "
+                "(agent=%s desired=%s); still reusing without creating a draft",
+                agent_id,
+                current_url,
+                desired_url,
+            )
+        logger.info(
+            "Reusing Custom LLM agent id=%s version=%s (skip draft/create)",
+            agent_id,
+            version,
         )
-        if status_code >= 400:
-            return "", err or "Failed to update the Custom LLM agent.", None
-        if isinstance(updated, dict):
-            version = _version_of(updated) or version
-        publish_err = _publish_agent(agent_id, version)
-        if publish_err:
-            return "", publish_err, None
         return agent_id, "", version
 
     agent_id = ""
@@ -396,6 +486,15 @@ def _ensure_agent(configured_id: str) -> tuple[str, str, int | None]:
         agent_id, agent = _find_agent_by_name(_AGENT_NAME_ELIGIBILITY)
 
     if agent_id:
+        # Reuse published retell-llm agent; call body already carries webhook/dynamic vars.
+        version = _version_of(agent)
+        if agent.get("is_published") and _llm_id_of(agent):
+            logger.info(
+                "Reusing Retell LLM agent id=%s version=%s (skip draft)",
+                agent_id,
+                version,
+            )
+            return agent_id, "", version
         agent, draft_err = _open_draft(agent_id, agent)
         if draft_err:
             return "", draft_err, None
@@ -475,8 +574,12 @@ def place_form_filler_call(
     form_name: str = "",
     agent_id: str = "",
 ) -> dict[str, Any]:
-    if not config.RETELL_API_KEY:
-        return {"ok": False, "error": "RETELL_API_KEY is not set in .env", "status_code": 503}
+    if not config.PC_FORMFILLER_RETELL_API_KEY:
+        return {
+            "ok": False,
+            "error": "PC_FORMFILLER_RETELL_API_KEY is not set in .env",
+            "status_code": 503,
+        }
 
     phone = normalize_phone(phone_number)
     if not phone or len(_digits(phone)) < 10:
@@ -505,6 +608,16 @@ def place_form_filler_call(
         "from_number": from_number,
         "to_number": phone,
         "override_agent_id": resolved_agent,
+        # Apply STT vocabulary per call as well as on newly-created agents.
+        # Existing published agents are intentionally reused without drafts, so
+        # relying only on agent settings would leave older agents unboosted.
+        "agent_override": {
+            "agent": {
+                "boosted_keywords": list(
+                    pointcare_agent_settings().get("boosted_keywords") or ()
+                ),
+            },
+        },
         "retell_llm_dynamic_variables": {
             "name": who,
             "first_name": who,

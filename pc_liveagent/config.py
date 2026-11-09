@@ -89,14 +89,83 @@ def application_after_signin_from_env(env: dict | None = None) -> bool:
 
 APPLICATION_AFTER_SIGNIN = application_after_signin_from_env()
 
+
+def application_only_test_mode_from_env(env: dict | None = None) -> bool:
+    """True only for the dedicated application-only test flag.
+
+    Disabled by default. Independent of APPLICATION_TEST_MODE and
+    APPLICATION_AFTER_SIGNIN. Production stays off unless
+    POINTCARE_APPLICATION_ONLY_TEST_MODE_ALLOW_PROD is also explicitly true.
+    """
+    src = os.environ if env is None else env
+
+    def _flag(name: str) -> bool:
+        return str(src.get(name, "")).strip().lower() in ("true", "1", "yes")
+
+    if not _flag("POINTCARE_APPLICATION_ONLY_TEST_MODE"):
+        return False
+    pointcare_env = (
+        str(src.get("APP_ENV") or src.get("POINTCARE_ENV") or "development")
+        .strip()
+        .lower()
+    )
+    if pointcare_env in ("production", "prod") and not _flag(
+        "POINTCARE_APPLICATION_ONLY_TEST_MODE_ALLOW_PROD"
+    ):
+        return False
+    return True
+
+
+APPLICATION_ONLY_TEST_MODE = application_only_test_mode_from_env()
+
+
+def application_start_at_from_env(env: dict | None = None) -> str:
+    """Optional Stage E start step for application-only testing.
+
+    Empty (default) = land on question 1 as usual.
+    ``app_address_review`` / ``q4`` = skip to Address (Q4).
+    ``app_income`` / ``q10`` / ``income`` = skip to Work & Income.
+
+    Only used when APPLICATION_ONLY_TEST_MODE is on. Clearing this flag
+    restores the normal Q1 start after restart.
+    """
+    src = os.environ if env is None else env
+    raw = str(src.get("POINTCARE_APPLICATION_START_AT", "") or "").strip().lower()
+    if not raw or raw in ("0", "false", "no", "off", "q1", "app_citizenship", "first"):
+        return ""
+    aliases = {
+        "app_address_review": "app_address_review",
+        "app_address": "app_address_review",
+        "address": "app_address_review",
+        "q4": "app_address_review",
+        "4": "app_address_review",
+        "app_income": "app_income",
+        "income": "app_income",
+        "q9": "app_income",
+        "q10": "app_income",
+        "9": "app_income",
+        "10": "app_income",
+        "work_and_income": "app_income",
+        "work-and-income": "app_income",
+        "work & income": "app_income",
+    }
+    return aliases.get(raw, "")
+
+
+# Empty = Q1. Examples: app_address_review (Q4), app_income (Work & Income).
+APPLICATION_START_AT = application_start_at_from_env()
+
 # Visible at process start so operators can confirm shortcuts are off for full calls.
 import logging as _logging
 
 _logging.getLogger(__name__).info(
     "pointcare_flow_flags APPLICATION_TEST_MODE=%s APPLICATION_AFTER_SIGNIN=%s "
-    "(full call requires both false; restart after .env changes)",
+    "APPLICATION_ONLY_TEST_MODE=%s APPLICATION_START_AT=%r "
+    "(full call requires all false / empty start_at; restart after .env changes)",
     APPLICATION_TEST_MODE,
     APPLICATION_AFTER_SIGNIN,
+    APPLICATION_ONLY_TEST_MODE,
+    APPLICATION_START_AT,
 )
 
 MAX_STEPS = int(os.environ.get("MAX_STEPS", "25"))
@@ -216,7 +285,10 @@ def chrome_profile_label(profile_directory: str = "") -> str:
         pass
     return name
 FORM_FILLER_WEBHOOK_URL = os.environ.get("FORM_FILLER_WEBHOOK_URL", "").strip()
-RETELL_API_KEY = os.environ.get("RETELL_API_KEY", "").strip()
+# Form-filler / Collect Mode Retell project only. Django apps keep RETELL_API_KEY.
+PC_FORMFILLER_RETELL_API_KEY = os.environ.get(
+    "PC_FORMFILLER_RETELL_API_KEY", ""
+).strip()
 RETELL_FROM_NUMBER = (
     os.environ.get("RETELL_FROM_NUMBER", "").strip()
     or os.environ.get("FORM_FILLER_FROM_NUMBER", "").strip()

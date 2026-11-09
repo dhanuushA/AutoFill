@@ -17,6 +17,15 @@ def pointcare_agent_settings() -> dict[str, Any]:
     return {
         "language": "en-US",
         "begin_message_delay_ms": 800,
+        # Q9 income acronyms are repeatedly dropped as unintelligible by STT.
+        # Retell uses these to bias recognition; Python still validates/maps the
+        # resulting transcript before any browser action.
+        "boosted_keywords": [
+            "SSA",
+            "SSDI",
+            "Social Security Administration",
+            "Social Security Disability Insurance",
+        ],
         "call_screening_option": {
             "agent_identity": "Kyle",
             "call_purpose": (

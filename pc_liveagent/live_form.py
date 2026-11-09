@@ -44,6 +44,32 @@ class LiveFormSession:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
+def _application_step_answer_key(
+    session: LiveFormSession, answer: str
+) -> tuple[str, str]:
+    """Dedupe Stage E answers within the exact active subquestion.
+
+    Several Pointcare screens contain sequential questions under one
+    ``app_step`` and legitimately receive the same answer, especially the two
+    insurance questions "any other plans?" and "any other member?".
+    """
+    filled = session.filled or {}
+    context = "|".join(
+        (
+            session.app_step or "",
+            str(filled.get("app_insurance_coverage_phase") or ""),
+            str(filled.get("app_insurance_current") or "").lower(),
+            str(filled.get("app_immigration_current") or "").lower(),
+            str(filled.get("app_dob_current") or "").lower(),
+            str(filled.get("app_dob_component") or ""),
+            str(filled.get("app_dob_phase") or ""),
+            str(filled.get("app_pending_step") or ""),
+            str(filled.get("app_pending_question") or ""),
+        )
+    )
+    return context, (answer or "").lower()
+
+
 _sessions: dict[str, LiveFormSession] = {}
 _sessions_lock = asyncio.Lock()
 _active_call_id = ""
@@ -637,6 +663,7 @@ async def start_live_form(call_id: str, url: str = "") -> LiveFormSession:
                     if (
                         not config.APPLICATION_TEST_MODE
                         and not config.APPLICATION_AFTER_SIGNIN
+                        and not config.APPLICATION_ONLY_TEST_MODE
                     ):
                         page = await open_page(None)
                         session.page = page
@@ -651,6 +678,18 @@ async def start_live_form(call_id: str, url: str = "") -> LiveFormSession:
                         session.page = page
                         await _page_wait(page, 800, call_id=call_id)
                     session.url = page.url or target
+                if config.APPLICATION_ONLY_TEST_MODE:
+                    session.welcome_done = True
+                    session.error = ""
+                    session.status = "open"
+                    session.url = page.url or session.url
+                    session.ready.set()
+                    logger.info(
+                        "application_only_browser_ready call_id=%s url=%s",
+                        call_id,
+                        _safe_url_for_log(session.url),
+                    )
+                    return session
                 if (
                     config.APPLICATION_AFTER_SIGNIN
                     and not config.APPLICATION_TEST_MODE
@@ -994,16 +1033,40 @@ async def _post_auth_session_ready(page: Page) -> bool:
     """
     if await _already_signed_in(page):
         return True
-    if config.APPLICATION_TEST_MODE or config.APPLICATION_AFTER_SIGNIN:
+    if (
+        config.APPLICATION_TEST_MODE
+        or config.APPLICATION_AFTER_SIGNIN
+        or config.APPLICATION_ONLY_TEST_MODE
+    ):
         return await _application_test_authenticated(page)
     return False
 
 
-async def _sign_in_with_provider(session: LiveFormSession, button_name: str, email: str) -> str:
+async def _land_after_provider_auth(
+    session: LiveFormSession, page: Page, destination: str
+) -> str:
+    """Where to go after Google auth is verified on the main page."""
+    session.signed_in = True
+    if destination == "stay":
+        return "AUTHENTICATED"
+    if config.APPLICATION_AFTER_SIGNIN:
+        return await _open_saved_application(session, page)
+    return await _begin_eligibility(session, page)
+
+
+async def _sign_in_with_provider(
+    session: LiveFormSession,
+    button_name: str,
+    email: str,
+    destination: str = "eligibility",
+) -> str:
     """Click Continue with Google/Apple and pick the account they named."""
     page = session.page
     if page is None:
         raise RuntimeError("form page not ready")
+    if destination == "stay" and await _post_auth_session_ready(page):
+        session.signed_in = True
+        return "AUTHENTICATED"
     # OAuth cancel / session drop can bounce the shared tab to Get Started. Go to
     # /auth once — do not clear cookies or replay the 4 welcome clicks.
     if session.welcome_done and await _welcome_get_started_visible(page):
@@ -1026,7 +1089,7 @@ async def _sign_in_with_provider(session: LiveFormSession, button_name: str, ema
         session.elig_step = recovered
         return "ASK: " + ELIG_QUESTIONS[recovered]
     if await _post_auth_session_ready(page):
-        return await _begin_eligibility(session, page)
+        return await _land_after_provider_auth(session, page, destination)
     popup = _provider_popup(page)
     if popup is None:
         try:
@@ -1038,9 +1101,7 @@ async def _sign_in_with_provider(session: LiveFormSession, button_name: str, ema
             popup = _provider_popup(page)
     if popup is None:
         if await _post_auth_session_ready(page):
-            if config.APPLICATION_AFTER_SIGNIN:
-                return await _open_saved_application(session, page)
-            return await _begin_eligibility(session, page)
+            return await _land_after_provider_auth(session, page, destination)
         visible = await _visible_button_text(page)
         logger.error("Sign-in button missing url=%s buttons=%s", page.url, visible)
         raise RuntimeError(f"{button_name} was not on the page. Buttons: {visible}")
@@ -1085,9 +1146,7 @@ async def _sign_in_with_provider(session: LiveFormSession, button_name: str, ema
         if await _post_auth_session_ready(page):
             session.popup = None
             logger.info("Google sign-in verified on main page url=%s", page.url)
-            if config.APPLICATION_AFTER_SIGNIN:
-                return await _open_saved_application(session, page)
-            return await _begin_eligibility(session, page)
+            return await _land_after_provider_auth(session, page, destination)
         try:
             if popup.is_closed():
                 session.popup = None
@@ -1130,9 +1189,7 @@ async def _sign_in_with_provider(session: LiveFormSession, button_name: str, ema
             break
 
     if await _post_auth_session_ready(page):
-        if config.APPLICATION_AFTER_SIGNIN:
-            return await _open_saved_application(session, page)
-        return await _begin_eligibility(session, page)
+        return await _land_after_provider_auth(session, page, destination)
     logger.error(
         "Google account selected but sign-in was not verified main_url=%s popup_url=%s",
         page.url,
@@ -1152,6 +1209,11 @@ async def _open_saved_application(session: LiveFormSession, page: Page) -> str:
 
 async def _begin_eligibility(session: LiveFormSession, page: Page) -> str:
     """Open Check Household Eligibility, then return the first question."""
+    if config.APPLICATION_ONLY_TEST_MODE:
+        raise RuntimeError(
+            "APPLICATION_ONLY_TEST_MODE: refused to start Stage D. "
+            "The application-only startup must open Stage E itself."
+        )
     if config.APPLICATION_AFTER_SIGNIN:
         raise RuntimeError(
             "APPLICATION_AFTER_SIGNIN: refused to start Stage D after sign-in. "
@@ -2345,6 +2407,8 @@ async def promote_signed_in_to_eligibility(call_id: str) -> str | None:
     Application-after-signin waits until the caller chooses a sign-in method, then
     never opens Stage D.
     """
+    if config.APPLICATION_ONLY_TEST_MODE:
+        return None
     session = await get_session(call_id)
     if session is None or session.page is None:
         return None
@@ -2935,7 +2999,7 @@ async def submit_field(
                     if request_id:
                         session.processed_requests[request_id] = result
                     return result
-                step_key = (session.app_step, text.lower())
+                step_key = _application_step_answer_key(session, text)
                 if session.last_step_answer == step_key and session.last_result:
                     return session.last_result
                 result = await submit_application_answer(
@@ -10706,7 +10770,7 @@ def _choice_phrase(value: str) -> str:
         return "No"
     # ASR often turns "Never Married" into never matter / never marry / never merit.
     if re.search(r"\bnever\b", lowered) and re.search(
-        r"\b(married|marry|matter|merit|murder|marriage)\b", lowered
+        r"\b(married|marry|matter|merit|murder|marriage|mind)\b", lowered
     ):
         return "Never Married"
     marital = (

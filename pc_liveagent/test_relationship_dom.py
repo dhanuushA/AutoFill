@@ -659,19 +659,20 @@ class RelationshipDomTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             all(row["selected"] == "U.S. Citizen" for row in discovered)
         )
-        clicked = await _set_member_immigration_status(
+        clicked, click_reason = await _set_member_immigration_status(
             self._page,
             "john",
             "Satisfactory immigration status (green card, etc.)",
         )
         self.assertTrue(clicked)
-        self.assertTrue(
-            await _verify_member_immigration_status(
-                self._page,
-                "john",
-                "Satisfactory immigration status (green card, etc.)",
-            )
+        self.assertEqual(click_reason, "selected")
+        verified, verify_reason = await _verify_member_immigration_status(
+            self._page,
+            "john",
+            "Satisfactory immigration status (green card, etc.)",
         )
+        self.assertTrue(verified)
+        self.assertEqual(verify_reason, "verified")
         state = await self._page.evaluate(
             """() => ({
               clicks: window.clicks,
@@ -686,16 +687,337 @@ class RelationshipDomTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(state["johnCitizen"])
         self.assertTrue(state["johnStatus"])
         self.assertTrue(state["don"])
-        confirmed = await _set_member_immigration_status(
+        # Already selected for this member: accept without clicking/toggling.
+        confirmed, confirm_reason = await _set_member_immigration_status(
             self._page, "Don", "U.S. Citizen"
         )
         self.assertTrue(confirmed)
+        self.assertEqual(confirm_reason, "already_selected")
         clicks_after = await self._page.evaluate("() => window.clicks.slice()")
-        self.assertEqual(clicks_after, ["john:status", "don:citizen"])
+        self.assertEqual(clicks_after, ["john:status"])
         still_citizen = await self._page.evaluate(
             "() => document.querySelector('input[name=don][value=citizen]').checked"
         )
         self.assertTrue(still_citizen)
+
+    async def test_immigration_us_vs_u_s_punctuation_and_wrong_member(self) -> None:
+        from pc_liveagent.app_stage import (
+            _set_member_immigration_status,
+            _verify_member_immigration_status,
+        )
+
+        await self._page.set_content(
+            """
+            <section style="padding:12px">
+              <article>
+                <div>Agent T.</div>
+                <label><input type="radio" name="agent" value="c" checked
+                  onclick="window.clicks.push('agent:c')">US Citizen</label>
+                <label><input type="radio" name="agent" value="n"
+                  onclick="window.clicks.push('agent:n')">US National</label>
+                <label><input type="radio" name="agent" value="s"
+                  onclick="window.clicks.push('agent:s')">Satisfactory immigration status</label>
+                <label><input type="radio" name="agent" value="p"
+                  onclick="window.clicks.push('agent:p')">Prefer not to answer</label>
+              </article>
+              <article>
+                <div>john D.</div>
+                <label><input type="radio" name="john" value="c" checked
+                  onclick="window.clicks.push('john:c')">US Citizen</label>
+                <label><input type="radio" name="john" value="n"
+                  onclick="window.clicks.push('john:n')">US National</label>
+                <label><input type="radio" name="john" value="s"
+                  onclick="window.clicks.push('john:s')">Satisfactory immigration status</label>
+                <label><input type="radio" name="john" value="p"
+                  onclick="window.clicks.push('john:p')">Prefer not to answer</label>
+              </article>
+            </section>
+            <script>window.clicks = [];</script>
+            """
+        )
+        # Preselected US Citizen matches spoken U.S. Citizen — no click.
+        ok, reason = await _set_member_immigration_status(
+            self._page, "Agent T", "U.S. Citizen"
+        )
+        self.assertTrue(ok)
+        self.assertEqual(reason, "already_selected")
+        clicks = await self._page.evaluate("() => window.clicks.slice()")
+        self.assertEqual(clicks, [])
+
+        ok, reason = await _set_member_immigration_status(
+            self._page, "Agent T.", "U.S. National"
+        )
+        self.assertTrue(ok)
+        self.assertEqual(reason, "selected")
+        verified, _ = await _verify_member_immigration_status(
+            self._page, "Agent T", "US National"
+        )
+        self.assertTrue(verified)
+        state = await self._page.evaluate(
+            """() => ({
+              clicks: window.clicks.slice(),
+              agentN: document.querySelector('input[name=agent][value=n]').checked,
+              johnC: document.querySelector('input[name=john][value=c]').checked,
+              johnN: document.querySelector('input[name=john][value=n]').checked,
+            })"""
+        )
+        self.assertEqual(state["clicks"], ["agent:n"])
+        self.assertTrue(state["agentN"])
+        self.assertTrue(state["johnC"])
+        self.assertFalse(state["johnN"])
+
+        missing, missing_reason = await _set_member_immigration_status(
+            self._page, "Nobody", "U.S. National"
+        )
+        self.assertFalse(missing)
+        self.assertEqual(missing_reason, "member_not_found")
+
+        # Ambiguous duplicate names must not pick either card.
+        await self._page.set_content(
+            """
+            <section>
+              <article>
+                <div>John D.</div>
+                <label><input type="radio" name="j1" value="n">U.S. National</label>
+                <label><input type="radio" name="j1" value="c" checked>U.S. Citizen</label>
+              </article>
+              <article>
+                <div>John D.</div>
+                <label><input type="radio" name="j2" value="n">U.S. National</label>
+                <label><input type="radio" name="j2" value="c" checked>U.S. Citizen</label>
+              </article>
+            </section>
+            """
+        )
+        amb, amb_reason = await _set_member_immigration_status(
+            self._page, "John D.", "U.S. National"
+        )
+        self.assertFalse(amb)
+        self.assertEqual(amb_reason, "multiple_member_matches")
+
+    async def test_immigration_delayed_aria_radio_and_no_forced_checked(self) -> None:
+        from pc_liveagent.app_stage import (
+            _set_member_immigration_status,
+            _verify_member_immigration_status,
+        )
+
+        # Custom role=radio: aria-checked flips only after a short delay.
+        await self._page.set_content(
+            """
+            <section style="padding:12px">
+              <article>
+                <div>Agent T.</div>
+                <div role="radio" aria-checked="true" id="c"
+                  onclick="window.pick(this)">U.S. Citizen</div>
+                <div role="radio" aria-checked="false" id="n"
+                  onclick="window.pick(this)">U.S. National</div>
+                <div role="radio" aria-checked="false" id="p"
+                  onclick="window.pick(this)">Prefer not to answer</div>
+              </article>
+            </section>
+            <script>
+              window.clicks = [];
+              window.pick = (el) => {
+                window.clicks.push(el.id);
+                const group = el.parentElement.querySelectorAll('[role=radio]');
+                setTimeout(() => {
+                  group.forEach((node) => {
+                    node.setAttribute('aria-checked', node === el ? 'true' : 'false');
+                  });
+                }, 120);
+              };
+            </script>
+            """
+        )
+        ok, reason = await _set_member_immigration_status(
+            self._page, "Agent T.", "U.S. National"
+        )
+        self.assertTrue(ok)
+        self.assertEqual(reason, "selected")
+        verified, _ = await _verify_member_immigration_status(
+            self._page, "Agent T.", "U.S. National"
+        )
+        self.assertTrue(verified)
+        state = await self._page.evaluate(
+            """() => ({
+              clicks: window.clicks.slice(),
+              n: document.getElementById('n').getAttribute('aria-checked'),
+              c: document.getElementById('c').getAttribute('aria-checked'),
+            })"""
+        )
+        self.assertEqual(state["clicks"], ["n"])
+        self.assertEqual(state["n"], "true")
+        self.assertEqual(state["c"], "false")
+
+        # Click is ignored; selection never becomes active. Success must not
+        # come from assigning element.checked / aria-checked in the setter.
+        await self._page.set_content(
+            """
+            <section style="padding:12px">
+              <article>
+                <div>Agent T.</div>
+                <label>
+                  <input type="radio" name="agent" value="c" checked>U.S. Citizen
+                </label>
+                <label>
+                  <input id="stuck" type="radio" name="agent" value="n"
+                    onclick="event.preventDefault(); event.stopImmediatePropagation(); window.clicks.push('blocked'); return false;">
+                  U.S. National
+                </label>
+              </article>
+            </section>
+            <script>window.clicks = [];</script>
+            """
+        )
+        failed, fail_reason = await _set_member_immigration_status(
+            self._page, "Agent T.", "U.S. National"
+        )
+        self.assertFalse(failed)
+        self.assertIn(
+            fail_reason,
+            {"selection_timeout", "state_not_reflected", "click_failed"},
+        )
+        still_off = await self._page.evaluate(
+            "() => !document.getElementById('stuck').checked"
+        )
+        self.assertTrue(still_off)
+        # Manual DOM mutation alone is not how the setter confirms success:
+        # after a forced property write without a working interaction, verify
+        # may see the property, but the setter must not claim selected when
+        # the live interaction never activated the control.
+        await self._page.evaluate(
+            "() => { document.getElementById('stuck').checked = true; }"
+        )
+        # Re-run set for Prefer not — missing option — and ensure the prior
+        # forced National check did not invent a confirmed setter success path
+        # for a blocked control (blocked path already returned false above).
+        missing, missing_reason = await _set_member_immigration_status(
+            self._page, "Agent T.", "Prefer not to answer"
+        )
+        self.assertFalse(missing)
+        self.assertEqual(missing_reason, "status_option_not_found")
+
+    async def test_immigration_next_inspect_states_and_delayed_enable(self) -> None:
+        from pc_liveagent.app_stage import (
+            _click_enabled_application_next,
+            _inspect_application_next,
+            _wait_immigration_next_ready,
+        )
+
+        await self._page.set_content(
+            """
+            <div class="Mui-disabled" style="padding:8px">
+              <button type="button" id="next" disabled>Next</button>
+            </div>
+            """
+        )
+        info = await _inspect_application_next(self._page)
+        self.assertEqual(info["status"], "next_disabled")
+        self.assertTrue(info.get("native_disabled"))
+
+        await self._page.evaluate(
+            """() => {
+              const btn = document.getElementById('next');
+              setTimeout(() => { btn.disabled = false; }, 200);
+            }"""
+        )
+        ready = await _wait_immigration_next_ready(
+            self._page, polls=20, interval_ms=50
+        )
+        self.assertEqual(ready["status"], "next_enabled")
+
+        await self._page.set_content("<section><p>No actions</p></section>")
+        missing = await _inspect_application_next(self._page)
+        self.assertEqual(missing["status"], "next_not_found")
+
+        await self._page.set_content(
+            """
+            <button type="button" id="hidden" style="display:none">Next</button>
+            """
+        )
+        hidden = await _inspect_application_next(self._page)
+        self.assertEqual(hidden["status"], "next_hidden")
+
+        # Ancestor disabled class must not mark an enabled Next as disabled.
+        await self._page.set_content(
+            """
+            <div class="disabled Mui-disabled" style="padding:8px">
+              <button type="button" id="ok">Next</button>
+            </div>
+            """
+        )
+        ancestor = await _inspect_application_next(self._page)
+        self.assertEqual(ancestor["status"], "next_enabled")
+
+        # Misleading class substrings must not block the yellow footer Next.
+        # Old token-split logic treated "disabled" inside other names as disabled.
+        await self._page.set_content(
+            """
+            <button type="button" id="stale" disabled style="position:fixed;top:8px">Next</button>
+            <button type="button" id="hidden-dup" style="display:none">Next</button>
+            <footer style="position:fixed;bottom:0;left:0;right:0;padding:12px;background:#fff">
+              <button type="button" id="footer"
+                class="MuiButton-disableElevation next-disabled-theme"
+                style="background:#f5c518">Next</button>
+            </footer>
+            <script>window.clicks=[]; document.getElementById('footer')
+              .addEventListener('click', () => window.clicks.push('footer'));</script>
+            """
+        )
+        footer = await _inspect_application_next(self._page)
+        self.assertEqual(footer["status"], "next_enabled")
+        self.assertFalse(footer.get("native_disabled"))
+        self.assertEqual(footer.get("aria_disabled") or "", "")
+        self.assertTrue(await _click_enabled_application_next(self._page))
+        clicks = await self._page.evaluate("() => window.clicks.slice()")
+        self.assertEqual(clicks, ["footer"])
+        # Second click must still target the enabled footer, not the stale top Next.
+        await self._page.evaluate("() => { window.clicks = []; }")
+        again = await _inspect_application_next(self._page)
+        self.assertEqual(again["status"], "next_enabled")
+
+    async def test_immigration_click_exception_is_click_failed(self) -> None:
+        from pc_liveagent.app_stage import _set_member_immigration_status
+
+        await self._page.set_content(
+            """
+            <section>
+              <article>
+                <div>Agent T.</div>
+                <label><input type="radio" name="a" value="c" checked>U.S. Citizen</label>
+                <label><input type="radio" name="a" value="n">U.S. National</label>
+              </article>
+            </section>
+            """
+        )
+
+        class _Boom:
+            async def count(self) -> int:
+                return 1
+
+            async def check(self, *args, **kwargs):
+                raise RuntimeError("boom-check")
+
+            async def click(self, *args, **kwargs):
+                raise RuntimeError("boom-click")
+
+            @property
+            def first(self):
+                return self
+
+        real_locator = self._page.locator
+
+        def _fake_locator(sel, *args, **kwargs):
+            if "data-pc-imm" in str(sel):
+                return _Boom()
+            return real_locator(sel, *args, **kwargs)
+
+        with patch.object(self._page, "locator", side_effect=_fake_locator):
+            ok, reason = await _set_member_immigration_status(
+                self._page, "Agent T.", "U.S. National"
+            )
+        self.assertFalse(ok)
+        self.assertEqual(reason, "click_failed")
 
     async def test_next_ignores_decoy_and_ancestor_disabled_class(self) -> None:
         from pc_liveagent.app_stage import (
@@ -791,6 +1113,118 @@ class RelationshipDomTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(state["john"])
         self.assertTrue(state["don"])
 
+    async def test_coverage_john_d_and_agent_t_custom_and_delayed(self) -> None:
+        """Native + custom ARIA rows; delayed select; already-on; wrong-member guard."""
+        from pc_liveagent.app_stage import (
+            _ensure_member_coverage_expanded,
+            _match_named_members,
+            _member_coverage_types_visible,
+            _set_member_coverage_type,
+            _set_member_insurance_checked,
+            _verify_coverage_member_checked,
+            _verify_member_coverage_types,
+        )
+
+        await self._page.set_content(
+            """
+            <section>
+              <h2>Who has coverage?</h2>
+              <article>
+                <input id="agent" type="checkbox"
+                  style="opacity:0;position:absolute">
+                <label class="member-label" for="agent" style="display:none">Agent T.</label>
+                <button role="button" aria-expanded="false"
+                  aria-controls="agent-plans"
+                  onclick="this.setAttribute('aria-expanded','true');
+                    this.dataset.state='expanded';
+                    document.querySelector('#agent-plans').style.display='block'">
+                  <h3>Agent T.</h3>
+                </button>
+                <div id="agent-plans" style="display:none">
+                  <p>What type of coverage?</p>
+                  <label><input id="agent-medicare" type="checkbox"
+                    onchange="document.querySelector('#agent').checked=this.checked">
+                    Medicare</label>
+                </div>
+              </article>
+              <article>
+                <div class="MuiFormControlLabel-root" style="display:flex;gap:8px;align-items:center">
+                  <span id="john" role="checkbox" aria-checked="false" tabindex="0"
+                    style="display:inline-block;width:24px;height:24px;border:1px solid #333;background:#fff"
+                    onclick="(function(el){
+                      if (el.dataset.pending) return;
+                      el.dataset.pending = '1';
+                      setTimeout(function(){
+                        el.setAttribute('aria-checked','true');
+                        el.classList.add('Mui-checked');
+                        delete el.dataset.pending;
+                      }, 250);
+                    })(this)">
+                  </span>
+                  <span>john D.</span>
+                </div>
+              </article>
+              <article>
+                <label style="display:block">
+                  <input id="don" type="checkbox" checked> Don D.
+                </label>
+              </article>
+            </section>
+            """
+        )
+        available = ["Agent T.", "john D.", "Don D."]
+        hits, clarify = _match_named_members("I said John d.", available)
+        self.assertIsNone(clarify)
+        self.assertEqual(hits, ["john D."])
+        hits_t, clarify_t = _match_named_members("Agent t.", available)
+        self.assertIsNone(clarify_t)
+        self.assertEqual(hits_t, ["Agent T."])
+
+        self.assertTrue(
+            await _set_member_insurance_checked(self._page, "john D.", True)
+        )
+        self.assertTrue(
+            await _verify_coverage_member_checked(self._page, "john D.")
+        )
+        self.assertFalse(
+            await _verify_coverage_member_checked(self._page, "Agent T.")
+        )
+        # john's expanded branch must not make Agent appear expanded.
+        self.assertFalse(
+            await _member_coverage_types_visible(self._page, "Agent T.")
+        )
+        self.assertTrue(
+            await _ensure_member_coverage_expanded(self._page, "Agent T.")
+        )
+        self.assertTrue(
+            await _member_coverage_types_visible(self._page, "Agent T.")
+        )
+        self.assertTrue(
+            await _set_member_coverage_type(
+                self._page, "Agent T.", "Medicare"
+            )
+        )
+        self.assertTrue(
+            await _verify_member_coverage_types(
+                self._page, "Agent T.", ["Medicare"]
+            )
+        )
+        # Already selected — must not toggle Don off.
+        self.assertTrue(
+            await _set_member_insurance_checked(self._page, "Don D.", True)
+        )
+        state = await self._page.evaluate(
+            """() => ({
+              agent: document.querySelector('#agent').checked,
+              john: document.querySelector('#john').getAttribute('aria-checked'),
+              don: document.querySelector('#don').checked,
+            })"""
+        )
+        # The derived member status becomes checked only after selecting a plan.
+        self.assertTrue(state["agent"])
+        self.assertEqual(state["john"], "true")
+        self.assertTrue(state["don"])
+
     async def test_dob_save_stays_on_the_named_member(self) -> None:
         from pc_liveagent.app_stage import (
             _click_member_add_dob,
@@ -803,27 +1237,38 @@ class RelationshipDomTests(unittest.IsolatedAsyncioTestCase):
             """
             <h1>Date of birth</h1>
             <article id="agent" style="width:280px;height:160px;display:block">
-              <div>Agent</div>
+              <div style="height:24px">Agent</div>
               <button type="button" id="agent-add" onclick="openEditor('agent')">Add</button>
               <div id="agent-saved"></div>
               <p id="agent-error"></p>
               <div id="agent-editor" style="display:none">
-                <input id="agent-mm" placeholder="MM" maxlength="2">
-                <input id="agent-dd" placeholder="DD" maxlength="2">
-                <input id="agent-yyyy" placeholder="YYYY" maxlength="4">
+                <div style="display:flex;gap:8px">
+                  <input id="agent-mm" placeholder="MM" maxlength="2">
+                  <input id="agent-dd" placeholder="DD" maxlength="2">
+                  <input id="agent-yyyy" placeholder="YYYY" maxlength="4">
+                </div>
                 <button type="button" onclick="saveDob('agent')">Save</button>
+                <button type="button">Cancel</button>
               </div>
             </article>
             <article id="john" style="width:280px;height:160px;display:block">
-              <div>john</div>
+              <div style="height:24px">john</div>
               <div id="john-saved">01/02/1990</div>
-              <button type="button" id="john-edit" onclick="openEditor('john')">Edit</button>
+              <button type="button" id="john-edit" onclick="openEditor('john')">
+                <svg width="14" height="14" viewBox="0 0 24 24">
+                  <path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174"></path>
+                  <path d="m15 5 4 4"></path>
+                </svg>
+              </button>
               <p id="john-error"></p>
               <div id="john-editor" style="display:none">
-                <input id="john-mm" placeholder="MM" maxlength="2">
-                <input id="john-dd" placeholder="DD" maxlength="2">
-                <input id="john-yyyy" placeholder="YYYY" maxlength="4">
+                <div style="display:flex;gap:8px">
+                  <input id="john-mm" placeholder="MM" maxlength="2">
+                  <input id="john-dd" placeholder="DD" maxlength="2">
+                  <input id="john-yyyy" placeholder="YYYY" maxlength="4">
+                </div>
                 <button type="button" onclick="saveDob('john')">Save</button>
+                <button type="button">Cancel</button>
               </div>
             </article>
             <script>
@@ -877,6 +1322,7 @@ class RelationshipDomTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_address_edit_stays_on_the_named_member(self) -> None:
         from pc_liveagent.app_stage import (
+            _clear_member_address_selection,
             _click_member_address_action,
             _commit_member_address,
             _handle_address_step,
@@ -891,19 +1337,33 @@ class RelationshipDomTests(unittest.IsolatedAsyncioTestCase):
             <h1>Home address</h1>
             <p>Mailing address</p>
             <article id="agent" style="width:320px;display:block">
-              <div>Agent</div>
+              <div style="display:flex;justify-content:space-between;align-items:center">
+                <div>Agent</div>
+                <button type="button" id="agent-edit" style="width:36px;height:36px;padding:0;border:0;background:transparent">
+                  <svg width="20" height="20" viewBox="0 0 24 24"><path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L2.828 17.185a2 2 0 0 0-.578 1.153l-.34 2.724a1 1 0 0 0 1.177 1.177l2.724-.34a2 2 0 0 0 1.153-.578z"></path></svg>
+                </button>
+              </div>
               <div>Home address</div>
               <div id="agent-home">10 First St</div>
               <div>Mailing address</div>
               <div id="agent-mail">Same mailing address</div>
-              <button type="button" id="agent-edit">Edit</button>
               <div id="agent-form" style="display:none">
                 <label>Home Address</label>
-                <input id="agent-home-input">
+                <div>
+                  <input id="agent-home-input">
+                  <button type="button" id="agent-home-clear" style="width:24px;height:24px;padding:0;border:0;background:transparent">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+                  </button>
+                </div>
                 <label>Apartment, unit, building</label>
                 <input id="agent-home-unit">
                 <label>Mailing Address</label>
-                <input id="agent-mail-input">
+                <div>
+                  <input id="agent-mail-input">
+                  <button type="button" id="agent-mail-clear" style="width:24px;height:24px;padding:0;border:0;background:transparent">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+                  </button>
+                </div>
                 <label>Apartment, unit, building, or PO Box</label>
                 <input id="agent-mail-unit">
                 <label><input id="agent-no-home" type="checkbox"> No Home Address</label>
@@ -921,11 +1381,21 @@ class RelationshipDomTests(unittest.IsolatedAsyncioTestCase):
               <button type="button" id="john-add">Add</button>
               <div id="john-form" style="display:none">
                 <label>Home Address</label>
-                <input id="john-home-input">
+                <div>
+                  <input id="john-home-input">
+                  <button type="button" id="john-home-clear" style="width:24px;height:24px;padding:0;border:0;background:transparent">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+                  </button>
+                </div>
                 <label>Apartment, unit, building</label>
                 <input id="john-home-unit">
                 <label>Mailing Address</label>
-                <input id="john-mail-input">
+                <div>
+                  <input id="john-mail-input">
+                  <button type="button" id="john-mail-clear" style="width:24px;height:24px;padding:0;border:0;background:transparent">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+                  </button>
+                </div>
                 <label>Apartment, unit, building, or PO Box</label>
                 <input id="john-mail-unit">
                 <label><input id="john-no-home" type="checkbox"> No Home Address</label>
@@ -938,6 +1408,8 @@ class RelationshipDomTests(unittest.IsolatedAsyncioTestCase):
             <div id="suggestions" style="display:none">
               <div class="pac-item" role="option">999 Other Rd, Austin, TX 78701</div>
               <div class="pac-item" role="option">123 Main St, San Jose, CA 95112</div>
+              <div class="pac-item" role="option">Newton Ave, Seattle, WA</div>
+              <div class="pac-item" role="option">Newton Street Seattle, WA, USA</div>
             </div>
             <button type="button" id="next" disabled>Next</button>
             <script>
@@ -950,6 +1422,22 @@ class RelationshipDomTests(unittest.IsolatedAsyncioTestCase):
               }
               document.getElementById('agent-edit').onclick = () => openCard('agent');
               document.getElementById('john-add').onclick = () => openCard('john');
+              function wireClear(inputId, clearId) {
+                document.getElementById(clearId).onclick = () => {
+                  window.clicks.push('clear-' + inputId);
+                  document.getElementById(inputId).value = '';
+                };
+              }
+              wireClear('agent-home-input', 'agent-home-clear');
+              wireClear('agent-mail-input', 'agent-mail-clear');
+              wireClear('john-home-input', 'john-home-clear');
+              wireClear('john-mail-input', 'john-mail-clear');
+              // Pre-selected mailing chip style value so X must be clicked first.
+              document.getElementById('agent-edit').addEventListener('click', () => {
+                setTimeout(() => {
+                  document.getElementById('agent-mail-input').value = 'Highway 50, Fallon, NV, USA';
+                }, 0);
+              });
               function showSuggestions(input) {
                 const box = document.getElementById('suggestions');
                 box.style.display = 'block';
@@ -1002,6 +1490,30 @@ class RelationshipDomTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(by_name["john"]["needs_home"])
         self.assertFalse(by_name["john"]["needs_mailing"])
 
+        await self._page.evaluate(
+            """() => {
+              openCard('john');
+              document.getElementById('john-home-input').value = 'Old Home Rd';
+            }"""
+        )
+        cleared = await _clear_member_address_selection(self._page, "john", "home")
+        self.assertTrue(cleared.get("home"))
+        self.assertEqual(
+            await self._page.locator("#john-home-input").input_value(), ""
+        )
+        self.assertEqual(
+            await self._page.locator("#john-mail-input").input_value(), ""
+        )
+        clicks = await self._page.evaluate("() => window.clicks.slice()")
+        self.assertIn("clear-john-home-input", clicks)
+        await self._page.evaluate(
+            """() => {
+              document.getElementById('john-form').style.display = 'none';
+              document.getElementById('john-add').style.display = 'inline';
+              window.clicks = [];
+            }"""
+        )
+
         saved = await _commit_member_address(
             self._page, "john", "home", "123 Main St", "4B"
         )
@@ -1009,7 +1521,10 @@ class RelationshipDomTests(unittest.IsolatedAsyncioTestCase):
         clicks = await self._page.evaluate("() => window.clicks.slice()")
         self.assertIn("open-john", clicks)
         self.assertNotIn("open-agent", clicks)
+        self.assertIn("clear-john-home-input", clicks)
         self.assertIn("suggestion", clicks)
+        # The matching suggestion is the San Jose row, not the first Austin row.
+        self.assertIn("San Jose", (await self._page.locator("#john-home").inner_text()))
         self.assertEqual(
             (await self._page.locator("#john-home").inner_text()).strip(),
             "123 Main St, San Jose, CA 95112 unit 4B",
@@ -1028,7 +1543,9 @@ class RelationshipDomTests(unittest.IsolatedAsyncioTestCase):
             "123 Main St",
         )
 
-        self.assertTrue(await _open_member_address_editor(self._page, "Agent"))
+        opened_agent = await _open_member_address_editor(self._page, "Agent")
+        self.assertTrue(opened_agent.get("ok"), opened_agent)
+        self.assertTrue(opened_agent.get("icon_only"), opened_agent)
         await self._page.locator("#agent-home-input").fill("999 Other Rd")
         session = LiveFormSession(
             call_id="addr-dom",
@@ -1065,8 +1582,38 @@ class RelationshipDomTests(unittest.IsolatedAsyncioTestCase):
             "10 First St",
         )
 
-        await self._page.evaluate("() => { document.body.dataset.fail = ''; }")
-        self.assertTrue(await _open_member_address_editor(self._page, "john"))
+        await self._page.evaluate(
+            """() => {
+              document.body.dataset.fail = '';
+              document.getElementById('john-add').style.display = 'inline';
+              document.getElementById('john-form').style.display = 'none';
+              window.clicks = [];
+            }"""
+        )
+        newton = await _commit_member_address(
+            self._page, "Agent", "home", "Newton Street, Seattle"
+        )
+        self.assertTrue(newton.get("ok"), newton.get("error"))
+        self.assertIn(
+            "Newton Street Seattle",
+            (await self._page.locator("#agent-home").inner_text()),
+        )
+        self.assertEqual(
+            (await self._page.locator("#john-mail").inner_text()).strip(),
+            "200 Oak Ave",
+        )
+        newton_clicks = await self._page.evaluate("() => window.clicks.slice()")
+        self.assertIn("open-agent", newton_clicks)
+        self.assertNotIn("open-john", newton_clicks)
+
+        await self._page.evaluate(
+            """() => {
+              document.getElementById('john-add').style.display = 'inline';
+              document.getElementById('john-form').style.display = 'none';
+            }"""
+        )
+        opened_john = await _open_member_address_editor(self._page, "john")
+        self.assertTrue(opened_john.get("ok"), opened_john)
         self.assertTrue(await _set_member_no_address(self._page, "john", "mailing"))
         self.assertTrue(await self._page.locator("#john-no-mail").is_checked())
         self.assertFalse(await self._page.locator("#agent-no-mail").is_checked())
@@ -1076,6 +1623,388 @@ class RelationshipDomTests(unittest.IsolatedAsyncioTestCase):
             await self._page.evaluate("() => window.clicks.slice()"),
         )
 
+
+    async def test_marital_cards_scope_pencil_radio_save_and_same_value(self) -> None:
+        from pc_liveagent.app_stage import (
+            _click_marital_action,
+            _marital_target_card,
+            _open_marital_editor,
+            _scrape_marital_cards,
+            _set_member_marital_status,
+        )
+
+        await self._page.set_content(
+            """
+            <h2>Current Marital Statuses</h2>
+            <p>We've set marital statuses based on your household relationships.</p>
+            <div id="cards"></div>
+            <script>
+              window.maritalClicks = [];
+              const people = [
+                ['Agent T.', 'Married'],
+                ['john D.', 'Married'],
+                ['John D.', 'Never Married'],
+              ];
+              const options = [
+                'Never Married', 'Married', 'Separated', 'Divorced', 'Widowed',
+                'Registered Domestic Partner', 'Common Law Marriage'
+              ];
+              function renderCard(index) {
+                const [name, saved] = people[index];
+                const card = document.createElement('article');
+                card.id = 'card-' + index;
+                card.style.cssText = 'width:330px;padding:12px;margin:8px;border:1px solid #ccc';
+                card.innerHTML = `
+                  <div class="header"><span>${name}</span>
+                    <button class="pencil" style="width:36px;height:36px">
+                      <svg><path d="M21.174 6.812a1 1 0 0 0-3.986-3.987"></path></svg>
+                    </button>
+                    <button class="cancel" style="display:none">Cancel</button>
+                    <button class="save" disabled style="display:none">Save</button>
+                  </div>
+                  <div class="saved">${saved}</div>
+                  <div class="form" style="display:none"></div>`;
+                const form = card.querySelector('.form');
+                for (const label of options) {
+                  const row = document.createElement('label');
+                  row.style.display = 'block';
+                  row.innerHTML = `<div role="radio" aria-checked="${label === saved}"></div><span>${label}</span>`;
+                  const radio = row.querySelector('[role=radio]');
+                  radio.style.cssText = 'display:inline-block;width:16px;height:16px';
+                  radio.onclick = () => {
+                    for (const other of form.querySelectorAll('[role=radio]')) {
+                      other.setAttribute('aria-checked', String(other === radio));
+                    }
+                    card.querySelector('.save').disabled = label === people[index][1];
+                    card.dataset.draft = label;
+                  };
+                  form.appendChild(row);
+                }
+                const open = () => {
+                  window.maritalClicks.push('open-' + index);
+                  card.querySelector('.pencil').style.display = 'none';
+                  card.querySelector('.saved').style.display = 'none';
+                  card.querySelector('.cancel').style.display = 'inline';
+                  card.querySelector('.save').style.display = 'inline';
+                  card.querySelector('.form').style.display = 'block';
+                };
+                const close = () => {
+                  card.querySelector('.pencil').style.display = 'inline';
+                  card.querySelector('.saved').style.display = 'block';
+                  card.querySelector('.cancel').style.display = 'none';
+                  card.querySelector('.save').style.display = 'none';
+                  card.querySelector('.form').style.display = 'none';
+                };
+                card.querySelector('.pencil').onclick = open;
+                card.querySelector('.cancel').onclick = () => {
+                  window.maritalClicks.push('cancel-' + index);
+                  delete card.dataset.draft;
+                  close();
+                };
+                card.querySelector('.save').onclick = () => {
+                  window.maritalClicks.push('save-' + index);
+                  people[index][1] = card.dataset.draft;
+                  card.querySelector('.saved').textContent = people[index][1];
+                  delete card.dataset.draft;
+                  close();
+                };
+                return card;
+              }
+              people.forEach((_person, index) => {
+                document.getElementById('cards').appendChild(renderCard(index));
+              });
+            </script>
+            """
+        )
+
+        cards = await _scrape_marital_cards(self._page)
+        self.assertEqual(
+            [(row["name"], row["status"]) for row in cards],
+            [
+                ("Agent T.", "Married"),
+                ("john D.", "Married"),
+                ("John D.", "Never Married"),
+            ],
+        )
+        target, clarify = _marital_target_card("John D", cards)
+        self.assertIsNone(target)
+        self.assertIn("2 people", clarify or "")
+        target, clarify = _marital_target_card("second John D", cards)
+        self.assertIsNone(clarify)
+        self.assertEqual(target["index"], 2)
+
+        same = await _set_member_marital_status(self._page, 0, "Married")
+        self.assertTrue(same.get("ok"), same)
+        self.assertFalse(same.get("changed"))
+        clicks = await self._page.evaluate("() => window.maritalClicks.slice()")
+        self.assertIn("open-0", clicks)
+        self.assertIn("cancel-0", clicks)
+        self.assertNotIn("save-0", clicks)
+
+        changed = await _set_member_marital_status(self._page, 1, "Divorced")
+        self.assertTrue(changed.get("ok"), changed)
+        self.assertTrue(changed.get("changed"))
+        self.assertEqual(changed["card"]["status"], "Divorced")
+        clicks = await self._page.evaluate("() => window.maritalClicks.slice()")
+        self.assertIn("save-1", clicks)
+
+        opened = await _open_marital_editor(self._page, 2)
+        self.assertTrue(opened.get("ok"), opened)
+        self.assertTrue(await _click_marital_action(self._page, 2, "cancel"))
+
+    async def test_circumstance_cards_select_condition_and_members(self) -> None:
+        from pc_liveagent.app_stage import (
+            _discover_circumstance_members,
+            _select_circumstance_checkbox,
+            _set_circumstance_member,
+        )
+
+        await self._page.set_content(
+            """
+            <h2>Other Statuses</h2>
+            <p>Please select any situations that apply to household members.</p>
+            <div id="cards"></div>
+            <script>
+              window.circClicks = [];
+              const conditions = [
+                'Needs help with daily activities',
+                'Veteran or military member',
+                'None of the above',
+              ];
+              const people = ['Agent T.', 'john D.', 'John D.'];
+              function renderCard(label) {
+                const card = document.createElement('article');
+                card.style.cssText = 'width:420px;padding:12px;margin:8px;border:1px solid #ccc';
+                card.dataset.checked = '0';
+                const header = document.createElement('label');
+                header.innerHTML = `<input type="checkbox"> ${label}`;
+                const box = header.querySelector('input');
+                const who = document.createElement('div');
+                who.style.display = 'none';
+                who.innerHTML = '<div>Who does this apply to?</div>';
+                people.forEach((name, index) => {
+                  const row = document.createElement('label');
+                  row.style.display = 'block';
+                  row.innerHTML = `<input type="checkbox" data-name="${name}" data-i="${index}"> ${name}`;
+                  row.querySelector('input').onclick = (ev) => {
+                    window.circClicks.push(label + ':' + name + ':' + index);
+                  };
+                  who.appendChild(row);
+                });
+                box.onchange = () => {
+                  window.circClicks.push('cond:' + label);
+                  who.style.display = box.checked ? 'block' : 'none';
+                };
+                card.appendChild(header);
+                card.appendChild(who);
+                return card;
+              }
+              conditions.forEach((label) => {
+                document.getElementById('cards').appendChild(renderCard(label));
+              });
+            </script>
+            """
+        )
+
+        selected = await _select_circumstance_checkbox(
+            self._page, "Needs help with daily activities"
+        )
+        self.assertTrue(selected.get("ok"), selected)
+        members = await _discover_circumstance_members(
+            self._page, "Needs help with daily activities"
+        )
+        self.assertEqual(
+            [row["label"] for row in members],
+            ["Agent T.", "john D.", "John D."],
+        )
+        self.assertTrue(
+            await _set_circumstance_member(
+                self._page, "john D.", "Needs help with daily activities", dup_index=0
+            )
+        )
+        self.assertTrue(
+            await _set_circumstance_member(
+                self._page, "John D.", "Needs help with daily activities", dup_index=1
+            )
+        )
+        clicks = await self._page.evaluate("() => window.circClicks.slice()")
+        self.assertIn("cond:Needs help with daily activities", clicks)
+        self.assertTrue(
+            any(item.startswith("Needs help with daily activities:john D.:1") for item in clicks)
+        )
+        self.assertTrue(
+            any(item.startswith("Needs help with daily activities:John D.:2") for item in clicks)
+        )
+
+    async def test_childcare_rows_scope_yes_no_and_same_value(self) -> None:
+        from pc_liveagent.app_stage import (
+            _childcare_target_card,
+            _scrape_childcare_cards,
+            _set_member_childcare,
+        )
+
+        await self._page.set_content(
+            """
+            <h2>Do the following household members live with and care for any
+            children under the age of 19?</h2>
+            <div id="rows"></div>
+            <script>
+              window.childcareClicks = [];
+              const people = [
+                ['Agent T.', 'Yes'],
+                ['john D.', 'Yes'],
+                ['John D.', 'No'],
+              ];
+              function renderRow(index) {
+                const [name, saved] = people[index];
+                const row = document.createElement('article');
+                row.id = 'row-' + index;
+                row.style.cssText = 'width:420px;padding:12px;margin:8px;border:1px solid #ccc;display:flex;justify-content:space-between;align-items:center';
+                row.innerHTML = `
+                  <span>${name}</span>
+                  <div>
+                    <label><div role="radio" data-val="Yes" aria-checked="${saved === 'Yes'}"></div> Yes</label>
+                    <label><div role="radio" data-val="No" aria-checked="${saved === 'No'}"></div> No</label>
+                  </div>`;
+                for (const radio of row.querySelectorAll('[role=radio]')) {
+                  radio.style.cssText = 'display:inline-block;width:16px;height:16px';
+                  radio.onclick = () => {
+                    window.childcareClicks.push(radio.dataset.val + '-' + index);
+                    for (const other of row.querySelectorAll('[role=radio]')) {
+                      other.setAttribute('aria-checked', String(other === radio));
+                    }
+                    people[index][1] = radio.dataset.val;
+                  };
+                }
+                return row;
+              }
+              people.forEach((_person, index) => {
+                document.getElementById('rows').appendChild(renderRow(index));
+              });
+            </script>
+            """
+        )
+
+        cards = await _scrape_childcare_cards(self._page)
+        self.assertEqual(
+            [(row["name"], row["answer"]) for row in cards],
+            [
+                ("Agent T.", "Yes"),
+                ("john D.", "Yes"),
+                ("John D.", "No"),
+            ],
+        )
+        target, clarify = _childcare_target_card("John D", cards)
+        self.assertIsNone(target)
+        self.assertIn("2 people", clarify or "")
+        target, clarify = _childcare_target_card("second John D", cards)
+        self.assertIsNone(clarify)
+        self.assertEqual(target["index"], 2)
+
+        same = await _set_member_childcare(self._page, 0, "Yes")
+        self.assertTrue(same.get("ok"), same)
+        self.assertFalse(same.get("changed"))
+        clicks = await self._page.evaluate("() => window.childcareClicks.slice()")
+        self.assertEqual(clicks, [])
+
+        changed = await _set_member_childcare(self._page, 1, "No")
+        self.assertTrue(changed.get("ok"), changed)
+        self.assertTrue(changed.get("changed"))
+        self.assertEqual(changed["card"]["answer"], "No")
+        clicks = await self._page.evaluate("() => window.childcareClicks.slice()")
+        self.assertIn("No-1", clicks)
+
+    async def test_citizenship_cards_ignore_ancestor_disabled_class(self) -> None:
+        from pc_liveagent.app_stage import _click_yes_no, _stage_e_card_state
+
+        await self._page.set_content(
+            """
+            <section class="Mui-disabled" style="padding:16px">
+              <div style="padding:12px">Yes — Everyone listed is a U.S. Citizen</div>
+              <div id="no-card" style="padding:12px">No — Some or all are not U.S. Citizens</div>
+              <div>Prefer not to answer</div>
+              <div>U.S. National</div>
+              <div>Satisfactory immigration status</div>
+            </section>
+            """
+        )
+        await self._page.evaluate(
+            """() => {
+              const el = document.getElementById('no-card');
+              el.addEventListener('click', () => { el.dataset.clicked = '1'; });
+            }"""
+        )
+        state = await _stage_e_card_state(
+            self._page, "No — Some or all are not U.S. Citizens"
+        )
+        self.assertTrue(state.get("found"))
+        self.assertFalse(state.get("disabled"))
+        with (
+            patch(
+                "pc_liveagent.live_form._visible_choice_labels",
+                new=AsyncMock(
+                    return_value=[
+                        "Yes — Everyone listed is a U.S. Citizen",
+                        "No — Some or all are not U.S. Citizens",
+                    ]
+                ),
+            ),
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_citizenship"),
+            ),
+            patch(
+                "pc_liveagent.app_stage.immigration_member_radios_visible",
+                new=AsyncMock(return_value=True),
+            ),
+        ):
+            selected = await _click_yes_no(self._page, False)
+        self.assertIn("not U.S. Citizens", selected)
+        clicked = await self._page.evaluate(
+            "() => document.getElementById('no-card').dataset.clicked || ''"
+        )
+        self.assertEqual(clicked, "1")
+
+    async def test_citizenship_card_self_disabled_is_not_clicked(self) -> None:
+        from pc_liveagent.app_stage import _click_yes_no, _stage_e_card_state
+
+        await self._page.set_content(
+            """
+            <section style="padding:16px">
+              <div id="yes-card" aria-disabled="true" style="padding:12px">Yes — Everyone listed is a U.S. Citizen</div>
+              <div id="no-card" style="padding:12px">No — Some or all are not U.S. Citizens</div>
+            </section>
+            """
+        )
+        await self._page.evaluate(
+            """() => {
+              for (const id of ['yes-card', 'no-card']) {
+                const el = document.getElementById(id);
+                el.addEventListener('click', () => { el.dataset.clicked = '1'; });
+              }
+            }"""
+        )
+        yes_state = await _stage_e_card_state(
+            self._page, "Yes — Everyone listed is a U.S. Citizen"
+        )
+        self.assertTrue(yes_state.get("disabled"))
+        with (
+            patch(
+                "pc_liveagent.live_form._visible_choice_labels",
+                new=AsyncMock(
+                    return_value=[
+                        "Yes — Everyone listed is a U.S. Citizen",
+                        "No — Some or all are not U.S. Citizens",
+                    ]
+                ),
+            ),
+        ):
+            with self.assertRaises(RuntimeError):
+                await _click_yes_no(self._page, True)
+        clicked = await self._page.evaluate(
+            "() => document.getElementById('yes-card').dataset.clicked || ''"
+        )
+        self.assertEqual(clicked, "")
 
 if __name__ == "__main__":
     unittest.main()

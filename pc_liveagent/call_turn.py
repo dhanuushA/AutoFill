@@ -134,6 +134,7 @@ _PENDING_SIGNIN_RE = re.compile(
 )
 _signin_watch_tasks: dict[str, asyncio.Task] = {}
 _sso_tasks: dict[str, asyncio.Task] = {}
+_application_only_tasks: dict[str, asyncio.Task] = {}
 _email_auth_tasks: dict[str, asyncio.Task] = {}
 _app_browser_tasks: dict[str, asyncio.Task] = {}
 
@@ -148,12 +149,21 @@ _SLOW_APP_STEPS = frozenset(
         "app_marital_review",
         "app_childcare_review",
         "app_circumstances",
+        "app_circumstances_person",
+        "app_circumstances_more",
         "app_tax",
         "app_income",
         "app_income_employed",
         "app_income_self",
+        "app_income_amount",
+        "app_income_unemployed",
+        "app_income_confirm",
         "app_income_more",
         "app_expenses",
+        "app_expenses_amount",
+        "app_expenses_medical",
+        "app_expenses_confirm",
+        "app_expenses_more",
         "app_documents",
         "app_submit_confirm",
     }
@@ -292,6 +302,9 @@ class CallController:
     pending_email: str = ""
     eligibility_screen_verified: bool = False
     eligibility_question_sent: bool = False
+    # application_test_start|authenticating|opening_application|
+    # resetting_to_question_1|application_ready. Empty unless that test mode is on.
+    application_only_state: str = ""
     active_response_id: int | None = None
     active_websocket_status: str = "unknown"  # connected|disconnected|unknown
     interrupt_seq: int = 0
@@ -805,6 +818,15 @@ async def begin_speech(call_id: str) -> str:
             return speech
         ctrl = existing or CallController(call_id=call_id)
         _controllers[call_id] = ctrl
+    if config.APPLICATION_ONLY_TEST_MODE:
+        # No greeting. Question 1 is spoken only after the browser is on that screen.
+        ctrl.phase = "application_test_start"
+        ctrl.application_only_state = "application_test_start"
+        ctrl.last_speech = ""
+        ctrl.eligibility_question_sent = False
+        _schedule_application_only(call_id)
+        logger.info("application_only_opening call_id=%s", call_id)
+        return ""
     opening = _application_test_opening(session)
     if opening:
         if session is not None and session.app_step:
@@ -938,6 +960,63 @@ async def sync_controller_to_eligibility(call_id: str) -> str | None:
         speech[:80],
     )
     return speech
+
+
+def _schedule_application_only(call_id: str) -> None:
+    """One startup task per call. A second schedule does not overlap the first."""
+    prev = _application_only_tasks.get(call_id)
+    if prev is not None and not prev.done():
+        return
+
+    async def _run() -> None:
+        from .app_stage import run_application_only_browser
+        from .live_form import start_live_form
+
+        ctrl = await get_controller(call_id)
+        try:
+            session = await start_live_form(call_id, config.POINTCARE_URL)
+            page = session.page
+            if page is None:
+                raise RuntimeError("application browser page is not open")
+
+            def set_state(name: str) -> None:
+                ctrl.application_only_state = name
+                ctrl.phase = name
+                ctrl.sso_in_progress = name == "authenticating"
+
+            result = await run_application_only_browser(session, page, set_state)
+            speech = str(result.get("spoken") or "").strip()
+            if speech.startswith("ASK: "):
+                speech = speech[5:].strip()
+            ctrl.last_speech = speech
+            if result.get("ok") and result.get("state") == "application_ready":
+                ctrl.application_only_state = "application_ready"
+                ctrl.phase = "application"
+                ctrl.sso_in_progress = False
+                ctrl.eligibility_question_sent = True
+            else:
+                ctrl.sso_in_progress = ctrl.application_only_state == "authenticating"
+            from .retell_llm_ws import speak_now, websocket_connected
+
+            # Speak only the verified question, or a setup blocker. Never an intro.
+            if websocket_connected(call_id) and speech:
+                await speak_now(call_id, speech, interrupt_id=ctrl.interrupt_seq + 1)
+        except Exception:
+            logger.exception("application_only_startup_failed call_id=%s", call_id)
+            ctrl.application_only_state = "opening_application"
+            ctrl.phase = "opening_application"
+            ctrl.sso_in_progress = False
+            ctrl.last_speech = (
+                "I couldn't open the application, so I did not ask question 1."
+            )
+        finally:
+            current = _application_only_tasks.get(call_id)
+            if current is asyncio.current_task():
+                _application_only_tasks.pop(call_id, None)
+
+    _application_only_tasks[call_id] = asyncio.create_task(
+        _run(), name=f"application-only-{call_id}"
+    )
 
 
 def schedule_signin_watch(call_id: str) -> None:
@@ -1691,6 +1770,7 @@ async def _process_application_turn(
     dedupe_ctx: str,
     turn_id: str,
     form_url: str,
+    transcript_user_index: int | None = None,
 ) -> TurnResult:
     """Collect Mode Stage E — one spoken answer → Playwright → next question."""
     from .app_stage import app_question_for_step
@@ -1735,13 +1815,78 @@ async def _process_application_turn(
             detail="go_back" if result.get("ok") else "go_back_failed",
         )
     if intent.kind == "repeat":
-        speech = app_question_for_step(step)
+        speech = app_question_for_step(step, session)
         ctrl.last_speech = speech
         return TurnResult(
             speech=speech, phase="application", turn_id=turn_id, detail="repeat"
         )
+    if intent.kind == "list_options":
+        phase = ""
+        if session is not None:
+            phase = str(session.filled.get("app_income_phase") or "").strip()
+        if step.startswith("app_income") and phase in ("", "type"):
+            from .income_stage import income_type_options_speech
+
+            speech = income_type_options_speech()
+            if session is not None:
+                session.filled["app_income_types_listed"] = "1"
+            ctrl.last_speech = speech
+            return TurnResult(
+                speech=speech,
+                phase="application",
+                turn_id=turn_id,
+                detail="list_options",
+            )
+        if step in ("app_immigration", "app_immigration_who"):
+            from .app_stage import (
+                _clean_member_display_name,
+                _immigration_status_options_speech,
+                _mark_immigration_options_listed,
+            )
+
+            current = ""
+            if session is not None:
+                current = str(
+                    session.filled.get("app_immigration_current") or ""
+                ).strip()
+                _mark_immigration_options_listed(session)
+            speech = _immigration_status_options_speech()
+            if current:
+                label = _clean_member_display_name(current)
+                speech = (
+                    f"{speech} What is {label}'s citizenship or immigration "
+                    "status?"
+                )
+            ctrl.last_speech = speech
+            return TurnResult(
+                speech=speech,
+                phase="application",
+                turn_id=turn_id,
+                detail="list_options",
+            )
+        speech = app_question_for_step(step, session)
+        ctrl.last_speech = speech
+        return TurnResult(
+            speech=speech,
+            phase="application",
+            turn_id=turn_id,
+            detail="list_options",
+        )
 
     page = getattr(session, "page", None) if session else None
+    pending_browser = _app_browser_tasks.get(call_id)
+    if text and (
+        ctrl.elig_op_in_progress
+        or (pending_browser is not None and not pending_browser.done())
+    ):
+        # The answer already sent to the browser owns this transition.
+        # Do not resync that utterance, or a repeat of it, onto the next question.
+        return TurnResult(
+            speech=ELIG_PROGRESS_ACK,
+            phase="application",
+            turn_id=turn_id,
+            detail="app_answer_pending",
+        )
     if page is not None and text:
         from .app_stage import (
             _app_step_parent,
@@ -1792,7 +1937,33 @@ async def _process_application_turn(
         ctrl.last_speech = speech
         return TurnResult(speech=speech, phase="application", turn_id=turn_id)
 
-    commit_key = f"app:{step}:{fp}"
+    # A Stage E screen can contain several sequential subquestions with the
+    # same answer. For example: "Any other plans?" → No, followed by
+    # "Does any other member have insurance?" → No. Deduping by visible step
+    # and answer alone incorrectly drops the second answer.
+    filled = (getattr(session, "filled", None) or {}) if session else {}
+    pending_question = str(filled.get("app_pending_question") or "")
+    pending_fp = (
+        uuid.uuid5(uuid.NAMESPACE_OID, pending_question).hex[:12]
+        if pending_question
+        else "-"
+    )
+    app_answer_ctx = ":".join(
+        (
+            str(filled.get("app_insurance_coverage_phase") or "-"),
+            str(filled.get("app_insurance_current") or "-").lower(),
+            str(filled.get("app_immigration_current") or "-").lower(),
+            str(filled.get("app_dob_current") or "-").lower(),
+            str(filled.get("app_dob_component") or "-"),
+            str(filled.get("app_dob_phase") or "-"),
+            str(filled.get("app_address_current") or "-").lower(),
+            str(filled.get("app_address_field") or "-"),
+            str(filled.get("app_address_ready") or "-"),
+            str(filled.get("app_address_correcting") or "-").lower(),
+            pending_fp,
+        )
+    )
+    commit_key = f"app:{step}:{app_answer_ctx}:{fp}"
     if any(item.get("key") == commit_key for item in ctrl.committed[-12:]):
         return TurnResult(
             speech=ctrl.last_speech or app_question_for_step(step),
@@ -1802,11 +1973,16 @@ async def _process_application_turn(
         )
 
     ctrl.last_user_fp = fp
-    ctrl.last_dedupe_ctx = f"application:{step}"
+    ctrl.last_dedupe_ctx = f"application:{step}:{app_answer_ctx}"
     ctrl.pending_op_id = turn_id
+    if transcript_user_index is not None and transcript_user_index >= 0:
+        ctrl.consumed_transcript_user_index = transcript_user_index
 
     if step in _SLOW_APP_STEPS:
         ctrl.elig_op_in_progress = True
+        # Prevent reminder_required from re-reading the prior question while
+        # Playwright works (tax Save and Return can take ~2s).
+        ctrl.last_speech = ELIG_PROGRESS_ACK
         epoch = ctrl.elig_nav_epoch
 
         async def _run_app() -> None:
@@ -1963,6 +2139,30 @@ async def process_user_turn(
         if response_id is not None:
             ctrl.active_response_id = response_id
 
+        if config.APPLICATION_ONLY_TEST_MODE and (
+            ctrl.application_only_state != "application_ready"
+        ):
+            return TurnResult(
+                speech=ctrl.last_speech or "",
+                phase=ctrl.phase or "application_test_start",
+                turn_id=turn_id,
+                detail="application_only_not_ready",
+            )
+
+        # Any phase: a Retell user_index already consumed is an ASR replay/revision,
+        # not a new spoken turn (call_772995 Don D. → Donnie.).
+        if (
+            transcript_user_index is not None
+            and ctrl.consumed_transcript_user_index >= 0
+            and transcript_user_index <= ctrl.consumed_transcript_user_index
+        ):
+            return TurnResult(
+                speech=ctrl.last_speech or "Are you still there?",
+                phase=ctrl.phase,
+                turn_id=turn_id,
+                detail="stale_transcript_turn",
+            )
+
         # Go-back for wrong email must win even while Playwright auth is running,
         # and also while we are only waiting on confirm (auth flags may be false).
         if (
@@ -2066,6 +2266,41 @@ async def process_user_turn(
                     detail="closing",
                     end_call=True,
                 )
+            # During a slow Stage E browser action (e.g. tax Save and Return),
+            # do not re-speak the previous question from last_speech.
+            if ctrl.phase == "application":
+                pending_browser = _app_browser_tasks.get(call_id)
+                busy = ctrl.elig_op_in_progress or (
+                    pending_browser is not None and not pending_browser.done()
+                )
+                if busy:
+                    return TurnResult(
+                        speech=ELIG_PROGRESS_ACK,
+                        phase="application",
+                        turn_id=turn_id,
+                        detail="app_busy_reminder",
+                    )
+                session_rem = await get_session(call_id)
+                if session_rem is not None:
+                    tax_phase = str(
+                        session_rem.filled.get("app_tax_phase") or ""
+                    ).strip()
+                    pending_q = str(
+                        session_rem.filled.get("app_pending_question") or ""
+                    ).strip()
+                    if tax_phase == "saving":
+                        who = str(
+                            session_rem.filled.get("app_tax_saving_name") or ""
+                        ).strip() or "this person"
+                        speech = pending_q or (
+                            f"I'm saving tax details for {who}. One moment."
+                        )
+                        return TurnResult(
+                            speech=speech,
+                            phase="application",
+                            turn_id=turn_id,
+                            detail="tax_saving_reminder",
+                        )
             return TurnResult(
                 speech=ctrl.last_speech or "Could you say that again?",
                 phase=ctrl.phase,
@@ -3440,6 +3675,7 @@ async def process_user_turn(
                 dedupe_ctx=dedupe_ctx,
                 turn_id=turn_id,
                 form_url=form_url,
+                transcript_user_index=transcript_user_index,
             )
 
         # closing / unknown
@@ -3522,7 +3758,7 @@ class TranscriptTurnDecision:
     utterance: str
     user_index: int
     transcript_kind: str  # cumulative | empty
-    dedupe: str  # process | stale_tip | duplicate_response_id | empty
+    dedupe: str  # process | stale_tip | asr_revision | duplicate_response_id | empty
     response_id: int | None = None
 
 
@@ -3536,7 +3772,11 @@ def classify_transcript_turn(
 
     Retell Custom LLM sends the full live transcript (cumulative) on every
     response_required / reminder_required. A new response_id alone is not proof
-    of new speech — only an advanced user-turn index (or changed tip text) is.
+    of new speech — only an *advanced* user-turn index is.
+
+    When ASR revises the tip of an already-handled user slot (same
+    ``user_index``, different text, e.g. ``Don D.`` → ``Donnie.``), that is
+    ``asr_revision`` and must not re-enter Collect Mode or mutate state.
     """
     if (
         response_id is not None
@@ -3561,17 +3801,15 @@ def classify_transcript_turn(
             response_id=response_id,
         )
 
-    fp = _user_fingerprint(text)
-    if (
-        idx == ctrl.last_transcript_user_index
-        and fp == ctrl.last_transcript_user_fp
-        and ctrl.last_transcript_user_index >= 0
-    ):
+    # Same user-turn slot already committed: replay or ASR revision — not new speech.
+    if idx == ctrl.last_transcript_user_index and ctrl.last_transcript_user_index >= 0:
+        fp = _user_fingerprint(text)
+        same_words = bool(fp and fp == ctrl.last_transcript_user_fp)
         return TranscriptTurnDecision(
             utterance=text,
             user_index=idx,
             transcript_kind="cumulative",
-            dedupe="stale_tip",
+            dedupe="stale_tip" if same_words else "asr_revision",
             response_id=response_id,
         )
 

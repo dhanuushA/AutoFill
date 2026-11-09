@@ -4,7 +4,12 @@ import sys
 
 import uvicorn
 
-from pc_liveagent.config import APPLICATION_AFTER_SIGNIN, APPLICATION_TEST_MODE, PORT
+from pc_liveagent.config import (
+    APPLICATION_AFTER_SIGNIN,
+    APPLICATION_ONLY_TEST_MODE,
+    APPLICATION_TEST_MODE,
+    PORT,
+)
 
 # Playwright needs a Proactor loop on Windows. reload=True uses a Selector
 # loop and then Chrome never starts (NotImplementedError / long hang).
@@ -19,9 +24,11 @@ if __name__ == "__main__":
     )
     logging.getLogger("pc_liveagent").info(
         "runtime config POINTCARE_APPLICATION_AFTER_SIGNIN=%s "
-        "POINTCARE_APPLICATION_TEST_MODE=%s",
+        "POINTCARE_APPLICATION_TEST_MODE=%s "
+        "POINTCARE_APPLICATION_ONLY_TEST_MODE=%s",
         APPLICATION_AFTER_SIGNIN,
         APPLICATION_TEST_MODE,
+        APPLICATION_ONLY_TEST_MODE,
     )
     uvicorn.run(
         "pc_liveagent.main:app",

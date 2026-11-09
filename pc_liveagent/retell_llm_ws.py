@@ -207,8 +207,13 @@ async def handle_retell_llm_websocket(websocket: WebSocket, call_id: str) -> Non
                     phase=ctrl_r.phase,
                 )
 
-                # Same response_id twice, or cumulative tip unchanged: no new command.
-                if decision.dedupe in ("duplicate_response_id", "stale_tip"):
+                # Same response_id, unchanged tip, or ASR revision of a committed
+                # user_index (e.g. Don D. → Donnie.): do not mutate workflow state.
+                if decision.dedupe in (
+                    "duplicate_response_id",
+                    "stale_tip",
+                    "asr_revision",
+                ):
                     mark_transcript_turn_handled(
                         ctrl_r, decision, response_id=response_id
                     )

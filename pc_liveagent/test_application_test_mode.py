@@ -307,6 +307,14 @@ class PermissionDecisionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class StartupPathTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        # Local .env may enable application-only testing. These cases cover the
+        # other modes, so they force that flag off.
+        self._only_off = patch("pc_liveagent.config.APPLICATION_ONLY_TEST_MODE", False)
+        self._only_off.start()
+
+    async def asyncTearDown(self) -> None:
+        self._only_off.stop()
     async def asyncTearDown(self) -> None:
         from pc_liveagent.live_form import end_live_form
 
@@ -543,6 +551,12 @@ class StartupPathTests(unittest.IsolatedAsyncioTestCase):
 
 
 class OpeningSpeechTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self._only_off = patch("pc_liveagent.config.APPLICATION_ONLY_TEST_MODE", False)
+        self._only_off.start()
+
+    async def asyncTearDown(self) -> None:
+        self._only_off.stop()
     async def asyncTearDown(self) -> None:
         from pc_liveagent.call_turn import drop_controller
         from pc_liveagent.live_form import end_live_form

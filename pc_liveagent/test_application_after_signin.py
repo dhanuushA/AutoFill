@@ -331,6 +331,12 @@ class GateDecisionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SignInRoutingTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self._only_off = patch("pc_liveagent.config.APPLICATION_ONLY_TEST_MODE", False)
+        self._only_off.start()
+
+    async def asyncTearDown(self) -> None:
+        self._only_off.stop()
     async def asyncTearDown(self) -> None:
         from pc_liveagent.call_turn import drop_controller
         from pc_liveagent.live_form import end_live_form
