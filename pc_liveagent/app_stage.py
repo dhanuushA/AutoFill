@@ -107,8 +107,7 @@ APP_QUESTIONS: dict[str, str] = {
         "you want to change something."
     ),
     "app_income_more": (
-        "Do you want to add another income? If yes, tell me the income type. "
-        "Say No if you're done with this person."
+        "Do you want to add another income? Please say Yes or No."
     ),
     "app_expenses": (
         "I'll add deductible and medical expenses for each person. "
@@ -126,8 +125,7 @@ APP_QUESTIONS: dict[str, str] = {
         "change something."
     ),
     "app_expenses_more": (
-        "Do you want to add another expense? If yes, tell me the expense type. "
-        "Say No if you're done with this person."
+        "Do you want to add another expense? Please say Yes or No."
     ),
     "app_documents": (
         "Documents can be provided now or later. Say skip to continue without "
@@ -219,8 +217,9 @@ _STAGE_E_EXPLAIN: dict[str, str] = {
         "We collect each person's income type and details one short question at "
         "a time, confirm before saving, and mention that proof documents will be "
         "uploaded later. Types other than Employed, Self-employed, and Unemployed "
-        "only need the amount per month. You can edit or delete an existing income "
-        "for that person. After save, we ask whether to add another income type."
+        "only need the amount per month. After save, first ask whether to add "
+        "another income (Yes/No). Only after No, ask whether to edit or delete; "
+        "ask for the income type only after they say edit or delete."
     ),
     "app_submit_confirm": (
         "After submit, Pointcare may lock the answers. Say Yes only when you are "
@@ -784,6 +783,9 @@ _APPLICATION_ONLY_STALE_KEYS = (
     "app_address_pending_street",
     "app_address_pending_chosen",
     "app_address_pending_unit",
+    "app_address_share_after",
+    "app_address_share_prompt",
+    "app_address_share_members",
     "app_marital_current",
     "app_marital_current_index",
     "app_marital_review_ready",
@@ -2868,18 +2870,37 @@ async def restart_application_to_first_question(page: Page) -> str:
 
 
 def _clean_member_display_name(name: str) -> str:
-    """Strip trailing UI labels like Add that scrape sometimes glues onto names."""
+    """Strip UI chrome from a member label and make it safe to speak.
+
+    Pointcare's Back control was being scraped as the first "member" name, so
+    the agent said "For Back..." instead of "For Admin...".
+    """
     label = re.sub(r"\s+", " ", (name or "").strip())
     # Pointcare marks the applicant as "Admin P. (you)" — never speak "you".
     label = re.sub(r"\s*\(\s*you\s*\)\s*", " ", label, flags=re.I)
+    # Nav chrome is often glued onto the first card (Back sits under Admin P.).
     label = re.sub(
-        r"\s+\b(add|edit|pencil|save|next|continue)\b\.?$",
+        r"\s+\b(add|edit|pencil|save|next|continue|back|cancel|exit|previous)\b\.?",
         "",
         label,
         flags=re.I,
     )
-    label = re.sub(r"\s+", " ", label).strip()
-    return label or "that person"
+    label = re.sub(r"\s+", " ", label).strip(" ,.-")
+    if not label:
+        return "that person"
+    if re.fullmatch(
+        r"(back|next|continue|cancel|save|edit|add|exit|previous|done|close)",
+        label,
+        flags=re.I,
+    ):
+        return "that person"
+    # Drop trailing initial period for clearer TTS: "John D." → "John D".
+    label = re.sub(r"\b([A-Za-z])\.\s*$", r"\1", label)
+    parts = label.split()
+    # Applicant card: say "Admin" (not "Admin P") — clearer on the phone.
+    if parts and parts[0].lower() == "admin":
+        return "Admin"
+    return label
 
 
 _MONTH_SPEECH: dict[int, str] = {
@@ -5732,7 +5753,11 @@ def _member_address_card_js() -> str:
         const t = norm(line).replace(/\\s*\\(you\\)\\s*/ig, ' ').trim();
         if (!/^[A-Za-z][A-Za-z .'-]{0,40}$/.test(t) || t.split(' ').length > 4) return false;
         const n = low(t);
-        if (/address|apartment|mailing|home|same|unit|building|pencil|edit|save|cancel|add|next|continue|street|po box/.test(n)) {
+        // Never treat footer/nav chrome as a household member ("Back" was spoken as the name).
+        if (/^(back|exit|previous|next|continue|cancel|save|edit|add|done|close)$/i.test(t)) {
+          return false;
+        }
+        if (/address|apartment|mailing|home|same|unit|building|pencil|edit|save|cancel|add|next|continue|back|exit|street|po box|step \\d/.test(n)) {
           return false;
         }
         return true;
@@ -5867,9 +5892,22 @@ def _member_address_card_js() -> str:
             key = ['home', 'homeUnit', 'mailing', 'mailingUnit'][index] || '';
           } else if (inputs.length === 2) {
             key = index === 0 ? 'home' : 'mailing';
+          } else if (inputs.length === 1) {
+            // Only one free-text field left (common after No Home Address).
+            key = label.includes('mailing') || label.includes('po box') ? 'mailing' : 'home';
           }
           if (key && !fields[key]) fields[key] = input;
         });
+        // After No Home Address, Pointcare hides home inputs — the remaining
+        // location field is mailing even when label mapping is weak.
+        if (!fields.mailing && fields.home && boxOn(root, 'no home address')) {
+          fields.mailing = fields.home;
+          fields.home = null;
+          if (!fields.mailingUnit && fields.homeUnit) {
+            fields.mailingUnit = fields.homeUnit;
+            fields.homeUnit = null;
+          }
+        }
         return fields;
       };
       const boxOn = (root, phrase) => {
@@ -5914,7 +5952,26 @@ async def _scrape_address_cards(page: Page) -> list[dict[str, Any]]:
                 const key = low(name);
                 if (seen.has(key)) continue;
                 const text = lines.join(' ');
-                if (!/address|mailing|home/.test(low(text)) && !/\\d{5}/.test(text)) continue;
+                const looksSavedAddress = (value) => {
+                  const t = norm(value);
+                  if (!t || /^same\\b/i.test(t)) return false;
+                  // Progress chrome ("Step 5 of 12") is not an address.
+                  if (/^step\\s+\\d+/i.test(t)) {
+                    return false;
+                  }
+                  if (/^(back|next|continue|cancel|save|edit)$/i.test(t)) return false;
+                  if (/\\d/.test(t) && !/^step\\b/i.test(t)) return true;
+                  // Numberless streets and landmarks (Bridge / Parkway / Square).
+                  return /\\b(street|st|avenue|ave|road|rd|drive|dr|lane|ln|boulevard|blvd|court|ct|way|place|pl|highway|hwy|bridge|parkway|pkwy|square|plaza|circle|cir|terrace|ter|trail|loop|memorial)\\b/i.test(t);
+                };
+                // Collapsed cards may use icons (no "home"/"mailing" words) and
+                // landmark addresses may omit a ZIP — still keep the member.
+                const hasAddrCue = (
+                  /address|mailing|home/.test(low(text)) ||
+                  /\\d{5}/.test(text) ||
+                  lines.some((line) => looksSavedAddress(line))
+                );
+                if (!hasAddrCue) continue;
                 const fields = cardFields(el);
                 const expanded = Boolean(fields.home || fields.mailing || fields.homeUnit || fields.mailingUnit);
                 let home = fields.home ? (fields.home.value || '') : '';
@@ -5938,19 +5995,13 @@ async def _scrape_address_cards(page: Page) -> list[dict[str, Any]]:
                   if (n === 'same mailing address') { mailingSame = true; if (!mailing) mailing = line; continue; }
                   if (n === 'no home address' || n === 'no mailing address') continue;
                   if (/^needs\b/.test(n)) continue;
-                  if (/^(edit|add|save|cancel|pencil|next|continue)$/.test(n)) continue;
+                  if (/^(edit|add|save|cancel|pencil|next|continue|back|exit)$/.test(n)) continue;
+                  if (/^step\\s+\\d+/i.test(line)) continue;
                   if (section === 'home' && !home) home = line;
                   else if (section === 'mailing' && !mailing) mailing = line;
                   else if (section === 'home_unit' && !homeUnit) homeUnit = line;
                   else if (section === 'mailing_unit' && !mailingUnit) mailingUnit = line;
                 }
-                const looksSavedAddress = (value) => {
-                  const t = norm(value);
-                  if (!t || /^same\\b/i.test(t)) return false;
-                  if (/\\d/.test(t)) return true;
-                  // Numberless spoken addresses such as "Newton Street Seattle".
-                  return /\\b(street|st|avenue|ave|road|rd|drive|dr|lane|ln|boulevard|blvd|court|ct|way|place|pl|highway)\\b/i.test(t);
-                };
                 // Collapsed Pointcare cards often omit section labels and list
                 // home then mailing as two plain address lines under the name.
                 const hadSections = lines.some((line) => {
@@ -6006,14 +6057,49 @@ async def _scrape_address_cards(page: Page) -> list[dict[str, Any]]:
                   needs_home: !homeOk,
                   needs_mailing: !mailOk,
                   needs_add: !homeOk || !mailOk,
+                  top: r.top,
                   index: out.length,
                 });
               }
+              // Screen order: top card first (Admin above John).
+              out.sort((a, b) => (a.top - b.top) || (a.index - b.index));
+              out.forEach((row, i) => { row.index = i; delete row.top; });
               return out;
             }"""
         )
         if isinstance(rows, list):
-            return [row for row in rows if isinstance(row, dict) and row.get("name")]
+            blocked = {
+                "back",
+                "next",
+                "continue",
+                "cancel",
+                "save",
+                "edit",
+                "add",
+                "exit",
+                "previous",
+                "done",
+                "close",
+            }
+            out: list[dict[str, Any]] = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                name = str(row.get("name") or "").strip()
+                if not name:
+                    continue
+                name_key = re.sub(r"[^a-z0-9]+", "", name.lower())
+                if name.lower().strip(" .") in blocked or name_key in blocked:
+                    logger.info("scrape_address_cards skip_nav_name name=%r", name)
+                    continue
+                home = str(row.get("home") or "")
+                mailing = str(row.get("mailing") or "")
+                if re.match(r"^step\s+\d+", home, flags=re.I):
+                    row = {**row, "home": ""}
+                if re.match(r"^step\s+\d+", mailing, flags=re.I):
+                    row = {**row, "mailing": ""}
+                out.append(row)
+            return out
     except Exception:
         logger.exception("scrape_address_cards failed")
     return []
@@ -6387,35 +6473,32 @@ def _clear_address_pending(session: Any) -> None:
 
 
 def _address_home_check_speech(card: dict[str, Any]) -> str:
+    """Ask only whether the saved home address is correct."""
     name = _clean_member_display_name(str(card.get("name") or "this person"))
     if card.get("no_home"):
         return (
             f"For {name}, No Home Address is currently selected. "
-            "Say Yes if that is still correct, say the new home address to change it, "
-            "or say No Home Address again to keep it."
+            "Is that still correct? Say Yes, or say No to change it."
         )
     home = _address_spoken_line(
         str(card.get("home") or "").strip(),
         str(card.get("home_unit") or "").strip(),
     )
     if home and "same " not in home.lower():
-        return (
-            f"For {name}, is the home address {home} correct? "
-            "Say Yes, say No Home Address, or tell me the new home address."
-        )
+        return f"For {name}, is the home address {home} correct? Say Yes or No."
     return (
-        f"For {name}, what is the home address? "
-        "Say the street, or say No Home Address."
+        f"For {name}, a home address is still needed. "
+        "Say Yes to enter one, or say No Home Address."
     )
 
 
 def _address_mailing_check_speech(card: dict[str, Any]) -> str:
+    """Ask only whether the saved mailing address is correct."""
     name = _clean_member_display_name(str(card.get("name") or "this person"))
     if card.get("no_mailing"):
         return (
             f"For {name}, No Mailing Address is currently selected. "
-            "Say Yes if that is still correct, say the new mailing address to change it, "
-            "or say No Mailing Address again to keep it."
+            "Is that still correct? Say Yes, or say No to change it."
         )
     if card.get("mailing_same") or _address_home_mailing_match(card):
         home = _address_spoken_line(
@@ -6425,8 +6508,7 @@ def _address_mailing_check_speech(card: dict[str, Any]) -> str:
         detail = f" ({home})" if home and "same " not in home.lower() else ""
         return (
             f"For {name}, the mailing address is the same as the home address"
-            f"{detail}. Is that correct? Say Yes, say No Mailing Address, "
-            "or tell me a different mailing address."
+            f"{detail}. Is that correct? Say Yes or No."
         )
     mailing = _address_spoken_line(
         str(card.get("mailing") or "").strip(),
@@ -6434,13 +6516,55 @@ def _address_mailing_check_speech(card: dict[str, Any]) -> str:
     )
     if mailing and "same " not in mailing.lower():
         return (
-            f"For {name}, is the mailing address {mailing} correct? "
-            "Say Yes, say No Mailing Address, or tell me the new mailing address."
+            f"For {name}, is the mailing address {mailing} correct? Say Yes or No."
         )
     return (
-        f"For {name}, what is the mailing address? "
-        "Say the street, or say No Mailing Address."
+        f"For {name}, a mailing address is still needed. "
+        "Say Yes to enter one, or say No Mailing Address."
     )
+
+
+def _address_change_ask_speech(member: str, field: str) -> str:
+    label = _clean_member_display_name(member)
+    if field == "mailing":
+        return (
+            f"For {label}, say Yes to change the mailing address, "
+            "or say No Mailing Address."
+        )
+    return (
+        f"For {label}, say Yes to change the home address, "
+        "or say No Home Address."
+    )
+
+
+def _means_no_home_address(text: str) -> bool:
+    """True for No Home Address, including common ASR garble (No, Omar)."""
+    lowered = re.sub(r"\s+", " ", (text or "").strip().lower())
+    if not lowered:
+        return False
+    if re.search(r"\bno[,.]?\s*home(?:\s+address)?\b", lowered):
+        return True
+    # ASR often hears "No Home" as "No, Omar" / "No ohm" / "No own".
+    if re.search(r"\bno[,.]?\s*(?:omar|ohm|own|holm|homee)(?:\s+address)?\b", lowered):
+        return True
+    return bool(re.search(r"\bno\s+address\b", lowered)) and not re.search(
+        r"\bmailing\b", lowered
+    )
+
+
+def _means_no_mailing_address(text: str) -> bool:
+    """True for No Mailing Address and close ASR variants."""
+    lowered = re.sub(r"\s+", " ", (text or "").strip().lower())
+    if not lowered:
+        return False
+    return bool(re.search(r"\bno[,.]?\s*mailing(?:\s+address)?\b", lowered))
+
+
+def _address_enter_speech(member: str, field: str) -> str:
+    label = _clean_member_display_name(member)
+    which = "mailing" if field == "mailing" else "home"
+    none_label = "No Mailing Address" if which == "mailing" else "No Home Address"
+    return f"What is the new {which} address for {label}? Or say {none_label}."
 
 
 def _address_pending_confirm_speech(
@@ -6464,22 +6588,22 @@ def _address_pending_confirm_speech(
     matched = _normalize_address_suggestion_text(chosen or street).strip(" ,.")
     if chosen:
         return (
-            f"I matched {matched} from the address list for {label}'s {which} "
-            "address. Say Yes to save that selection, or No to change it."
+            f"I matched {matched} as the {which} address for {label}. "
+            "Say Yes to save, or No to change it."
         )
     spoken = _address_spoken_line(street)
     return (
         f"I have {spoken} as the {which} address for {label}. "
-        "Say Yes to save it, or No to change it."
+        "Say Yes to save, or No to change it."
     )
 
 
 def _address_change_which_prompt(member: str) -> str:
-    """Fallback prompt; preferred path is home-then-mailing checks."""
+    """Fallback prompt; preferred path is home change-ask then enter."""
     label = _clean_member_display_name(member)
     return (
         f"Okay, I'll open the address editor for {label}. "
-        + _address_home_check_speech({"name": label})
+        + _address_change_ask_speech(label, "home")
     )
 
 
@@ -6750,6 +6874,256 @@ async def _click_member_address_action(
         return False
 
 
+async def _address_share_dialog_info(page: Page) -> dict[str, Any]:
+    """Detect the 'Update household addresses' shared-address popup."""
+    try:
+        raw = await page.evaluate(
+            """() => {
+              const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+              const low = (s) => norm(s).toLowerCase();
+              const isShown = (el) => {
+                if (!el) return false;
+                const r = el.getBoundingClientRect();
+                if (r.width < 40 || r.height < 40) return false;
+                const st = window.getComputedStyle(el);
+                if (st.visibility === 'hidden' || st.display === 'none' ||
+                    Number(st.opacity || '1') === 0) return false;
+                return true;
+              };
+              const roots = [
+                ...document.querySelectorAll(
+                  '[role=dialog], [aria-modal=true], .modal, [class*="Modal"], [class*="dialog"]'
+                ),
+              ];
+              let dialog = null;
+              for (const el of roots) {
+                if (!isShown(el)) continue;
+                const text = low(el.innerText || el.textContent || '');
+                if (
+                  text.includes('update household address') ||
+                  text.includes('shares your home address') ||
+                  text.includes('shares your mailing address') ||
+                  text.includes('shares your address') ||
+                  text.includes('currently share') ||
+                  text.includes('only update mine') ||
+                  (text.includes('update') && text.includes('member') &&
+                    text.includes('address')) ||
+                  (text.includes('would you like to update') && text.includes('as well'))
+                ) {
+                  dialog = el;
+                  break;
+                }
+              }
+              // Footer-only detection when the dialog root is a generic overlay.
+              if (!dialog) {
+                for (const el of document.querySelectorAll('button, [role=button]')) {
+                  if (!isShown(el)) continue;
+                  const ll = low(el.innerText || el.textContent || '');
+                  if (!(ll.includes('only update mine') || /^update \\d+ members?$/.test(ll))) {
+                    continue;
+                  }
+                  const root = el.closest(
+                    '[role=dialog], [aria-modal=true], .modal, [class*="Modal"], [class*="dialog"], body'
+                  );
+                  if (root && root !== document.body) {
+                    dialog = root;
+                    break;
+                  }
+                }
+              }
+              if (!dialog) return { open: false };
+              const text = norm(dialog.innerText || dialog.textContent || '');
+              const members = [];
+              for (const box of dialog.querySelectorAll(
+                'input[type=checkbox], [role=checkbox]'
+              )) {
+                let label = '';
+                if (box.id) {
+                  const lab = dialog.querySelector('label[for="' + CSS.escape(box.id) + '"]');
+                  if (lab) label = norm(lab.innerText || lab.textContent || '');
+                }
+                if (!label) {
+                  const host = box.closest('label') || box.parentElement;
+                  label = norm((host && (host.innerText || host.textContent)) || '');
+                }
+                label = label.split('\\n')[0].trim();
+                if (label && !members.includes(label)) members.push(label);
+              }
+              const buttons = [...dialog.querySelectorAll(
+                'button, [role=button], a, input[type=button], input[type=submit]'
+              )].filter(isShown);
+              let onlyMine = '';
+              let updateShared = '';
+              for (const btn of buttons) {
+                // Never treat checkbox/label rows as the footer actions.
+                if (
+                  btn.closest('[role=checkbox]') ||
+                  btn.getAttribute('role') === 'checkbox' ||
+                  btn.querySelector('input[type=checkbox], [role=checkbox]')
+                ) {
+                  continue;
+                }
+                const label = norm(btn.innerText || btn.value || btn.textContent || '');
+                const ll = low(label);
+                if (!label) continue;
+                if (ll.includes('only update mine')) onlyMine = label;
+                if (/^update \\d+ members?$/i.test(label)) updateShared = label;
+              }
+              return {
+                open: true,
+                prompt: text.slice(0, 240),
+                members,
+                only_mine: onlyMine,
+                update_shared: updateShared,
+              };
+            }"""
+        )
+        if isinstance(raw, dict) and raw.get("open"):
+            return {
+                "open": True,
+                "prompt": str(raw.get("prompt") or ""),
+                "members": [
+                    str(item).strip()
+                    for item in (raw.get("members") or [])
+                    if str(item).strip()
+                ],
+                "only_mine": str(raw.get("only_mine") or ""),
+                "update_shared": str(raw.get("update_shared") or ""),
+            }
+    except Exception:
+        logger.exception("address_share_dialog_info failed")
+    return {"open": False}
+
+
+def _address_share_ask_speech(info: dict[str, Any]) -> str:
+    members = []
+    for name in info.get("members") or []:
+        label = _clean_member_display_name(str(name))
+        if not label or label == "that person":
+            continue
+        if label not in members:
+            members.append(label)
+    if members:
+        who = ", ".join(members[:3])
+        return (
+            f"{who} currently share this address. "
+            "Say Yes to update them as well, or No to only update yours."
+        )
+    prompt = str(info.get("prompt") or "")
+    if "shares your" in prompt.lower():
+        # Keep the Pointcare wording short for speech.
+        first = prompt.split("Would you like")[0].strip()
+        if first:
+            return (
+                f"{first} Would you like to update theirs as well? "
+                "Say Yes to update them, or No to only update yours."
+            )
+    return (
+        "Another household member currently shares this address. "
+        "Say Yes to update them as well, or No to only update yours."
+    )
+
+
+async def _click_address_share_dialog_choice(
+    page: Page, *, update_others: bool
+) -> bool:
+    """Click Update N member(s) or No, only update mine — never member checkboxes."""
+    info = await _address_share_dialog_info(page)
+    if not info.get("open"):
+        return True
+    try:
+        box = await page.evaluate(
+            """(updateOthers) => {
+              const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+              const low = (s) => norm(s).toLowerCase();
+              const isShown = (el) => {
+                const r = el.getBoundingClientRect();
+                if (r.width < 8 || r.height < 8) return false;
+                const st = window.getComputedStyle(el);
+                return !(st.visibility === 'hidden' || st.display === 'none' ||
+                         Number(st.opacity || '1') === 0);
+              };
+              const isCheckboxish = (el) => {
+                if (!el) return true;
+                const role = (el.getAttribute('role') || '').toLowerCase();
+                if (role === 'checkbox') return true;
+                if (el.matches && el.matches('input[type=checkbox]')) return true;
+                if (el.closest && el.closest('[role=checkbox], label')) {
+                  const host = el.closest('[role=checkbox], label');
+                  if (host && host.querySelector('input[type=checkbox], [role=checkbox]')) {
+                    return true;
+                  }
+                }
+                return false;
+              };
+              const roots = [
+                ...document.querySelectorAll(
+                  '[role=dialog], [aria-modal=true], .modal, [class*="Modal"], [class*="dialog"]'
+                ),
+              ].filter(isShown);
+              const dialog = roots.find((el) => {
+                const text = low(el.innerText || el.textContent || '');
+                return (
+                  text.includes('update household address') ||
+                  text.includes('shares your') ||
+                  text.includes('would you like to update')
+                );
+              });
+              if (!dialog) return null;
+              const buttons = [...dialog.querySelectorAll(
+                'button, [role=button], a, input[type=button], input[type=submit]'
+              )].filter((btn) => isShown(btn) && !isCheckboxish(btn));
+              let pick = null;
+              for (const btn of buttons) {
+                const label = low(btn.innerText || btn.value || btn.textContent || '');
+                if (!label) continue;
+                if (updateOthers) {
+                  if (/^update \\d+ members?$/.test(label)) {
+                    pick = btn;
+                    break;
+                  }
+                } else if (label.includes('only update mine')) {
+                  pick = btn;
+                  break;
+                }
+              }
+              if (!pick) return null;
+              pick.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+              const r = pick.getBoundingClientRect();
+              return {
+                x: r.x + r.width / 2,
+                y: r.y + r.height / 2,
+                label: norm(pick.innerText || pick.value || pick.textContent || ''),
+              };
+            }""",
+            bool(update_others),
+        )
+        if not isinstance(box, dict) or box.get("x") is None:
+            logger.warning(
+                "address_share_dialog_choice_missing update_others=%s info=%s",
+                int(bool(update_others)),
+                {
+                    "only_mine": info.get("only_mine"),
+                    "update_shared": info.get("update_shared"),
+                },
+            )
+            return False
+        # Real mouse click — synthetic JS clicks often miss Pointcare dialogs.
+        await page.mouse.click(float(box["x"]), float(box["y"]))
+        await page.wait_for_timeout(400)
+        still = await _address_share_dialog_info(page)
+        if still.get("open"):
+            logger.warning(
+                "address_share_dialog_still_open after click label=%r",
+                box.get("label"),
+            )
+            return False
+        return True
+    except Exception:
+        logger.exception("click_address_share_dialog_choice failed")
+        return False
+
+
 async def _set_member_no_address(page: Page, member_name: str, kind: str) -> bool:
     """Check No Home Address or No Mailing Address on one member card."""
     phrase = "no home address" if kind == "home" else "no mailing address"
@@ -6857,10 +7231,24 @@ async def _set_member_no_address(page: Page, member_name: str, kind: str) -> boo
                 clicked = {"ok": True, "reason": "playwright_text"}
         except Exception:
             pass
+    # Real mouse click — synthetic clicks often miss Pointcare checkbox rows.
     try:
         marked = page.locator("[data-pc-no-addr='1']").first
         if await marked.count():
-            await marked.click(timeout=2500, force=True)
+            box = await marked.bounding_box()
+            if box and box.get("width") and box.get("height"):
+                await page.mouse.click(
+                    float(box["x"]) + float(box["width"]) / 2.0,
+                    float(box["y"]) + float(box["height"]) / 2.0,
+                )
+                clicked = {
+                    "ok": True,
+                    "reason": "mouse_"
+                    + str((clicked or {}).get("reason") or "marked"),
+                }
+            else:
+                await marked.click(timeout=2500, force=True)
+                clicked = {"ok": True, "reason": "force_marked"}
     except Exception:
         pass
 
@@ -6905,74 +7293,94 @@ async def _clear_member_address_selection(
             + """
               const card = findAddressCard(memberName);
               if (!card) return null;
+              for (const el of card.querySelectorAll('[data-pc-addr-clear]')) {
+                el.removeAttribute('data-pc-addr-clear');
+              }
               const fields = cardFields(card);
               const cleared = {};
+              const clicks = [];
               const sectionBand = (kind) => {
                 const want = kind === 'mailing' ? 'mailing address' : 'home address';
                 const other = kind === 'mailing' ? 'home address' : 'mailing address';
+                const input = fields[kind];
+                // Prefer the live input row — collapsed summary labels above the
+                // editor can steal the first "Home/Mailing address" match.
+                if (input) {
+                  const ir = input.getBoundingClientRect();
+                  return { top: ir.top - 56, bottom: ir.bottom + 48 };
+                }
                 let startY = null;
                 let endY = null;
+                const labelHits = [];
                 for (const el of card.querySelectorAll('div, span, label, p, h1, h2, h3, h4')) {
                   const t = low(el.innerText || el.textContent || '');
                   if (t !== want && !t.startsWith(want + ' ')) continue;
                   if ((el.innerText || '').trim().length > 40) continue;
                   const r = el.getBoundingClientRect();
-                  if (r.height < 4 || r.height > 40) continue;
-                  startY = r.top;
-                  break;
+                  if (r.height < 4 || r.height > 48) continue;
+                  labelHits.push(r.top);
                 }
-                for (const el of card.querySelectorAll('div, span, label, p, h1, h2, h3, h4, button')) {
+                // Use the lowest matching label (closest to the open editor).
+                if (labelHits.length) startY = Math.max(...labelHits);
+                for (const el of card.querySelectorAll(
+                  'div, span, label, p, h1, h2, h3, h4, button, [role=checkbox]'
+                )) {
                   const t = low(el.innerText || el.textContent || '');
                   const r = el.getBoundingClientRect();
                   if (startY != null && r.top <= startY + 2) continue;
-                  if (t === other || t.startsWith(other + ' ') || t === 'save' || t === 'cancel') {
+                  if (
+                    t === other || t.startsWith(other + ' ') ||
+                    t === 'no home address' || t === 'no mailing address' ||
+                    t === 'save' || t === 'cancel'
+                  ) {
                     if (r.height <= 48) {
                       endY = r.top;
                       break;
                     }
                   }
                 }
-                if (startY == null) {
-                  const input = fields[kind];
-                  if (!input) return null;
-                  const ir = input.getBoundingClientRect();
-                  return { top: ir.top - 80, bottom: ir.bottom + 40 };
-                }
+                if (startY == null) return null;
                 return {
                   top: startY - 8,
-                  bottom: endY != null ? endY - 4 : startY + 220,
+                  bottom: endY != null ? endY - 4 : startY + 260,
                 };
               };
-              const isClearButton = (btn) => {
-                if (!btn || !visible(btn)) return false;
-                // Never mistake the header pencil for the address-bar clear.
-                if (isPencilButton(btn)) return false;
-                const br = btn.getBoundingClientRect();
-                if (br.width < 12 || br.height < 12 || br.width > 40 || br.height > 40) {
+              const looksAddrChip = (t) => (
+                /\\d|,|street|st\\b|ave|avenue|road|rd\\b|highway|blvd|lane|drive|way|bridge|parkway|plaza|square|usa|ny|ca|wa|tx/i.test(t)
+              );
+              const isClearControl = (el) => {
+                if (!el || !visible(el)) return false;
+                if (isPencilButton(el)) return false;
+                if (el.getAttribute('role') === 'checkbox') return false;
+                const br = el.getBoundingClientRect();
+                if (br.width < 10 || br.height < 10 || br.width > 44 || br.height > 44) {
                   return false;
                 }
                 const label = low(
-                  (btn.getAttribute('aria-label') || '') + ' ' +
-                  (btn.getAttribute('title') || '') + ' ' +
-                  (btn.innerText || btn.textContent || '')
+                  (el.getAttribute('aria-label') || '') + ' ' +
+                  (el.getAttribute('title') || '') + ' ' +
+                  (el.innerText || el.textContent || '')
                 );
                 if (/cancel|save|edit|add|next|continue|back|no home|no mailing/.test(label)) {
                   return false;
                 }
-                if (btn.getAttribute('role') === 'checkbox') return false;
-                const svg = btn.querySelector('svg');
+                const svg = (el.tagName || '').toLowerCase() === 'svg'
+                  ? el
+                  : el.querySelector('svg');
                 const paths = svg
                   ? [...svg.querySelectorAll('path')].map((p) => p.getAttribute('d') || '').join(' ')
                   : '';
-                const text = norm(btn.innerText || btn.textContent || '');
+                const text = norm(el.innerText || el.textContent || '');
                 if (label === 'x' || label === '×' || label.includes('clear') ||
                     label.includes('remove') || label.includes('delete')) return true;
                 if (text === '×' || text === 'x' || text === 'X') return true;
-                // Live Pointcare: Lucide X (M18 6 6 18) inside the location field.
-                if (paths.includes('M18 6 6 18') || paths.includes('m6 6 12 12')) return true;
-                const square = Math.abs(br.width - br.height) <= 6;
-                // Small icon-only clear beside the input (not the 36px pencil).
-                if (square && svg && !text && br.width <= 28) return true;
+                // Live Pointcare: Lucide X inside the location chip.
+                if (paths.includes('M18 6 6 18') || paths.includes('m6 6 12 12') ||
+                    paths.includes('M18 6L6 18') || paths.includes('M6 6l12 12')) {
+                  return true;
+                }
+                const square = Math.abs(br.width - br.height) <= 8;
+                if (square && svg && text.length <= 1 && br.width <= 36) return true;
                 return false;
               };
               const clearOne = (key) => {
@@ -6980,61 +7388,82 @@ async def _clear_member_address_selection(
                 const bandOk = Boolean(band && (band.bottom - band.top) > 20);
                 const input = fields[key];
                 const candidates = [];
-                const consider = (btn) => {
-                  if (!isClearButton(btn) || candidates.includes(btn)) return;
-                  const br = btn.getBoundingClientRect();
-                  if (bandOk && (br.top < band.top || br.top > band.bottom)) return;
-                  candidates.push(btn);
+                const consider = (el) => {
+                  if (!isClearControl(el) || candidates.includes(el)) return;
+                  const br = el.getBoundingClientRect();
+                  if (bandOk && (br.top < band.top - 4 || br.top > band.bottom + 4)) return;
+                  candidates.push(el);
                 };
-                for (const btn of card.querySelectorAll('button, [role=button]')) {
-                  consider(btn);
+                // Prefer real buttons first — Pointcare chip X is usually a button.
+                for (const el of card.querySelectorAll('button, [role=button]')) {
+                  consider(el);
                 }
-                // Prefer the clear control sitting on the location input itself.
                 if (input) {
                   const ir = input.getBoundingClientRect();
                   let host = input.parentElement;
-                  for (let i = 0; host && i < 5; i += 1, host = host.parentElement) {
-                    for (const btn of host.querySelectorAll('button, [role=button]')) {
-                      if (!isClearButton(btn)) continue;
-                      const br = btn.getBoundingClientRect();
+                  for (let i = 0; host && i < 6; i += 1, host = host.parentElement) {
+                    for (const el of host.querySelectorAll('button, [role=button]')) {
+                      if (!isClearControl(el)) continue;
+                      const br = el.getBoundingClientRect();
                       const near =
-                        Math.abs(br.top - ir.top) < 48 &&
-                        Math.abs(br.left - ir.right) < 120;
-                      if (near && !candidates.includes(btn)) candidates.push(btn);
+                        Math.abs(br.top - ir.top) < 56 &&
+                        br.left >= ir.left - 8 &&
+                        br.left <= ir.right + 80;
+                      if (near) consider(el);
                     }
                     if (host === card) break;
                   }
                 }
-                // Fallback: clear beside a selected address chip in this section.
+                // Chip/div fallback when the selected place has no writable input yet.
+                if (!candidates.length) {
+                  for (const el of card.querySelectorAll('div, span, svg')) {
+                    consider(el);
+                  }
+                }
                 if (!candidates.length && bandOk) {
-                  for (const chip of card.querySelectorAll('div, span')) {
+                  for (const chip of card.querySelectorAll('div, span, p, label')) {
                     const t = norm(chip.innerText || chip.textContent || '');
                     const cr = chip.getBoundingClientRect();
-                    if (!t || t.length < 8 || t.length > 120) continue;
-                    if (cr.top < band.top || cr.top > band.bottom) continue;
-                    if (!/\\d|,|street|ave|road|highway|blvd|lane|drive|way|usa/i.test(t)) {
-                      continue;
-                    }
-                    let root = chip.parentElement;
-                    for (let i = 0; root && i < 4; i += 1, root = root.parentElement) {
-                      for (const btn of root.querySelectorAll('button, [role=button]')) {
-                        consider(btn);
+                    if (!t || t.length < 8 || t.length > 160) continue;
+                    if (cr.top < band.top - 4 || cr.top > band.bottom + 4) continue;
+                    if (!looksAddrChip(t)) continue;
+                    let root = chip;
+                    for (let i = 0; root && i < 5; i += 1, root = root.parentElement) {
+                      for (const el of root.querySelectorAll(
+                        'button, [role=button], div, span, svg'
+                      )) {
+                        consider(el);
                       }
                     }
                   }
                 }
-                if (input && candidates.length > 1) {
-                  const ir = input.getBoundingClientRect();
+                if (candidates.length > 1) {
+                  const ir = input ? input.getBoundingClientRect() : null;
                   candidates.sort((a, b) => {
                     const ar = a.getBoundingClientRect();
                     const br = b.getBoundingClientRect();
-                    const da = Math.abs(ar.top - ir.top) + Math.abs(ar.left - ir.right);
-                    const db = Math.abs(br.top - ir.top) + Math.abs(br.left - ir.right);
-                    return da - db;
+                    if (ir) {
+                      const da = Math.abs(ar.top - ir.top) + Math.abs(ar.left - ir.right);
+                      const db = Math.abs(br.top - ir.top) + Math.abs(br.left - ir.right);
+                      return da - db;
+                    }
+                    // Prefer the rightmost small control in the section (chip X).
+                    return (br.left - ar.left) || (ar.top - br.top);
                   });
                 }
                 if (candidates.length) {
-                  try { candidates[0].click(); } catch (e) {}
+                  const target = candidates[0];
+                  const clickEl = target.closest('button, [role=button]') || target;
+                  clickEl.setAttribute('data-pc-addr-clear', key);
+                  const br = clickEl.getBoundingClientRect();
+                  clicks.push({
+                    key,
+                    x: br.left + br.width / 2,
+                    y: br.top + br.height / 2,
+                    w: br.width,
+                    h: br.height,
+                  });
+                  try { clickEl.click(); } catch (e) {}
                   cleared[key] = true;
                   return;
                 }
@@ -7052,17 +7481,58 @@ async def _clear_member_address_selection(
                 cleared[key] = false;
               };
               for (const key of targets) clearOne(key);
-              return cleared;
+              return { cleared, clicks };
             }""",
             {"memberName": member_name, "targets": targets},
         )
-        result = raw if isinstance(raw, dict) else {}
+        result: dict[str, bool] = {}
+        clicks: list[dict[str, Any]] = []
+        if isinstance(raw, dict):
+            cleared = raw.get("cleared")
+            if isinstance(cleared, dict):
+                result = {str(k): bool(v) for k, v in cleared.items()}
+            else:
+                # Older shape fallback.
+                result = {
+                    str(k): bool(v)
+                    for k, v in raw.items()
+                    if k in ("home", "mailing")
+                }
+            maybe_clicks = raw.get("clicks")
+            if isinstance(maybe_clicks, list):
+                clicks = [c for c in maybe_clicks if isinstance(c, dict)]
+        # Real mouse click — Pointcare chip X often ignores synthetic click alone.
+        for item in clicks:
+            try:
+                x = float(item.get("x") or 0)
+                y = float(item.get("y") or 0)
+                if x > 0 and y > 0:
+                    await page.mouse.click(x, y)
+                    await page.wait_for_timeout(120)
+                    key = str(item.get("key") or "")
+                    if key:
+                        result[key] = True
+            except Exception:
+                logger.exception("address_clear_mouse_click failed")
+        try:
+            marked = page.locator("[data-pc-addr-clear]").first
+            if await marked.count():
+                box = await marked.bounding_box()
+                if box and box.get("width") and box.get("height"):
+                    await page.mouse.click(
+                        float(box["x"]) + float(box["width"]) / 2.0,
+                        float(box["y"]) + float(box["height"]) / 2.0,
+                    )
+                    await page.wait_for_timeout(100)
+        except Exception:
+            pass
         logger.info(
-            "address_clear member=%r field=%s home=%s mailing=%s",
+            "address_clear member=%r field=%s home=%s mailing=%s clicks=%s",
             member_name,
             field,
             int(bool(result.get("home"))),
             int(bool(result.get("mailing"))),
+            len(clicks),
         )
         return result
     except Exception:
@@ -7216,11 +7686,25 @@ async def _type_address_for_places_dropdown(
             const locs = [...card.querySelectorAll('input')].filter((input) => {
               const t = (input.type || 'text').toLowerCase();
               if (t === 'checkbox' || t === 'radio' || t === 'hidden') return false;
+              const label = labelFor(card, input);
               const ph = ((input.placeholder || '') + ' ' +
-                (input.getAttribute('aria-label') || '')).toLowerCase();
-              return ph.includes('location') || ph.includes('address');
+                (input.getAttribute('aria-label') || '') + ' ' + label).toLowerCase();
+              if (ph.includes('apartment') || ph.includes('unit') || ph.includes('po box')) {
+                return false;
+              }
+              return (
+                ph.includes('location') || ph.includes('address') ||
+                ph.includes('home') || ph.includes('mailing') || !ph.trim()
+              );
             });
-            el = key === 'mailing' ? (locs[1] || null) : (locs[0] || null);
+            if (key === 'mailing') {
+              const byLabel = locs.find((input) => labelFor(card, input).includes('mailing'));
+              // After No Home Address only the mailing location input remains.
+              el = byLabel || (locs.length === 1 ? locs[0] : (locs[1] || locs[0] || null));
+            } else {
+              const byLabel = locs.find((input) => labelFor(card, input).includes('home'));
+              el = byLabel || locs[0] || null;
+            }
           }
           if (!el) return { ok: false, reason: 'no_input' };
           for (const node of card.querySelectorAll('[data-pc-addr]')) {
@@ -7335,8 +7819,36 @@ async def _click_address_suggestion(page: Page, suggestion: str) -> bool:
         )
         if not isinstance(box, dict) or box.get("x") is None:
             return False
-        await page.mouse.click(float(box["x"]), float(box["y"]))
-        await page.wait_for_timeout(350)
+        # Mark + mouse click the exact matched row (never ArrowDown — wrong row risk).
+        await page.evaluate(
+            """(suggestion) => {
+              const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+              const want = norm(suggestion);
+              for (const el of document.querySelectorAll('[role=option], .pac-item, [class*="suggestion"]')) {
+                el.removeAttribute('data-pc-pac');
+                const text = norm(el.innerText || el.textContent || '');
+                if (!text) continue;
+                if (text === want || text.includes(want) || want.includes(text)) {
+                  el.setAttribute('data-pc-pac', '1');
+                  break;
+                }
+              }
+            }""",
+            suggestion,
+        )
+        marked = page.locator("[data-pc-pac='1']").first
+        if await marked.count():
+            box2 = await marked.bounding_box()
+            if box2 and box2.get("width") and box2.get("height"):
+                await page.mouse.click(
+                    float(box2["x"]) + float(box2["width"]) / 2.0,
+                    float(box2["y"]) + min(float(box2["height"]) / 2.0, 14.0),
+                )
+            else:
+                await marked.click(timeout=2000, force=True)
+        else:
+            await page.mouse.click(float(box["x"]), float(box["y"]))
+        await page.wait_for_timeout(400)
         return True
     except Exception:
         logger.exception("click_address_suggestion failed")
@@ -7355,10 +7867,16 @@ async def _address_places_selection_committed(
             + """
               const card = findAddressCard(memberName);
               if (!card) return { ok: false, reason: 'no_card' };
+              const cardText = low(card.innerText || '');
+              // Pointcare shows this until a Places row is selected.
+              if (/please enter and select|select a (home|mailing) address|choose an address from the list/.test(cardText)) {
+                return { ok: false, reason: 'validation_visible' };
+              }
               const fields = cardFields(card);
               const input = fields[key];
               if (!input) return { ok: false, reason: 'no_input' };
               const value = (input.value || '').trim();
+              if (!value) return { ok: false, reason: 'empty' };
               const pacOpen = [...document.querySelectorAll('.pac-item, [role=option]')].some((el) => {
                 const r = el.getBoundingClientRect();
                 if (r.width < 8 || r.height < 8) return false;
@@ -7369,6 +7887,7 @@ async def _address_places_selection_committed(
                 }
                 return true;
               });
+              if (pacOpen) return { ok: false, reason: 'pac_open', value };
               // Selected Places rows show the circular clear X on the field.
               const ir = input.getBoundingClientRect();
               let clearNear = false;
@@ -7387,20 +7906,50 @@ async def _address_places_selection_committed(
                 }
                 if (host === card) break;
               }
-              const typedNorm = (typed || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-              const valueNorm = value.toLowerCase();
-              const chosenNorm = (chosen || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-              const valueChanged = Boolean(value) && valueNorm !== typedNorm;
-              const looksChosen = Boolean(value) && (
-                valueChanged ||
-                (chosenNorm && valueNorm.includes(chosenNorm.slice(0, 12)))
+              // Fold AFTER toLowerCase; keep /i so "Street"/"Drive" still match.
+              const foldAddr = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase()
+                .replace(/\\b(street)\\b/gi, 'st')
+                .replace(/\\b(drive)\\b/gi, 'dr')
+                .replace(/\\b(avenue)\\b/gi, 'ave')
+                .replace(/\\b(road)\\b/gi, 'rd')
+                .replace(/\\b(lane)\\b/gi, 'ln')
+                .replace(/\\b(boulevard)\\b/gi, 'blvd')
+                .replace(/\\b(north carolina)\\b/gi, 'nc')
+                .replace(/\\b(massachusetts)\\b/gi, 'ma')
+                .replace(/\\b(united states(?: of america)?)\\b/gi, 'usa');
+              const typedNorm = foldAddr(typed);
+              const valueNorm = foldAddr(value);
+              const chosenNorm = foldAddr(chosen);
+              const tokens = (s) => s.split(/[^a-z0-9]+/).filter((t) => t.length >= 2 && !/^(usa|us|the|of)$/.test(t));
+              const valueTokens = new Set(tokens(valueNorm));
+              const chosenTokens = tokens(chosenNorm);
+              const overlap = chosenTokens.length
+                ? chosenTokens.filter((t) => valueTokens.has(t)).length / chosenTokens.length
+                : 0;
+              // Must look like the Places row, not free-typed speech alone.
+              const matchesChosen = Boolean(chosenNorm) && (
+                valueNorm === chosenNorm ||
+                valueNorm.includes(chosenNorm) ||
+                chosenNorm.includes(valueNorm) ||
+                overlap >= 0.65
               );
+              const richerThanTyped = Boolean(typedNorm) && valueNorm !== typedNorm && (
+                valueNorm.includes(typedNorm.split(',')[0].trim()) ||
+                typedNorm.includes(valueNorm.split(',')[0].trim()) ||
+                valueNorm.includes(typedNorm) ||
+                typedNorm.includes(valueNorm.split(',')[0] || '')
+              );
+              // Clear-X + richer Places value means the row was selected even when
+              // the pac label abbreviates Street→St (overlap used to fail at 0.67).
+              const ok = clearNear && (matchesChosen || richerThanTyped);
               return {
-                ok: Boolean(value) && !pacOpen && (clearNear || looksChosen),
+                ok,
                 value,
                 pacOpen,
                 clearNear,
-                valueChanged,
+                matchesChosen,
+                overlap,
+                richerThanTyped,
               };
             }""",
             {
@@ -7434,7 +7983,7 @@ async def _address_validation_visible(page: Page, member_name: str) -> bool:
               if (!card) return false;
               const text = low(card.innerText || '');
               // Do not treat the "Enter a location" placeholder as validation.
-              return /please enter a valid|invalid address|address is required|select an address|choose an address from the list/.test(text);
+              return /please enter a valid|please enter and select|invalid address|address is required|select an address|select a (home|mailing) address|choose an address from the list|or check ['\"]?no (home|mailing) address/.test(text);
             }""",
             member_name,
         )
@@ -7565,9 +8114,65 @@ async def _resolve_spoken_address_suggestion(
             "suggestions": suggestions[:5],
             "street": street,
         }
+    chosen = matches[0]
+    # Select the Places row now so confirm shows a committed chip, not free text.
+    if not await _click_address_suggestion(page, chosen):
+        logger.warning(
+            "address_resolve_suggestion_click_failed member=%r suggestion=%r",
+            member_name,
+            chosen,
+        )
+        return {
+            "ok": False,
+            "error": "address_no_suggestion",
+            "reason": "suggestion_click_failed",
+            "suggestions": suggestions[:5],
+            "street": street,
+        }
+    # Let Pointcare clear the red "enter and select" warning after the click.
+    for _ in range(6):
+        if not await _address_validation_visible(page, member_name):
+            break
+        await page.wait_for_timeout(150)
+    if not await _address_places_selection_committed(
+        page, member_name, primary_field, street, chosen
+    ):
+        # One retry: re-open dropdown and click again.
+        await _type_address_for_places_dropdown(
+            page, member_name, primary_field, street
+        )
+        await page.wait_for_timeout(400)
+        again = await _visible_address_suggestions(page)
+        rematch = _suggestion_matches(street, again) or (
+            [chosen] if any(
+                _normalize_address_suggestion_text(row).lower()
+                == _normalize_address_suggestion_text(chosen).lower()
+                for row in again
+            )
+            else []
+        )
+        if len(rematch) != 1 or not await _click_address_suggestion(page, rematch[0]):
+            return {
+                "ok": False,
+                "error": "address_no_suggestion",
+                "reason": "suggestion_not_committed",
+                "suggestions": again[:5] or suggestions[:5],
+                "street": street,
+            }
+        chosen = rematch[0]
+        if not await _address_places_selection_committed(
+            page, member_name, primary_field, street, chosen
+        ):
+            return {
+                "ok": False,
+                "error": "address_no_suggestion",
+                "reason": "suggestion_not_committed",
+                "suggestions": again[:5] or suggestions[:5],
+                "street": street,
+            }
     return {
         "ok": True,
-        "chosen": matches[0],
+        "chosen": chosen,
         "suggestions": suggestions,
         "street": street,
         "field": primary_field,
@@ -7600,6 +8205,7 @@ async def _commit_member_address(
     type_query = street or chosen_hint
     number_match = re.search(r"\b\d+\b", type_query or "")
     number = number_match.group(0) if number_match else ""
+    cleared: dict[str, Any] = {}
     _content_skip = {
         "the",
         "and",
@@ -7629,8 +8235,19 @@ async def _commit_member_address(
     ][:3]
     suggestions: list[str] = []
     matches: list[str] = []
-    # If the matched row is still visible, click it without retyping.
-    visible_now = await _visible_address_suggestions(page)
+    already_selected = False
+    # If resolve already selected the Places chip, do not clear it on Yes→Save.
+    if chosen_hint and await _address_places_selection_committed(
+        page, member_name, primary_field, type_query, chosen_hint
+    ):
+        matches = [chosen_hint]
+        already_selected = True
+        logger.info(
+            "address_places_already_selected member=%r field=%s chosen=%r",
+            member_name,
+            primary_field,
+            chosen_hint,
+        )
 
     def _row_matches_chosen(row: str, want: str) -> bool:
         left = _normalize_address_suggestion_text(row).lower()
@@ -7639,7 +8256,11 @@ async def _commit_member_address(
             return False
         return left == right or right in left or left in right
 
-    if chosen_hint and any(_row_matches_chosen(row, chosen_hint) for row in visible_now):
+    # If the matched row is still visible, click it without retyping.
+    visible_now = await _visible_address_suggestions(page)
+    if len(matches) != 1 and chosen_hint and any(
+        _row_matches_chosen(row, chosen_hint) for row in visible_now
+    ):
         preferred = [row for row in visible_now if _row_matches_chosen(row, chosen_hint)]
         if len(preferred) == 1:
             matches = preferred
@@ -7724,24 +8345,71 @@ async def _commit_member_address(
         else:
             await _fill_member_address_inputs(page, member_name, home_unit=unit)
     chosen = matches[0]
-    if not await _click_address_suggestion(page, chosen):
-        logger.warning("address_suggestion_click_failed suggestion=%r", chosen)
-        return {
-            "ok": False,
-            "error": "address_no_suggestion",
-            "reason": "suggestion_click_failed",
-            "suggestions": suggestions[:5],
-        }
-    if not await _address_places_selection_committed(
-        page, member_name, primary_field, type_query, chosen
-    ):
-        logger.warning("address_suggestion_not_committed suggestion=%r", chosen)
-        return {
-            "ok": False,
-            "error": "address_no_suggestion",
-            "reason": "suggestion_not_committed",
-            "suggestions": suggestions[:5],
-        }
+    if not already_selected:
+        if not await _click_address_suggestion(page, chosen):
+            logger.warning("address_suggestion_click_failed suggestion=%r", chosen)
+            return {
+                "ok": False,
+                "error": "address_no_suggestion",
+                "reason": "suggestion_click_failed",
+                "suggestions": suggestions[:5],
+            }
+        if not await _address_places_selection_committed(
+            page, member_name, primary_field, type_query, chosen
+        ):
+            logger.warning("address_suggestion_not_committed suggestion=%r", chosen)
+            return {
+                "ok": False,
+                "error": "address_no_suggestion",
+                "reason": "suggestion_not_committed",
+                "suggestions": suggestions[:5],
+            }
+    if await _address_validation_visible(page, member_name):
+        logger.warning(
+            "address_validation_before_save_retry member=%r field=%s chosen=%r",
+            member_name,
+            primary_field,
+            chosen,
+        )
+        # Stale red warning after picking a household-shared address — re-select.
+        await _clear_member_address_selection(page, member_name, primary_field)
+        await page.wait_for_timeout(150)
+        rewritten = await _type_address_for_places_dropdown(
+            page, member_name, primary_field, chosen or type_query
+        )
+        if rewritten:
+            for _ in range(8):
+                await page.wait_for_timeout(250)
+                rows_now = await _visible_address_suggestions(page)
+                rematch = _suggestion_matches(street or chosen or type_query, rows_now)
+                if chosen_hint:
+                    preferred = [
+                        row
+                        for row in rows_now
+                        if _row_matches_chosen(row, chosen_hint)
+                    ]
+                    if len(preferred) == 1:
+                        rematch = preferred
+                if len(rematch) == 1:
+                    await _click_address_suggestion(page, rematch[0])
+                    chosen = rematch[0]
+                    already_selected = await _address_places_selection_committed(
+                        page, member_name, primary_field, type_query, chosen
+                    )
+                    break
+        if await _address_validation_visible(page, member_name):
+            logger.warning(
+                "address_validation_before_save member=%r field=%s chosen=%r",
+                member_name,
+                primary_field,
+                chosen,
+            )
+            return {
+                "ok": False,
+                "error": "address_save_failed",
+                "reason": "validation_before_save",
+                "suggestions": suggestions[:5],
+            }
     checked = await _fill_member_address_inputs(page, member_name)
     selected = (
         checked.get("mailing") if primary_field == "mailing" else checked.get("home")
@@ -7792,13 +8460,123 @@ async def _commit_member_address(
                     "reason": "suggestion_missing",
                     "suggestions": mail_suggestions[:5],
                 }
-    if not await _click_member_address_action(page, member_name, "save"):
+    async def _save_and_read_share() -> dict[str, Any]:
+        if not await _click_member_address_action(page, member_name, "save"):
+            return {"ok": False, "reason": "save_click_failed"}
+        await page.wait_for_timeout(450)
+        share_info = await _address_share_dialog_info(page)
+        if share_info.get("open"):
+            return {"ok": True, "share": share_info}
+        # Shared-address overlays can lag a beat after Save.
+        for _ in range(4):
+            await page.wait_for_timeout(200)
+            share_info = await _address_share_dialog_info(page)
+            if share_info.get("open"):
+                return {"ok": True, "share": share_info}
+        return {
+            "ok": True,
+            "share": share_info,
+            "validation": await _address_validation_visible(page, member_name),
+        }
+
+    async def _force_reselect_places() -> bool:
+        """Re-type and re-click Places — needed when the address is already used."""
+        await _clear_member_address_selection(page, member_name, primary_field)
+        await page.wait_for_timeout(150)
+        query = chosen or type_query
+        written = await _type_address_for_places_dropdown(
+            page, member_name, primary_field, query
+        )
+        if not written:
+            return False
+        rows: list[str] = []
+        hit: list[str] = []
+        for _ in range(10):
+            await page.wait_for_timeout(250)
+            rows = await _visible_address_suggestions(page)
+            hit = _suggestion_matches(street or chosen or query, rows)
+            if chosen_hint:
+                preferred = [
+                    row for row in rows if _row_matches_chosen(row, chosen_hint)
+                ]
+                if len(preferred) == 1:
+                    hit = preferred
+            if len(hit) == 1:
+                break
+            if rows and _ == 4:
+                break
+        if len(hit) != 1:
+            return False
+        if not await _click_address_suggestion(page, hit[0]):
+            return False
+        return await _address_places_selection_committed(
+            page, member_name, primary_field, query, hit[0]
+        )
+
+    saved = await _save_and_read_share()
+    if not saved.get("ok") and saved.get("reason") == "save_click_failed":
         logger.warning("address_save_click_failed")
         return {"ok": False, "error": "address_save_failed", "reason": "save_click_failed"}
-    await page.wait_for_timeout(400)
-    if await _address_validation_visible(page, member_name):
-        logger.warning("address_validation_still_visible")
-        return {"ok": False, "error": "address_save_failed", "reason": "validation_visible"}
+    share = saved.get("share") if isinstance(saved.get("share"), dict) else {}
+    if share.get("open"):
+        # Caller must ask Yes/No, then dismiss the popup before verifying the card.
+        return {
+            "ok": True,
+            "error": "",
+            "share_dialog": share,
+            "card": None,
+            "reason": "share_dialog",
+            "cleared": cleared,
+            "member_name": member_name,
+            "field": field,
+            "street": street,
+            "before": before,
+        }
+    if saved.get("validation") or await _address_validation_visible(page, member_name):
+        # Reused household addresses often need a fresh Places click before Save
+        # will stick (otherwise Pointcare keeps the red select warning).
+        logger.warning(
+            "address_validation_after_save_retry member=%r field=%s chosen=%r",
+            member_name,
+            primary_field,
+            chosen,
+        )
+        if await _force_reselect_places():
+            saved = await _save_and_read_share()
+            share = saved.get("share") if isinstance(saved.get("share"), dict) else {}
+            if share.get("open"):
+                return {
+                    "ok": True,
+                    "error": "",
+                    "share_dialog": share,
+                    "card": None,
+                    "reason": "share_dialog",
+                    "cleared": cleared,
+                    "member_name": member_name,
+                    "field": field,
+                    "street": street,
+                    "before": before,
+                }
+            if not (
+                saved.get("validation")
+                or await _address_validation_visible(page, member_name)
+            ):
+                # Fall through to card verification below.
+                pass
+            else:
+                logger.warning("address_validation_still_visible")
+                return {
+                    "ok": False,
+                    "error": "address_save_failed",
+                    "reason": "validation_visible",
+                }
+        else:
+            logger.warning("address_validation_still_visible")
+            return {
+                "ok": False,
+                "error": "address_save_failed",
+                "reason": "validation_visible",
+            }
     after = await _scrape_address_cards(page)
     if not _other_addresses_unchanged(before, after, member_name):
         logger.warning("address_other_member_changed")
@@ -13163,33 +13941,68 @@ def _address_leave_as_is(text: str) -> bool:
     )
 
 
+def _start_member_home_review(session: Any, card: dict[str, Any]) -> str:
+    """Pin the member on home_check and return the home-only Yes/No prompt."""
+    name = str(card.get("name") or "").strip()
+    session.filled["app_address_current"] = name
+    session.filled["app_address_field"] = "home"
+    session.filled.pop("app_address_ready", None)
+    session.filled.pop("app_address_correcting", None)
+    _clear_address_pending(session)
+    _set_address_phase(session, "home_check")
+    return _address_home_check_speech(card)
+
+
 async def _prepare_address_review_speech(
     session: Any, page: Page
 ) -> tuple[str, str]:
-    """Read the next unconfirmed member's saved addresses; never open Edit here."""
+    """Walk members top-to-bottom: home check → mailing check → next member."""
     cards = await _scrape_address_cards(page)
     names = [str(card.get("name") or "").strip() for card in cards if card.get("name")]
-    missing = [
-        name
-        for name in names
-        if (_card_by_name(cards, name) or {}).get("needs_add")
-    ]
     current = str(session.filled.get("app_address_current") or "").strip()
-    field = str(session.filled.get("app_address_field") or "").strip()
     phase = _address_phase(session)
 
     # Mid home/mailing confirm-before-save flow.
     if current and phase in (
         "home_check",
+        "home_change_ask",
+        "home_enter",
         "home_confirm",
         "mailing_check",
+        "mailing_change_ask",
+        "mailing_enter",
         "mailing_confirm",
+        "share_ask",
     ):
         card = _card_by_name(cards, current) or {"name": current}
         if phase == "home_check":
             speech = _address_home_check_speech(card)
         elif phase == "mailing_check":
             speech = _address_mailing_check_speech(card)
+        elif phase == "home_change_ask":
+            speech = _address_change_ask_speech(current, "home")
+        elif phase == "mailing_change_ask":
+            speech = _address_change_ask_speech(current, "mailing")
+        elif phase == "home_enter":
+            speech = _address_enter_speech(current, "home")
+        elif phase == "mailing_enter":
+            speech = _address_enter_speech(current, "mailing")
+        elif phase == "share_ask":
+            share_members: list[str] = []
+            try:
+                loaded = json.loads(
+                    session.filled.get("app_address_share_members") or "[]"
+                )
+                if isinstance(loaded, list):
+                    share_members = [str(item) for item in loaded if str(item).strip()]
+            except Exception:
+                share_members = []
+            speech = _address_share_ask_speech(
+                {
+                    "members": share_members,
+                    "prompt": str(session.filled.get("app_address_share_prompt") or ""),
+                }
+            )
         else:
             speech = _address_pending_confirm_speech(
                 current,
@@ -13201,51 +14014,33 @@ async def _prepare_address_review_speech(
         _set_pending_question(session, "app_address_review", speech)
         return "app_address_review", speech
 
-    # Mid-correction: keep asking for the pending street without re-opening Edit.
-    if current and field:
-        prompt = (
-            f"What is the new {field} address for "
-            f"{_clean_member_display_name(current)}?"
-        )
-        _set_pending_question(session, "app_address_review", prompt)
-        return "app_address_review", prompt
+    # Resume an in-progress member on home first when phase was lost.
     if current and current.lower() not in {
         name.lower() for name in _address_confirmed_names(session)
     }:
         card = _card_by_name(cards, current)
         if card is not None:
-            speech = _address_confirm_speech(card, cards)
+            speech = _start_member_home_review(session, card)
             _set_pending_question(session, "app_address_review", speech)
             return "app_address_review", speech
 
-    # Required missing addresses before reviewing complete cards.
-    if missing:
-        nxt = missing[0]
-        if current and current in missing:
-            nxt = current
-        session.filled["app_address_current"] = nxt
-        session.filled.pop("app_address_ready", None)
-        card = _card_by_name(cards, nxt) or {"name": nxt}
-        speech = _address_confirm_speech(card, cards)
-        _set_pending_question(session, "app_address_review", speech)
-        return "app_address_review", speech
-
+    # Always walk in screen order (Admin first) — never jump to incomplete cards.
     confirmed = {name.lower() for name in _address_confirmed_names(session)}
     pending = [name for name in names if name.lower() not in confirmed]
     if pending:
         nxt = pending[0]
         if current and current.lower() not in confirmed and current in names:
             nxt = current
-        session.filled["app_address_current"] = nxt
-        session.filled.pop("app_address_ready", None)
         card = _card_by_name(cards, nxt) or {"name": nxt}
-        speech = _address_confirm_speech(card, cards)
+        speech = _start_member_home_review(session, card)
         _set_pending_question(session, "app_address_review", speech)
         return "app_address_review", speech
 
     if names:
         session.filled["app_address_ready"] = "1"
         session.filled.pop("app_address_current", None)
+        session.filled.pop("app_address_field", None)
+        _set_address_phase(session, "")
         speech = "Those address cards are confirmed. Say Yes to continue."
         _set_pending_question(session, "app_address_review", speech)
         return "app_address_review", speech
@@ -13338,7 +14133,7 @@ async def _begin_address_home_check(
     target: str,
     cards: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Open editor and start home → mailing confirm-before-save walk."""
+    """Open editor after No, then ask Yes-to-change vs No Home Address."""
     speak_as = _clean_member_display_name(target)
     opened = await _open_member_address_editor(page, target)
     if not opened.get("ok"):
@@ -13363,18 +14158,174 @@ async def _begin_address_home_check(
     session.filled["app_address_field"] = "home"
     session.filled.pop("app_address_ready", None)
     _clear_address_pending(session)
-    _set_address_phase(session, "home_check")
+    # User already said the card is wrong — ask change vs no-home next.
+    _set_address_phase(session, "home_change_ask")
     speech = (
         f"Okay, I'll change that for {speak_as}. "
-        + _address_home_check_speech(prior)
+        + _address_change_ask_speech(target, "home")
     )
     return _app_ok(
         call_id,
         session,
         text,
         step,
-        "address home check started",
+        "address home change ask started",
         spoken_override=speech,
+    )
+
+
+async def _advance_after_address_field_save(
+    call_id: str,
+    session: Any,
+    page: Page,
+    text: str,
+    step: str,
+    target: str,
+    field: str,
+    card: dict[str, Any],
+) -> dict[str, Any]:
+    """After a home/mailing save, continue to mailing check or next member."""
+    speak_as = _clean_member_display_name(target)
+    _clear_address_pending(session)
+    session.filled.pop("app_address_share_after", None)
+    session.filled.pop("app_address_share_prompt", None)
+    session.filled.pop("app_address_share_members", None)
+    if field == "home":
+        session.filled["app_address_field"] = "mailing"
+        _set_address_phase(session, "mailing_check")
+        await _open_member_address_editor(page, target)
+        return _app_ok(
+            call_id,
+            session,
+            text,
+            step,
+            "address home saved pending mailing",
+            spoken_override=(
+                f"Okay, that home address choice is saved for {speak_as}. "
+                + _address_mailing_check_speech(card)
+            ),
+        )
+    _set_address_phase(session, "")
+    session.filled.pop("app_address_field", None)
+    session.filled.pop("app_address_correcting", None)
+    session.filled.pop("app_address_snapshot", None)
+    _mark_address_confirmed(session, target)
+    session.filled.pop("app_address_current", None)
+    next_step, spoken = await _prepare_address_review_speech(session, page)
+    return _app_ok(
+        call_id,
+        session,
+        text,
+        next_step,
+        "address mailing saved member done",
+        spoken_override=(
+            f"Okay, that mailing address choice is saved for {speak_as}. " + spoken
+        ),
+    )
+
+
+async def _begin_address_share_ask(
+    call_id: str,
+    session: Any,
+    text: str,
+    step: str,
+    target: str,
+    field: str,
+    share: dict[str, Any],
+) -> dict[str, Any]:
+    """Pause after Save when Pointcare asks about shared household addresses."""
+    session.filled["app_address_current"] = target
+    session.filled["app_address_correcting"] = target
+    session.filled["app_address_field"] = field
+    session.filled["app_address_share_after"] = (
+        "mailing" if field == "home" else "done"
+    )
+    session.filled["app_address_share_prompt"] = str(share.get("prompt") or "")
+    session.filled["app_address_share_members"] = json.dumps(
+        list(share.get("members") or [])
+    )
+    _set_address_phase(session, "share_ask")
+    return _app_ok(
+        call_id,
+        session,
+        text,
+        step,
+        "address share ask",
+        spoken_override=_address_share_ask_speech(share),
+    )
+
+
+async def _save_no_address_and_advance(
+    call_id: str,
+    session: Any,
+    page: Page,
+    text: str,
+    step: str,
+    target: str,
+    field: str,
+) -> dict[str, Any]:
+    """Check No Home/Mailing Address, Save, handle share popup, then continue."""
+    speak_as = _clean_member_display_name(target)
+    box_kind = "home" if field == "home" else "mailing"
+    opened = await _open_member_address_editor(page, target)
+    if not opened.get("ok"):
+        return _address_error(
+            call_id,
+            step,
+            "address_editor_failed",
+            f"I couldn't open the address editor for {speak_as}.",
+            session,
+        )
+    # Pointcare often keeps No Home/Mailing disabled until the street chip is cleared.
+    try:
+        await _clear_member_address_selection(page, target, box_kind)
+        await page.wait_for_timeout(200)
+    except Exception:
+        logger.exception(
+            "address_no_clear_before_checkbox failed member=%r kind=%s",
+            target,
+            box_kind,
+        )
+    if not await _set_member_no_address(page, target, box_kind):
+        return _address_error(
+            call_id,
+            step,
+            "address_no_home_failed"
+            if box_kind == "home"
+            else "address_no_mailing_failed",
+            f"I couldn't select that choice for {speak_as}.",
+            session,
+        )
+    if not await _click_member_address_action(page, target, "save"):
+        return _address_error(
+            call_id,
+            step,
+            "address_save_failed",
+            f"I selected that choice for {speak_as}, but Save did not complete.",
+            session,
+        )
+    await page.wait_for_timeout(350)
+    share = await _address_share_dialog_info(page)
+    if share.get("open"):
+        return await _begin_address_share_ask(
+            call_id, session, text, step, target, field, share
+        )
+    if await _address_validation_visible(page, target):
+        return _address_error(
+            call_id,
+            step,
+            "address_save_failed",
+            f"Pointcare still shows an address error for {speak_as}.",
+            session,
+        )
+    refreshed = await _scrape_address_cards(page)
+    card = _card_by_name(refreshed, target) or {"name": target}
+    if box_kind == "home":
+        card["no_home"] = True
+    else:
+        card["no_mailing"] = True
+    return await _advance_after_address_field_save(
+        call_id, session, page, text, step, target, field, card
     )
 
 
@@ -13386,7 +14337,7 @@ async def _commit_address_pending_and_advance(
     step: str,
     cards: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Save the pending home/mailing choice after Yes, then continue the walk."""
+    """Save the pending matched street after Yes, then continue the walk."""
     target = str(session.filled.get("app_address_current") or "").strip()
     field = str(session.filled.get("app_address_field") or "").strip() or "home"
     kind = str(session.filled.get("app_address_pending_kind") or "").strip()
@@ -13402,6 +14353,10 @@ async def _commit_address_pending_and_advance(
             "I lost the pending address change. Please say the address again.",
             session,
         )
+    if kind in ("no_home", "no_mailing"):
+        return await _save_no_address_and_advance(
+            call_id, session, page, text, step, target, field
+        )
 
     opened = await _open_member_address_editor(page, target)
     if not opened.get("ok"):
@@ -13413,113 +14368,48 @@ async def _commit_address_pending_and_advance(
             session,
         )
 
-    if kind in ("no_home", "no_mailing"):
-        box_kind = "home" if kind == "no_home" else "mailing"
-        if not await _set_member_no_address(page, target, box_kind):
-            return _address_error(
-                call_id,
-                step,
-                "address_no_home_failed"
-                if box_kind == "home"
-                else "address_no_mailing_failed",
-                f"I couldn't select that choice for {speak_as}.",
-                session,
+    # Always select the matched Places row — never save free-typed speech alone.
+    result = await _commit_member_address(
+        page, target, field, street, unit, chosen=chosen
+    )
+    if not result.get("ok"):
+        error = str(result.get("error") or "address_save_failed")
+        suggestion_rows = result.get("suggestions") or []
+        if not isinstance(suggestion_rows, list):
+            suggestion_rows = []
+        if error == "address_ambiguous":
+            spoken_err = (
+                f"More than one address matches for {speak_as}. "
+                + _speak_visible_address_suggestions(
+                    [str(item) for item in suggestion_rows]
+                )
             )
-        if not await _click_member_address_action(page, target, "save"):
-            return _address_error(
-                call_id,
-                step,
-                "address_save_failed",
-                f"I selected that choice for {speak_as}, but Save did not complete.",
-                session,
+        elif error == "address_no_suggestion":
+            spoken_err = (
+                f"I couldn't match that to an address from the list for {speak_as}. "
+                + _speak_visible_address_suggestions(
+                    [str(item) for item in suggestion_rows]
+                )
             )
-        await page.wait_for_timeout(300)
-        if await _address_validation_visible(page, target):
-            return _address_error(
-                call_id,
-                step,
-                "address_save_failed",
-                f"Pointcare still shows an address error for {speak_as}.",
-                session,
+        else:
+            spoken_err = (
+                f"I couldn't save that {field} address for {speak_as}. "
+                "Please say it again."
             )
+        return _address_error(call_id, step, error, spoken_err, session)
+
+    share = result.get("share_dialog")
+    if isinstance(share, dict) and share.get("open"):
+        return await _begin_address_share_ask(
+            call_id, session, text, step, target, field, share
+        )
+
+    card = result.get("card") or {}
+    if not isinstance(card, dict) or not card.get("name"):
         refreshed = await _scrape_address_cards(page)
         card = _card_by_name(refreshed, target) or {"name": target}
-        if box_kind == "home":
-            card["no_home"] = True
-        else:
-            card["no_mailing"] = True
-    else:
-        # Always select the matched Places row — never save free-typed speech alone.
-        result = await _commit_member_address(
-            page, target, field, street, unit, chosen=chosen
-        )
-        if not result.get("ok"):
-            error = str(result.get("error") or "address_save_failed")
-            suggestion_rows = result.get("suggestions") or []
-            if not isinstance(suggestion_rows, list):
-                suggestion_rows = []
-            if error == "address_ambiguous":
-                spoken_err = (
-                    f"More than one address matches for {speak_as}. "
-                    + _speak_visible_address_suggestions(
-                        [str(item) for item in suggestion_rows]
-                    )
-                )
-            elif error == "address_no_suggestion":
-                spoken_err = (
-                    f"I couldn't match that to an address from the list for {speak_as}. "
-                    + _speak_visible_address_suggestions(
-                        [str(item) for item in suggestion_rows]
-                    )
-                )
-            else:
-                spoken_err = (
-                    f"I couldn't save that {field} address for {speak_as}. "
-                    "Please say it again."
-                )
-            return _address_error(call_id, step, error, spoken_err, session)
-        refreshed = await _scrape_address_cards(page)
-        card = result.get("card") or _card_by_name(refreshed, target) or {
-            "name": target
-        }
-
-    _clear_address_pending(session)
-    if field == "home" or _address_phase(session).startswith("home"):
-        session.filled["app_address_field"] = "mailing"
-        _set_address_phase(session, "mailing_check")
-        # Keep editor ready for mailing follow-up.
-        await _open_member_address_editor(page, target)
-        speech = (
-            f"Okay, that home address choice is saved for {speak_as}. "
-            + _address_mailing_check_speech(card)
-        )
-        return _app_ok(
-            call_id,
-            session,
-            text,
-            step,
-            "address home saved pending mailing",
-            spoken_override=speech,
-        )
-
-    # Mailing done — member walk complete for this card.
-    _set_address_phase(session, "")
-    session.filled.pop("app_address_field", None)
-    session.filled.pop("app_address_correcting", None)
-    session.filled.pop("app_address_snapshot", None)
-    _mark_address_confirmed(session, target)
-    session.filled.pop("app_address_current", None)
-    next_step, spoken = await _prepare_address_review_speech(session, page)
-    return _app_ok(
-        call_id,
-        session,
-        text,
-        next_step,
-        "address mailing saved member done",
-        spoken_override=(
-            f"Okay, that mailing address choice is saved for {speak_as}. "
-            + spoken
-        ),
+    return await _advance_after_address_field_save(
+        call_id, session, page, text, step, target, field, card
     )
 
 
@@ -13532,15 +14422,20 @@ async def _handle_address_field_phase(
     step: str,
     cards: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
-    """Home-then-mailing confirm-before-save. None = not in that phase."""
+    """Stepwise home/mailing change. None = not in that phase."""
     from .live_form import _is_no, _is_yes
 
     phase = _address_phase(session)
     if phase not in (
         "home_check",
+        "home_change_ask",
+        "home_enter",
         "home_confirm",
         "mailing_check",
+        "mailing_change_ask",
+        "mailing_enter",
         "mailing_confirm",
+        "share_ask",
     ):
         return None
 
@@ -13563,15 +14458,17 @@ async def _handle_address_field_phase(
         return None
 
     card = _card_by_name(cards, target) or {"name": target}
-    field = "home" if phase.startswith("home") else "mailing"
+    field = "mailing" if "mailing" in phase else "home"
+    if phase == "share_ask":
+        field = str(session.filled.get("app_address_field") or "home")
     session.filled["app_address_field"] = field
     session.filled["app_address_correcting"] = target
     speak_as = _clean_member_display_name(target)
     looks_ok = bool(re.search(r"\blooks? (good|correct|fine)\b", lowered))
     leave_as_is = _address_leave_as_is(text)
     affirmed = bool(_is_yes(text) or looks_ok or leave_as_is)
-    no_home = bool(re.search(r"\bno home(?:\s+address)?\b", lowered))
-    no_mailing = bool(re.search(r"\bno mailing(?:\s+address)?\b", lowered))
+    no_home = _means_no_home_address(text)
+    no_mailing = _means_no_mailing_address(text)
     street, unit = _split_street_and_unit(text)
     commandish = bool(
         re.search(
@@ -13580,14 +14477,9 @@ async def _handle_address_field_phase(
             lowered,
         )
     )
-    # Do not treat "Address. Name" / "change …" command phrases as streets.
-    # Allow a unique cue such as "Bridge" / "Floyd" once the Places list is open.
     streetish = (not affirmed and not no_home and not no_mailing) and (
         _looks_like_street(street)
-        or (
-            len(re.findall(r"[A-Za-z]+", street)) >= 2
-            and not commandish
-        )
+        or (len(re.findall(r"[A-Za-z]+", street)) >= 2 and not commandish)
         or (
             len(re.findall(r"[A-Za-z0-9]{3,}", street or "")) >= 1
             and not commandish
@@ -13595,7 +14487,61 @@ async def _handle_address_field_phase(
         )
     )
 
-    # Pending Yes/No before Save.
+    # Shared-address popup after Save.
+    if phase == "share_ask":
+        if affirmed or _is_no(text):
+            update_others = bool(affirmed)
+            if not await _click_address_share_dialog_choice(
+                page, update_others=update_others
+            ):
+                return _address_error(
+                    call_id,
+                    step,
+                    "address_share_dialog_failed",
+                    "I couldn't answer the shared-address popup. "
+                    "Say Yes to update the other members, or No to only update yours.",
+                    session,
+                )
+            await page.wait_for_timeout(300)
+            if (await _address_share_dialog_info(page)).get("open"):
+                return _address_error(
+                    call_id,
+                    step,
+                    "address_share_dialog_failed",
+                    "That shared-address popup is still open. "
+                    "Say Yes to update the other members, or No to only update yours.",
+                    session,
+                )
+            refreshed = await _scrape_address_cards(page)
+            saved_card = _card_by_name(refreshed, target) or {"name": target}
+            return await _advance_after_address_field_save(
+                call_id, session, page, text, step, target, field, saved_card
+            )
+        share_members: list[str] = []
+        try:
+            loaded_share = json.loads(
+                session.filled.get("app_address_share_members") or "[]"
+            )
+            if isinstance(loaded_share, list):
+                share_members = [
+                    str(item) for item in loaded_share if str(item).strip()
+                ]
+        except Exception:
+            share_members = []
+        return _address_error(
+            call_id,
+            step,
+            "address_share_ask_needed",
+            _address_share_ask_speech(
+                {
+                    "members": share_members,
+                    "prompt": str(session.filled.get("app_address_share_prompt") or ""),
+                }
+            ),
+            session,
+        )
+
+    # Matched-street Yes/No before Save.
     if phase in ("home_confirm", "mailing_confirm"):
         if affirmed:
             return await _commit_address_pending_and_advance(
@@ -13603,23 +14549,20 @@ async def _handle_address_field_phase(
             )
         if _is_no(text) or re.search(r"\b(change|wrong|incorrect|fix)\b", lowered):
             _clear_address_pending(session)
-            back = "home_check" if phase == "home_confirm" else "mailing_check"
+            back = "home_enter" if phase == "home_confirm" else "mailing_enter"
             _set_address_phase(session, back)
-            speech = (
-                _address_home_check_speech(card)
-                if back == "home_check"
-                else _address_mailing_check_speech(card)
-            )
             return _app_ok(
                 call_id,
                 session,
                 text,
                 step,
                 "address pending rejected",
-                spoken_override=f"Okay, I won't save that yet. {speech}",
+                spoken_override=(
+                    "Okay, I won't save that yet. "
+                    + _address_enter_speech(target, field)
+                ),
             )
         if streetish and street:
-            # Rematch a unique cue against the Places list before Save.
             return await _stage_matched_address_pending(
                 call_id, session, page, text, step, target, field, street, unit
             )
@@ -13638,42 +14581,61 @@ async def _handle_address_field_phase(
             session,
         )
 
-    # home_check / mailing_check
-    if field == "home" and no_home:
-        session.filled["app_address_pending_kind"] = "no_home"
-        session.filled.pop("app_address_pending_street", None)
-        session.filled.pop("app_address_pending_chosen", None)
-        session.filled.pop("app_address_pending_unit", None)
-        _set_address_phase(session, "home_confirm")
-        return _app_ok(
+    # After "is it correct?" → No: ask Yes-to-change vs No Home/Mailing.
+    if phase in ("home_change_ask", "mailing_change_ask"):
+        if (field == "home" and no_home) or (field == "mailing" and no_mailing):
+            return await _save_no_address_and_advance(
+                call_id, session, page, text, step, target, field
+            )
+        if affirmed:
+            enter = "home_enter" if field == "home" else "mailing_enter"
+            _set_address_phase(session, enter)
+            return _app_ok(
+                call_id,
+                session,
+                text,
+                step,
+                "address enter started",
+                spoken_override=_address_enter_speech(target, field),
+            )
+        if _is_no(text):
+            # On this prompt, bare No means the No Home/Mailing Address choice.
+            return await _save_no_address_and_advance(
+                call_id, session, page, text, step, target, field
+            )
+        return _address_error(
             call_id,
-            session,
-            text,
             step,
-            "address home no pending confirm",
-            spoken_override=_address_pending_confirm_speech(
-                target, "home", kind="no_home"
-            ),
+            "address_change_ask_clarify",
+            _address_change_ask_speech(target, field),
+            session,
         )
-    if field == "mailing" and no_mailing:
-        session.filled["app_address_pending_kind"] = "no_mailing"
-        session.filled.pop("app_address_pending_street", None)
-        session.filled.pop("app_address_pending_chosen", None)
-        session.filled.pop("app_address_pending_unit", None)
-        _set_address_phase(session, "mailing_confirm")
-        return _app_ok(
+
+    # Enter new street (or no-address).
+    if phase in ("home_enter", "mailing_enter"):
+        if (field == "home" and no_home) or (field == "mailing" and no_mailing):
+            return await _save_no_address_and_advance(
+                call_id, session, page, text, step, target, field
+            )
+        if streetish and street:
+            return await _stage_matched_address_pending(
+                call_id, session, page, text, step, target, field, street, unit
+            )
+        return _address_error(
             call_id,
-            session,
-            text,
             step,
-            "address mailing no pending confirm",
-            spoken_override=_address_pending_confirm_speech(
-                target, "mailing", kind="no_mailing"
-            ),
+            "address_new_value_needed",
+            _address_enter_speech(target, field),
+            session,
+        )
+
+    # home_check / mailing_check — only Yes keep or No → change ask.
+    if (field == "home" and no_home) or (field == "mailing" and no_mailing):
+        return await _save_no_address_and_advance(
+            call_id, session, page, text, step, target, field
         )
 
     if affirmed:
-        # Keep current field as-is; advance without Save.
         if field == "home":
             session.filled["app_address_field"] = "mailing"
             _clear_address_pending(session)
@@ -13697,7 +14659,6 @@ async def _handle_address_field_phase(
         session.filled.pop("app_address_snapshot", None)
         _mark_address_confirmed(session, target)
         session.filled.pop("app_address_current", None)
-        # Close editor if still open.
         try:
             if await _address_editor_is_open(page, target):
                 await _click_member_address_action(page, target, "cancel")
@@ -13715,18 +14676,26 @@ async def _handle_address_field_phase(
             ),
         )
 
-    if streetish and street:
-        return await _stage_matched_address_pending(
-            call_id, session, page, text, step, target, field, street, unit
+    if _is_no(text) or re.search(r"\b(change|wrong|incorrect|fix|edit)\b", lowered):
+        ask_phase = "home_change_ask" if field == "home" else "mailing_change_ask"
+        _set_address_phase(session, ask_phase)
+        await _open_member_address_editor(page, target)
+        return _app_ok(
+            call_id,
+            session,
+            text,
+            step,
+            "address change ask",
+            spoken_override=_address_change_ask_speech(target, field),
         )
 
-    if _is_no(text) or re.search(r"\b(change|wrong|incorrect|fix|edit)\b", lowered):
-        ask = (
-            f"What is the new {field} address for {speak_as}? "
-            f"Or say No {'Home' if field == 'home' else 'Mailing'} Address."
-        )
-        return _address_error(
-            call_id, step, "address_new_value_needed", ask, session
+    # Missing-address cards can accept a street directly on the check step.
+    if streetish and street and (
+        (field == "home" and card.get("needs_home"))
+        or (field == "mailing" and card.get("needs_mailing"))
+    ):
+        return await _stage_matched_address_pending(
+            call_id, session, page, text, step, target, field, street, unit
         )
 
     check_speech = (
@@ -13875,12 +14844,16 @@ async def _handle_address_step(
             ),
         )
 
-    no_home = bool(re.search(r"\bno home(?:\s+address)?\b", lowered))
-    no_mailing = bool(re.search(r"\bno mailing(?:\s+address)?\b", lowered))
+    no_home = _means_no_home_address(text)
+    no_mailing = _means_no_mailing_address(text)
     if no_home or no_mailing:
-        # Confirm-before-save: stage the choice, do not Save yet.
+        # Explicit no-address choice: checkbox + Save immediately.
         name_text = re.sub(
-            r"\bno (?:home|mailing)(?:\s+address)?\b", " ", text, flags=re.I
+            r"\bno[,.]?\s*(?:home|mailing|omar|ohm|own|holm|homee)"
+            r"(?:\s+address)?\b",
+            " ",
+            text,
+            flags=re.I,
         )
         hits, clarify = _match_named_members(name_text, names)
         target = hits[0] if len(hits) == 1 else current
@@ -13899,34 +14872,17 @@ async def _handle_address_step(
                     "Whose card should get that no-address choice? Please say the name.",
                     session,
                 )
-        started = await _begin_address_home_check(
-            call_id, session, page, text, step, target, cards
+        prior = _card_by_name(cards, target) or {"name": target}
+        session.filled["app_address_snapshot"] = json.dumps(
+            {
+                "name": target,
+                "home": str(prior.get("home") or ""),
+                "mailing": str(prior.get("mailing") or ""),
+            }
         )
-        if not started.get("ok"):
-            return started
-        if no_home:
-            session.filled["app_address_field"] = "home"
-            session.filled["app_address_pending_kind"] = "no_home"
-            _set_address_phase(session, "home_confirm")
-            kind = "no_home"
-            field = "home"
-        else:
-            session.filled["app_address_field"] = "mailing"
-            session.filled["app_address_pending_kind"] = "no_mailing"
-            _set_address_phase(session, "mailing_confirm")
-            kind = "no_mailing"
-            field = "mailing"
-        session.filled.pop("app_address_pending_street", None)
-        session.filled.pop("app_address_pending_unit", None)
-        return _app_ok(
-            call_id,
-            session,
-            text,
-            step,
-            "address no-option pending confirm",
-            spoken_override=_address_pending_confirm_speech(
-                target, field, kind=kind
-            ),
+        field = "home" if no_home else "mailing"
+        return await _save_no_address_and_advance(
+            call_id, session, page, text, step, target, field
         )
 
     street, unit = _split_street_and_unit(text)
@@ -14081,20 +15037,18 @@ async def _handle_address_step(
         )
         if not started.get("ok"):
             return started
-        card = _card_by_name(cards, target) or {"name": target}
         if field == "mailing":
             session.filled["app_address_field"] = "mailing"
-            _set_address_phase(session, "mailing_check")
-            speech = _address_mailing_check_speech(card)
+            _set_address_phase(session, "mailing_change_ask")
             return _app_ok(
                 call_id,
                 session,
                 text,
                 step,
-                "address mailing check started",
+                "address mailing change ask started",
                 spoken_override=(
                     f"Okay, I'll change that for {_clean_member_display_name(target)}. "
-                    + speech
+                    + _address_change_ask_speech(target, "mailing")
                 ),
             )
         # Default: home first, then mailing.
@@ -14113,13 +15067,19 @@ async def _handle_address_step(
         )
 
     confirmed = {name.lower() for name in _address_confirmed_names(session)}
+    # Never mark a member confirmed from a bare Yes here — home/mailing phases
+    # handle Yes (home → mailing → confirmed). If phase was lost, restart home.
     if wants_next and current and current.lower() not in confirmed:
-        _mark_address_confirmed(session, current)
-        confirmed.add(current.lower())
-        session.filled.pop("app_address_current", None)
-        session.filled.pop("app_address_field", None)
-        session.filled.pop("app_address_correcting", None)
-        current = ""
+        card = _card_by_name(cards, current) or {"name": current}
+        speech = _start_member_home_review(session, card)
+        return _app_ok(
+            call_id,
+            session,
+            text,
+            step,
+            "address home check restarted",
+            spoken_override=speech,
+        )
     pending = [name for name in names if name.lower() not in confirmed]
     ready = bool(session.filled.get("app_address_ready")) and not pending and not missing
     if wants_next and ready:
@@ -14198,16 +15158,15 @@ async def _handle_address_step(
         )
     if wants_next and pending:
         nxt = pending[0]
-        session.filled["app_address_current"] = nxt
-        session.filled.pop("app_address_ready", None)
         card = _card_by_name(cards, nxt) or {"name": nxt}
+        speech = _start_member_home_review(session, card)
         return _app_ok(
             call_id,
             session,
             text,
             step,
             "address confirm one member",
-            spoken_override=_address_confirm_speech(card, cards),
+            spoken_override=speech,
         )
     if attempted_labels and names and not wants_next:
         # Caller named someone that did not resolve — never fall back to another card.
@@ -14221,23 +15180,23 @@ async def _handle_address_step(
         )
     if current:
         card = _card_by_name(cards, current) or {"name": current}
+        speech = _start_member_home_review(session, card)
         return _address_error(
             call_id,
             step,
             "address_clarify",
-            _address_confirm_speech(card, cards),
+            speech,
             session,
         )
-    # No current member yet — start the review walk by reading the first card.
+    # No current member yet — start the review walk with home for the first card.
     if names:
-        nxt = names[0]
-        session.filled["app_address_current"] = nxt
-        card = _card_by_name(cards, nxt) or {"name": nxt}
+        card = _card_by_name(cards, names[0]) or {"name": names[0]}
+        speech = _start_member_home_review(session, card)
         return _address_error(
             call_id,
             step,
             "address_clarify",
-            _address_confirm_speech(card, cards),
+            speech,
             session,
         )
     return _address_error(

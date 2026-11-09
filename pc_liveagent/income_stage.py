@@ -82,6 +82,7 @@ _INCOME_PHASES = (
     "type",
     "amount",
     "more",
+    "manage",
     "employed",
     "self",
     "unemployed",
@@ -2376,11 +2377,7 @@ def _type_ask_speech(
     types = [t for t in (existing or []) if t and t != "None"]
     if types:
         listed = ", ".join(types[:6])
-        prefix += (
-            f"I already see {listed} for {who}. "
-            "You can add another income type, or say edit or delete followed by "
-            "the income type. "
-        )
+        prefix += f"I already see {listed} for {who}. "
     ask = "What income type should I enter?"
     if include_options:
         ask = f"{ask} {income_type_options_speech()}"
@@ -2429,19 +2426,28 @@ def _amount_ask_speech(
 
 
 def _more_ask_speech(name: str, existing: list[str] | None = None) -> str:
+    """Yes/No only — type and edit/delete are asked on later turns."""
+    del existing  # kept for call-site compatibility
     who = name or "this person"
-    types = [t for t in (existing or []) if t and t != "None"]
-    manage = ""
-    if types:
-        listed = ", ".join(types[:6])
-        manage = (
-            f" You can also say edit or delete one of the existing incomes "
-            f"({listed})."
-        )
     return (
         f"Do you want to add another income for {who}? "
-        f"If yes, tell me the income type.{manage} "
-        "Say No if you're done with this person."
+        "Please say Yes or No."
+    )
+
+
+def _manage_ask_speech(name: str, existing: list[str] | None = None) -> str:
+    """Asked only after the caller declines adding another income."""
+    who = name or "this person"
+    types = [t for t in (existing or []) if t and t != "None"]
+    listed = ", ".join(types[:6]) if types else ""
+    if listed:
+        return (
+            f"Do you want to edit or delete an existing income for {who} "
+            f"({listed})? Say edit, delete, or No if you're done."
+        )
+    return (
+        f"Do you want to edit or delete an existing income for {who}? "
+        "Say edit, delete, or No if you're done."
     )
 
 
@@ -5159,6 +5165,12 @@ async def prepare_income_speech(session: Any, page: Page) -> tuple[str, str]:
             )
             _set_pending_question(session, "app_income_more", speech)
             return "app_income_more", speech
+        elif phase == "manage":
+            speech = _manage_ask_speech(
+                current, _member_existing_types(session, current)
+            )
+            _set_pending_question(session, "app_income_more", speech)
+            return "app_income_more", speech
         elif phase == "confirm":
             speech = str(
                 session.filled.get("app_income_pending_summary") or ""
@@ -6177,6 +6189,58 @@ async def handle_income_step(
         session.filled.pop("app_income_manage_action", None)
         return await _apply_picked_income(income_type, edit_mode=True)
 
+    # ---- Manage existing incomes (after declining "add another") ----
+    if phase == "manage":
+        managed = await _handle_edit_delete()
+        if managed is not None:
+            return managed
+        pending_manage = str(
+            session.filled.get("app_income_manage_action") or ""
+        ).strip()
+        if pending_manage in ("delete", "edit"):
+            picked_m = map_income_type(text)
+            if picked_m and picked_m != "None":
+                if pending_manage == "delete":
+                    return _begin_delete_confirm(picked_m)
+                session.filled.pop("app_income_manage_action", None)
+                return await _apply_picked_income(picked_m, edit_mode=True)
+            speech = (
+                f"Which income should I {pending_manage} for "
+                f"{current or 'this person'}? "
+                "Say the income type, like Employed or SSA."
+            )
+            return {
+                "ok": False,
+                "call_id": call_id,
+                "field_id": "application_answer",
+                "spoken": "ASK: " + speech,
+                "error": "income_manage_type_clarify",
+                "step": "app_income_more",
+                "phase": "application",
+            }
+        if (
+            _is_no(text)
+            or re.search(r"\b(continue|next|done|everyone|finished)\b", lowered)
+        ):
+            refreshed = await scrape_income_cards(page)
+            if refreshed:
+                cards = refreshed
+            return await _advance_after_income_member(
+                call_id, session, page, text, "app_income", cards, index
+            )
+        speech = _manage_ask_speech(
+            current, _member_existing_types(session, current)
+        )
+        return {
+            "ok": False,
+            "call_id": call_id,
+            "field_id": "application_answer",
+            "spoken": "ASK: " + speech,
+            "error": "income_manage_clarify",
+            "step": "app_income_more",
+            "phase": "application",
+        }
+
     # ---- Another income for this person? ----
     if step == "app_income_more" or phase == "more":
         managed = await _handle_edit_delete()
@@ -6286,11 +6350,19 @@ async def handle_income_step(
             _is_no(text)
             or re.search(r"\b(continue|next|done|everyone|finished)\b", lowered)
         ):
-            refreshed = await scrape_income_cards(page)
-            if refreshed:
-                cards = refreshed
-            return await _advance_after_income_member(
-                call_id, session, page, text, "app_income", cards, index
+            # After No, ask edit/delete separately — do not advance yet.
+            _set_income_phase(session, "manage")
+            speech = _manage_ask_speech(
+                current, _member_existing_types(session, current)
+            )
+            _set_pending_question(session, "app_income_more", speech)
+            return _app_ok(
+                call_id,
+                session,
+                text,
+                "app_income_more",
+                "income manage ask",
+                spoken_override=speech,
             )
         speech = _more_ask_speech(
             current, _member_existing_types(session, current)

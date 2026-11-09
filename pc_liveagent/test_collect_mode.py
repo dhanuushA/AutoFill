@@ -10486,6 +10486,109 @@ class StageECollectModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.get("step"), "app_income_more")
         self.assertIn("couldn't click", (result.get("spoken") or "").lower())
 
+    async def test_income_more_no_asks_manage_then_edit_asks_type(self) -> None:
+        """Add-another is Yes/No only; edit/delete and type come on later turns."""
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.income_stage import _more_ask_speech
+        from pc_liveagent.live_form import LiveFormSession
+
+        more = _more_ask_speech("Admin P.", ["SSA"]).lower()
+        self.assertIn("yes or no", more)
+        self.assertNotIn("edit or delete", more)
+        self.assertNotIn("tell me the income type", more)
+
+        session = LiveFormSession(
+            call_id="inc-more-manage",
+            url="https://example.test",
+            app_step="app_income_more",
+        )
+        session.filled["app_income_current"] = "Admin P."
+        session.filled["app_income_current_index"] = "0"
+        session.filled["app_income_phase"] = "more"
+        session.filled["app_income_member_types"] = '{"Admin P.": ["SSA"]}'
+        cards = [{"index": 0, "name": "Admin P.", "hasAddIncome": True}]
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_income"),
+            ),
+            patch(
+                "pc_liveagent.income_stage.scrape_income_cards",
+                new=AsyncMock(return_value=cards),
+            ),
+            patch(
+                "pc_liveagent.income_stage._advance_after_income_member",
+                new=AsyncMock(side_effect=AssertionError("must not advance yet")),
+            ),
+        ):
+            no_result = await submit_application_answer(
+                "inc-more-manage", session, AsyncMock(), "No", 0.0
+            )
+        self.assertTrue(no_result.get("ok"))
+        self.assertEqual(session.filled.get("app_income_phase"), "manage")
+        spoken_no = (no_result.get("spoken") or "").lower()
+        self.assertIn("edit or delete", spoken_no)
+        self.assertNotIn("what income type", spoken_no)
+
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_income"),
+            ),
+            patch(
+                "pc_liveagent.income_stage.scrape_income_cards",
+                new=AsyncMock(return_value=cards),
+            ),
+        ):
+            edit_result = await submit_application_answer(
+                "inc-more-manage", session, AsyncMock(), "edit", 0.0
+            )
+        self.assertFalse(edit_result.get("ok"))
+        self.assertIn(
+            "which income should i edit",
+            (edit_result.get("spoken") or "").lower(),
+        )
+
+    async def test_expense_more_no_asks_manage(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.expense_stage import _more_ask_speech
+        from pc_liveagent.live_form import LiveFormSession
+
+        more = _more_ask_speech("John D.", ["Childcare"]).lower()
+        self.assertIn("yes or no", more)
+        self.assertNotIn("edit or delete", more)
+
+        session = LiveFormSession(
+            call_id="exp-more-manage",
+            url="https://example.test",
+            app_step="app_expenses_more",
+        )
+        session.filled["app_expense_current"] = "John D."
+        session.filled["app_expense_current_index"] = "0"
+        session.filled["app_expense_phase"] = "more"
+        session.filled["app_expense_member_types"] = '{"John D.": ["Childcare"]}'
+        cards = [{"index": 0, "name": "John D.", "hasAddExpense": True}]
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_expenses"),
+            ),
+            patch(
+                "pc_liveagent.expense_stage.scrape_expense_cards",
+                new=AsyncMock(return_value=cards),
+            ),
+            patch(
+                "pc_liveagent.expense_stage._advance_after_expense_member",
+                new=AsyncMock(side_effect=AssertionError("must not advance yet")),
+            ),
+        ):
+            result = await submit_application_answer(
+                "exp-more-manage", session, AsyncMock(), "No", 0.0
+            )
+        self.assertTrue(result.get("ok"))
+        self.assertEqual(session.filled.get("app_expense_phase"), "manage")
+        self.assertIn("edit or delete", (result.get("spoken") or "").lower())
+
     async def test_income_more_named_type_clicks_add_another_first(self) -> None:
         from pc_liveagent.app_stage import submit_application_answer
         from pc_liveagent.live_form import LiveFormSession
@@ -16394,10 +16497,11 @@ class AddressStageTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(first.get("ok"))
         self.assertEqual(first.get("step"), "app_address_review")
         spoken_first = (first.get("spoken") or "").lower()
-        # Same home+mailing card: read once, ask if correct (no separate mailing line).
+        # Home first for Mickey; mailing comes only after Yes.
         self.assertIn("10 first", spoken_first)
         self.assertIn("mickey", spoken_first)
-        self.assertIn("correct", spoken_first)
+        self.assertIn("home address", spoken_first)
+        self.assertEqual(session.filled.get("app_address_phase"), "home_check")
 
         with (
             patch(
@@ -16409,6 +16513,17 @@ class AddressStageTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(return_value=cards),
             ),
             patch(
+                "pc_liveagent.app_stage._open_member_address_editor",
+                new=AsyncMock(
+                    return_value={
+                        "ok": True,
+                        "reason": "already_open",
+                        "action": "none",
+                        "icon_only": False,
+                    }
+                ),
+            ),
+            patch(
                 "pc_liveagent.app_stage._click_stage_next",
                 new=AsyncMock(side_effect=AssertionError("must not advance")),
             ),
@@ -16416,7 +16531,8 @@ class AddressStageTests(unittest.IsolatedAsyncioTestCase):
             second = await submit_application_answer(
                 "addr-review", session, AsyncMock(), "Yes", 0.0
             )
-        self.assertIn("same home", (second.get("spoken") or "").lower())
+        self.assertEqual(session.filled.get("app_address_phase"), "mailing_check")
+        self.assertIn("mailing", (second.get("spoken") or "").lower())
         self.assertEqual(session.app_step, "app_address_review")
 
     async def test_yes_after_review_syncs_detected_screen(self) -> None:
@@ -16891,7 +17007,7 @@ class AddressStageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.get("error"), "address_save_failed")
         self.assertEqual(session.app_step, "app_address_review")
 
-    async def test_no_home_address_confirms_before_save(self) -> None:
+    async def test_no_home_address_saves_immediately(self) -> None:
         from pc_liveagent.app_stage import submit_application_answer
         from pc_liveagent.live_form import LiveFormSession
 
@@ -16943,7 +17059,7 @@ class AddressStageTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch(
                 "pc_liveagent.app_stage._scrape_address_cards",
-                new=AsyncMock(side_effect=[before, before, after, after]),
+                new=AsyncMock(side_effect=[before, after, after]),
             ),
             patch(
                 "pc_liveagent.app_stage._open_member_address_editor",
@@ -16957,6 +17073,10 @@ class AddressStageTests(unittest.IsolatedAsyncioTestCase):
                 ),
             ) as opened,
             patch(
+                "pc_liveagent.app_stage._clear_member_address_selection",
+                new=AsyncMock(return_value={"home": True}),
+            ),
+            patch(
                 "pc_liveagent.app_stage._set_member_no_address",
                 new=AsyncMock(return_value=True),
             ) as checked,
@@ -16964,6 +17084,10 @@ class AddressStageTests(unittest.IsolatedAsyncioTestCase):
                 "pc_liveagent.app_stage._click_member_address_action",
                 new=AsyncMock(return_value=True),
             ) as action,
+            patch(
+                "pc_liveagent.app_stage._address_share_dialog_info",
+                new=AsyncMock(return_value={"open": False}),
+            ),
             patch(
                 "pc_liveagent.app_stage._address_validation_visible",
                 new=AsyncMock(return_value=False),
@@ -16973,22 +17097,11 @@ class AddressStageTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(side_effect=AssertionError("must not advance")),
             ),
         ):
-            pending = await submit_application_answer(
-                "addr-none",
-                session,
-                AsyncMock(),
-                "No Home Address for Mickey Mouse",
-                0.0,
-            )
-            self.assertTrue(pending.get("ok"))
-            self.assertEqual(session.filled.get("app_address_phase"), "home_confirm")
-            self.assertEqual(session.filled.get("app_address_pending_kind"), "no_home")
-            checked.assert_not_awaited()
             result = await submit_application_answer(
                 "addr-none",
                 session,
                 AsyncMock(),
-                "Yes",
+                "No Home Address for Mickey Mouse",
                 0.0,
             )
         self.assertTrue(opened.await_count >= 1)
@@ -17103,11 +17216,53 @@ class AddressStageTests(unittest.IsolatedAsyncioTestCase):
             step, speech = await _prepare_address_review_speech(session, AsyncMock())
         self.assertEqual(step, "app_address_review")
         self.assertEqual(session.filled.get("app_address_current"), "Agent T.")
-        # Same home+mailing: read the street once, then only Yes/No.
+        self.assertEqual(session.filled.get("app_address_phase"), "home_check")
+        # Home first only — mailing is asked after Yes.
         self.assertIn("highway 50", speech.lower())
-        self.assertIn("the address is", speech.lower())
-        self.assertIn("is that correct", speech.lower())
+        self.assertIn("home address", speech.lower())
+        self.assertIn("correct", speech.lower())
         self.assertNotIn("mailing address is", speech.lower())
+
+    async def test_entry_starts_first_member_even_when_second_needs_add(self) -> None:
+        """Walk Admin→John in screen order; do not jump to incomplete cards."""
+        from pc_liveagent.app_stage import _prepare_address_review_speech
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="addr-order",
+            url="https://example.test",
+            app_step="app_address_review",
+        )
+        cards = [
+            {
+                "name": "Admin P.",
+                "home": "George Washington Bridge, New York, NY, USA",
+                "mailing": "George Washington Bridge, New York, NY, USA",
+                "needs_add": False,
+                "needs_home": False,
+                "needs_mailing": False,
+            },
+            {
+                "name": "John D.",
+                "home": "",
+                "mailing": "",
+                "no_home": True,
+                "needs_add": True,
+                "needs_home": False,
+                "needs_mailing": True,
+            },
+        ]
+        with patch(
+            "pc_liveagent.app_stage._scrape_address_cards",
+            new=AsyncMock(return_value=cards),
+        ):
+            step, speech = await _prepare_address_review_speech(session, AsyncMock())
+        self.assertEqual(step, "app_address_review")
+        self.assertEqual(session.filled.get("app_address_current"), "Admin P.")
+        self.assertEqual(session.filled.get("app_address_phase"), "home_check")
+        self.assertIn("admin", speech.lower())
+        self.assertIn("george washington bridge", speech.lower())
+        self.assertNotIn("john", speech.lower())
 
     def test_address_confirm_speech_same_vs_different(self) -> None:
         from pc_liveagent.app_stage import (
@@ -17117,8 +17272,10 @@ class AddressStageTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             _clean_member_display_name("Admin P. (you)"),
-            "Admin P.",
+            "Admin",
         )
+        self.assertEqual(_clean_member_display_name("Back"), "that person")
+        self.assertEqual(_clean_member_display_name("Admin P. Back"), "Admin")
         same = _address_confirm_speech(
             {
                 "name": "Admin P. (you)",
@@ -17129,7 +17286,7 @@ class AddressStageTests(unittest.IsolatedAsyncioTestCase):
                 "needs_mailing": False,
             }
         )
-        self.assertIn("for admin p., the address is 10 first st", same.lower())
+        self.assertIn("for admin, the address is 10 first st", same.lower())
         self.assertIn("is that correct", same.lower())
         # Confirm is Yes/No only — no-address options come after No → edit.
         self.assertNotIn("you can also say no home", same.lower())
@@ -17163,7 +17320,7 @@ class AddressStageTests(unittest.IsolatedAsyncioTestCase):
         from pc_liveagent.app_stage import _address_change_which_prompt
 
         which = _address_change_which_prompt("Admin P. (you)")
-        self.assertIn("home address", which.lower())
+        self.assertIn("home", which.lower())
         self.assertIn("no home address", which.lower())
         self.assertNotIn("(you)", which.lower())
 
@@ -17177,6 +17334,8 @@ class AddressStageTests(unittest.IsolatedAsyncioTestCase):
             app_step="app_address_review",
         )
         session.filled["app_address_current"] = "Agent T."
+        session.filled["app_address_phase"] = "home_check"
+        session.filled["app_address_field"] = "home"
         cards = [
             {
                 "name": "Agent T.",
@@ -17208,8 +17367,15 @@ class AddressStageTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch(
                 "pc_liveagent.app_stage._open_member_address_editor",
-                new=AsyncMock(side_effect=AssertionError("must not open")),
-            ) as opened,
+                new=AsyncMock(
+                    return_value={
+                        "ok": True,
+                        "reason": "already_open",
+                        "action": "none",
+                        "icon_only": False,
+                    }
+                ),
+            ),
             patch(
                 "pc_liveagent.app_stage._commit_member_address",
                 new=AsyncMock(side_effect=AssertionError("must not save")),
@@ -17219,14 +17385,19 @@ class AddressStageTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(side_effect=AssertionError("must not advance")),
             ),
         ):
+            home_yes = await submit_application_answer(
+                "addr-yes-walk", session, AsyncMock(), "Yes", 0.0
+            )
+            self.assertEqual(session.filled.get("app_address_phase"), "mailing_check")
+            self.assertIn("mailing", (home_yes.get("spoken") or "").lower())
             result = await submit_application_answer(
                 "addr-yes-walk", session, AsyncMock(), "Yes", 0.0
             )
-        opened.assert_not_awaited()
         commit.assert_not_awaited()
         self.assertTrue(result.get("ok"))
         self.assertIn("don", (result.get("spoken") or "").lower())
         self.assertEqual(session.filled.get("app_address_current"), "Don D.")
+        self.assertEqual(session.filled.get("app_address_phase"), "home_check")
         self.assertIn("Agent T.", _json_names(session, "app_address_confirmed"))
 
     async def test_bare_no_opens_editor_and_asks_home_first(self) -> None:
@@ -17283,9 +17454,113 @@ class AddressStageTests(unittest.IsolatedAsyncioTestCase):
         spoken = (result.get("spoken") or "").lower()
         self.assertIn("home", spoken)
         self.assertIn("don", spoken)
+        self.assertIn("yes to change", spoken)
+        self.assertIn("no home address", spoken)
         self.assertEqual(session.filled.get("app_address_current"), "Don D.")
-        self.assertEqual(session.filled.get("app_address_phase"), "home_check")
+        self.assertEqual(session.filled.get("app_address_phase"), "home_change_ask")
         self.assertEqual(session.filled.get("app_address_field"), "home")
+
+    async def test_change_ask_bare_no_selects_no_home_address(self) -> None:
+        from pc_liveagent.app_stage import (
+            _means_no_home_address,
+            submit_application_answer,
+        )
+        from pc_liveagent.live_form import LiveFormSession
+
+        self.assertTrue(_means_no_home_address("No Home Address"))
+        self.assertTrue(_means_no_home_address("No, Omar."))
+        self.assertFalse(_means_no_home_address("No."))
+
+        session = LiveFormSession(
+            call_id="addr-change-no",
+            url="https://example.test",
+            app_step="app_address_review",
+        )
+        session.filled["app_address_current"] = "John D."
+        session.filled["app_address_field"] = "home"
+        session.filled["app_address_phase"] = "home_change_ask"
+        before = [
+            {
+                "name": "Admin P.",
+                "home": "George Washington Bridge, New York, NY, USA",
+                "mailing": "George Washington Bridge, New York, NY, USA",
+                "needs_add": False,
+                "needs_home": False,
+                "needs_mailing": False,
+            },
+            {
+                "name": "John D.",
+                "home": "Newton Street, Seattle, WA 98109, USA",
+                "mailing": "Newton Street, Seattle, WA 98109, USA",
+                "needs_add": False,
+                "needs_home": False,
+                "needs_mailing": False,
+            },
+        ]
+        after = [
+            before[0],
+            {
+                **before[1],
+                "home": "",
+                "no_home": True,
+                "needs_home": False,
+                "needs_add": False,
+            },
+        ]
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_address_review"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_address_cards",
+                new=AsyncMock(side_effect=[before, after, after]),
+            ),
+            patch(
+                "pc_liveagent.app_stage._open_member_address_editor",
+                new=AsyncMock(
+                    return_value={
+                        "ok": True,
+                        "reason": "already_open",
+                        "action": "none",
+                        "icon_only": False,
+                    }
+                ),
+            ),
+            patch(
+                "pc_liveagent.app_stage._clear_member_address_selection",
+                new=AsyncMock(return_value={"home": True}),
+            ) as cleared,
+            patch(
+                "pc_liveagent.app_stage._set_member_no_address",
+                new=AsyncMock(return_value=True),
+            ) as checked,
+            patch(
+                "pc_liveagent.app_stage._click_member_address_action",
+                new=AsyncMock(return_value=True),
+            ) as action,
+            patch(
+                "pc_liveagent.app_stage._address_share_dialog_info",
+                new=AsyncMock(return_value={"open": False}),
+            ),
+            patch(
+                "pc_liveagent.app_stage._address_validation_visible",
+                new=AsyncMock(return_value=False),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_stage_next",
+                new=AsyncMock(side_effect=AssertionError("must not advance")),
+            ),
+        ):
+            result = await submit_application_answer(
+                "addr-change-no", session, AsyncMock(), "No.", 0.0
+            )
+        cleared.assert_awaited()
+        self.assertEqual(checked.await_args.args[2], "home")
+        self.assertEqual(action.await_args.args[2], "save")
+        self.assertTrue(result.get("ok"))
+        self.assertEqual(session.filled.get("app_address_phase"), "mailing_check")
+        self.assertIn("mailing", (result.get("spoken") or "").lower())
 
     async def test_named_mailing_only_correction_does_not_touch_home(self) -> None:
         from pc_liveagent.app_stage import (
@@ -17365,9 +17640,12 @@ class AddressStageTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.get("ok"))
         self.assertEqual(session.filled.get("app_address_current"), "Don D.")
         self.assertEqual(session.filled.get("app_address_field"), "mailing")
-        self.assertEqual(session.filled.get("app_address_phase"), "mailing_check")
-        self.assertIn("mailing", (result.get("spoken") or "").lower())
-        self.assertNotIn("10 first", (result.get("spoken") or "").lower())
+        self.assertEqual(session.filled.get("app_address_phase"), "mailing_change_ask")
+        spoken = (result.get("spoken") or "").lower()
+        self.assertIn("mailing", spoken)
+        self.assertIn("yes to change", spoken)
+        self.assertIn("no mailing address", spoken)
+        self.assertNotIn("10 first", spoken)
 
     async def test_ambiguous_member_name_does_not_open_editor(self) -> None:
         from pc_liveagent.app_stage import submit_application_answer
@@ -17440,6 +17718,8 @@ class AddressStageTests(unittest.IsolatedAsyncioTestCase):
             app_step="app_address_review",
         )
         session.filled["app_address_current"] = "Agent T."
+        session.filled["app_address_phase"] = "mailing_check"
+        session.filled["app_address_field"] = "mailing"
         with (
             patch(
                 "pc_liveagent.app_stage.detect_application_screen",
@@ -17460,6 +17740,10 @@ class AddressStageTests(unittest.IsolatedAsyncioTestCase):
                         }
                     ]
                 ),
+            ),
+            patch(
+                "pc_liveagent.app_stage._address_editor_is_open",
+                new=AsyncMock(return_value=False),
             ),
             patch(
                 "pc_liveagent.app_stage._commit_member_address",
@@ -17587,18 +17871,7 @@ class AddressStageTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch(
                 "pc_liveagent.app_stage._scrape_address_cards",
-                new=AsyncMock(
-                    side_effect=[
-                        [card],  # bare No
-                        [card],  # home street pending
-                        [card],  # Yes save home (step scrape)
-                        [saved_home],  # Yes save home (refresh)
-                        [saved_home],  # mailing street pending
-                        [saved_home],  # Yes save mailing (step scrape)
-                        [saved_mail],  # Yes save mailing (refresh)
-                        [saved_mail],  # prepare next speech
-                    ]
-                ),
+                new=AsyncMock(return_value=[card]),
             ),
             patch(
                 "pc_liveagent.app_stage._open_member_address_editor",
@@ -17640,6 +17913,10 @@ class AddressStageTests(unittest.IsolatedAsyncioTestCase):
                 ),
             ) as commit,
             patch(
+                "pc_liveagent.app_stage._address_share_dialog_info",
+                new=AsyncMock(return_value={"open": False}),
+            ),
+            patch(
                 "pc_liveagent.app_stage._click_stage_next",
                 new=AsyncMock(side_effect=AssertionError("must not advance")),
             ),
@@ -17647,8 +17924,14 @@ class AddressStageTests(unittest.IsolatedAsyncioTestCase):
             no = await submit_application_answer(
                 "addr-walk-confirm", session, AsyncMock(), "No", 0.0
             )
-            self.assertEqual(session.filled.get("app_address_phase"), "home_check")
-            self.assertIn("home", (no.get("spoken") or "").lower())
+            self.assertEqual(session.filled.get("app_address_phase"), "home_change_ask")
+            self.assertIn("yes to change", (no.get("spoken") or "").lower())
+
+            change_yes = await submit_application_answer(
+                "addr-walk-confirm", session, AsyncMock(), "Yes", 0.0
+            )
+            self.assertEqual(session.filled.get("app_address_phase"), "home_enter")
+            self.assertIn("what is the new home", (change_yes.get("spoken") or "").lower())
 
             pending_home = await submit_application_answer(
                 "addr-walk-confirm", session, AsyncMock(), "123 Main St", 0.0
@@ -17665,6 +17948,20 @@ class AddressStageTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(session.filled.get("app_address_phase"), "mailing_check")
             self.assertIn("mailing", (home_saved.get("spoken") or "").lower())
 
+            mail_no = await submit_application_answer(
+                "addr-walk-confirm", session, AsyncMock(), "No", 0.0
+            )
+            self.assertEqual(session.filled.get("app_address_phase"), "mailing_change_ask")
+            self.assertIn("yes to change", (mail_no.get("spoken") or "").lower())
+
+            mail_change_yes = await submit_application_answer(
+                "addr-walk-confirm", session, AsyncMock(), "Yes", 0.0
+            )
+            self.assertEqual(session.filled.get("app_address_phase"), "mailing_enter")
+            self.assertIn(
+                "what is the new mailing", (mail_change_yes.get("spoken") or "").lower()
+            )
+
             pending_mail = await submit_application_answer(
                 "addr-walk-confirm", session, AsyncMock(), "456 Oak Ave", 0.0
             )
@@ -17680,6 +17977,97 @@ class AddressStageTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(session.filled.get("app_address_phase"))
         self.assertIn("Don D.", _json_names(session, "app_address_confirmed"))
         self.assertIn("confirmed", (done.get("spoken") or "").lower())
+
+    async def test_shared_address_popup_asks_before_continuing(self) -> None:
+        from pc_liveagent.app_stage import submit_application_answer
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="addr-share",
+            url="https://example.test",
+            app_step="app_address_review",
+        )
+        session.filled["app_address_current"] = "Admin B."
+        session.filled["app_address_field"] = "home"
+        session.filled["app_address_phase"] = "home_confirm"
+        session.filled["app_address_pending_kind"] = "street"
+        session.filled["app_address_pending_street"] = "Newton Street Seattle"
+        session.filled["app_address_pending_chosen"] = (
+            "Newton Street, Seattle, WA 98109, USA"
+        )
+        card = {
+            "name": "Admin B.",
+            "home": "Newton Street, Seattle, WA 98109, USA",
+            "mailing": "Same mailing address",
+            "mailing_same": True,
+            "needs_add": False,
+            "needs_home": False,
+            "needs_mailing": False,
+        }
+        with (
+            patch(
+                "pc_liveagent.app_stage.detect_application_screen",
+                new=AsyncMock(return_value="app_address_review"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._scrape_address_cards",
+                new=AsyncMock(return_value=[card, {"name": "John D.", "home": "Same home address", "home_same": True, "mailing": "Same mailing address", "mailing_same": True, "needs_add": False, "needs_home": False, "needs_mailing": False}]),
+            ),
+            patch(
+                "pc_liveagent.app_stage._open_member_address_editor",
+                new=AsyncMock(
+                    return_value={
+                        "ok": True,
+                        "reason": "already_open",
+                        "action": "none",
+                        "icon_only": False,
+                    }
+                ),
+            ),
+            patch(
+                "pc_liveagent.app_stage._commit_member_address",
+                new=AsyncMock(
+                    return_value={
+                        "ok": True,
+                        "share_dialog": {
+                            "open": True,
+                            "prompt": (
+                                "John D. currently shares your home address. "
+                                "Would you like to update theirs as well?"
+                            ),
+                            "members": ["John D."],
+                            "only_mine": "No, only update mine",
+                            "update_shared": "Update 1 member",
+                        },
+                        "card": None,
+                    }
+                ),
+            ),
+            patch(
+                "pc_liveagent.app_stage._click_address_share_dialog_choice",
+                new=AsyncMock(return_value=True),
+            ) as share_click,
+            patch(
+                "pc_liveagent.app_stage._address_share_dialog_info",
+                new=AsyncMock(return_value={"open": False}),
+            ),
+        ):
+            ask = await submit_application_answer(
+                "addr-share", session, AsyncMock(), "Yes", 0.0
+            )
+            self.assertTrue(ask.get("ok"))
+            self.assertEqual(session.filled.get("app_address_phase"), "share_ask")
+            self.assertIn("john", (ask.get("spoken") or "").lower())
+            self.assertIn("only update yours", (ask.get("spoken") or "").lower())
+
+            done = await submit_application_answer(
+                "addr-share", session, AsyncMock(), "No", 0.0
+            )
+        share_click.assert_awaited()
+        self.assertEqual(share_click.await_args.kwargs.get("update_others"), False)
+        self.assertTrue(done.get("ok"))
+        self.assertEqual(session.filled.get("app_address_phase"), "mailing_check")
+        self.assertIn("mailing", (done.get("spoken") or "").lower())
 
     async def test_duplicate_yes_does_not_click_next_twice(self) -> None:
         from pc_liveagent.app_stage import submit_application_answer
@@ -17821,10 +18209,13 @@ class AddressStageTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 session.filled.get("app_address_correcting"), "Agent T.", phrase
             )
-            self.assertEqual(session.filled.get("app_address_phase"), "home_check", phrase)
+            self.assertEqual(
+                session.filled.get("app_address_phase"), "home_change_ask", phrase
+            )
             open_edit.assert_awaited()
             self.assertIn("agent", (result.get("spoken") or "").lower())
             self.assertIn("home", (result.get("spoken") or "").lower())
+            self.assertIn("yes to change", (result.get("spoken") or "").lower())
             self.assertNotIn("john", (result.get("spoken") or "").lower())
 
     async def test_unknown_name_does_not_fall_back_to_current_member(self) -> None:
@@ -23056,6 +23447,48 @@ class TaxReviewWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(dlg_hidden)
         # Must not burn multi-second _click_cta retries for missing labels.
         self.assertLess(elapsed, 3.0)
+
+    async def test_click_tax_save_return_waits_for_slow_close(self) -> None:
+        """Pointcare can take 2–4s; must not fail while the modal is still closing."""
+        from playwright.async_api import async_playwright
+
+        from pc_liveagent.tax_stage import _click_tax_save_return
+
+        html = """
+        <html><body>
+          <h1>Tax Information</h1>
+          <div class="card" style="width:300px;height:100px;display:none" id="summary">
+            <div>John D.</div><div>Single</div><button>Edit</button>
+          </div>
+          <div role="dialog" aria-modal="true" id="dlg"
+               style="width:480px;height:420px;border:1px solid #000;">
+            <h2>Tax Information – John D.</h2>
+            <div>Will this person claim any dependents?</div>
+            <div>Will anyone claim this person as a dependent?</div>
+            <button id="save">Save and Return</button>
+          </div>
+          <script>
+            document.getElementById('save').onclick = () => {
+              setTimeout(() => {
+                document.getElementById('dlg').style.display = 'none';
+                document.getElementById('summary').style.display = 'block';
+              }, 3200);
+            };
+          </script>
+        </body></html>
+        """
+        async with async_playwright() as p:
+            try:
+                browser = await p.chromium.launch(headless=True, channel="chrome")
+            except Exception:
+                browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            try:
+                await page.set_content(html)
+                ok = await _click_tax_save_return(page)
+            finally:
+                await browser.close()
+        self.assertTrue(ok)
 
     async def test_click_tax_save_return_validation_stays_open(self) -> None:
         from playwright.async_api import async_playwright

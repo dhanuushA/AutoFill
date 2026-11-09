@@ -73,6 +73,7 @@ _EXPENSE_PHASES = (
     "amount",
     "medical",
     "more",
+    "manage",
     "confirm",
     "delete_confirm",
     "final",
@@ -1047,19 +1048,28 @@ def _medical_ask_speech(name: str, *, session: Any | None = None) -> str:
 
 
 def _more_ask_speech(name: str, existing: list[str] | None = None) -> str:
+    """Yes/No only — type and edit/delete are asked on later turns."""
+    del existing  # kept for call-site compatibility
     who = name or "this person"
-    types = [t for t in (existing or []) if t and t != "None"]
-    manage = ""
-    if types:
-        listed = ", ".join(types[:6])
-        manage = (
-            f" You can also say edit or delete one of the existing expenses "
-            f"({listed})."
-        )
     return (
         f"Do you want to add another expense for {who}? "
-        f"If yes, tell me the expense type.{manage} "
-        "Say No if you're done with this person."
+        "Please say Yes or No."
+    )
+
+
+def _manage_ask_speech(name: str, existing: list[str] | None = None) -> str:
+    """Asked only after the caller declines adding another expense."""
+    who = name or "this person"
+    types = [t for t in (existing or []) if t and t != "None"]
+    listed = ", ".join(types[:6]) if types else ""
+    if listed:
+        return (
+            f"Do you want to edit or delete an existing expense for {who} "
+            f"({listed})? Say edit, delete, or No if you're done."
+        )
+    return (
+        f"Do you want to edit or delete an existing expense for {who}? "
+        "Say edit, delete, or No if you're done."
     )
 
 
@@ -1957,6 +1967,12 @@ async def prepare_expense_speech(session: Any, page: Page) -> tuple[str, str]:
             )
             _set_pending_question(session, "app_expenses_more", speech)
             return "app_expenses_more", speech
+        elif phase == "manage":
+            speech = _manage_ask_speech(
+                current, _member_existing_types(session, current)
+            )
+            _set_pending_question(session, "app_expenses_more", speech)
+            return "app_expenses_more", speech
         elif phase == "confirm":
             speech = str(
                 session.filled.get("app_expense_pending_summary") or ""
@@ -2384,6 +2400,57 @@ async def handle_expense_step(
             {"amount": amount},
         )
 
+    # ---- Manage existing expenses (after declining "add another") ----
+    if phase == "manage":
+        managed = await _handle_edit_delete()
+        if managed is not None:
+            return managed
+        pending_manage = str(
+            session.filled.get("app_expense_manage_action") or ""
+        ).strip()
+        if pending_manage in ("delete", "edit"):
+            picked_m = map_expense_type(text)
+            if picked_m and picked_m != "None":
+                if pending_manage == "delete":
+                    return _begin_delete_confirm(picked_m)
+                session.filled.pop("app_expense_manage_action", None)
+                return await _apply_picked_expense(picked_m, edit_mode=True)
+            speech = (
+                f"Which expense should I {pending_manage} for "
+                f"{current or 'this person'}? "
+                "Say the expense type, like Childcare or Student Loans."
+            )
+            return {
+                "ok": False,
+                "call_id": call_id,
+                "field_id": "application_answer",
+                "spoken": "ASK: " + speech,
+                "error": "expense_manage_type_clarify",
+                "step": "app_expenses_more",
+                "phase": "application",
+            }
+        if _is_no(text) or re.search(
+            r"\b(continue|next|done|everyone|finished)\b", lowered
+        ):
+            refreshed = await scrape_expense_cards(page)
+            if refreshed:
+                cards = refreshed
+            return await _advance_after_expense_member(
+                call_id, session, page, text, cards, index
+            )
+        speech = _manage_ask_speech(
+            current, _member_existing_types(session, current)
+        )
+        return {
+            "ok": False,
+            "call_id": call_id,
+            "field_id": "application_answer",
+            "spoken": "ASK: " + speech,
+            "error": "expense_manage_clarify",
+            "step": "app_expenses_more",
+            "phase": "application",
+        }
+
     # ---- More ----
     if step == "app_expenses_more" or phase == "more":
         managed = await _handle_edit_delete()
@@ -2470,11 +2537,18 @@ async def handle_expense_step(
         if _is_no(text) or re.search(
             r"\b(continue|next|done|everyone|finished)\b", lowered
         ):
-            refreshed = await scrape_expense_cards(page)
-            if refreshed:
-                cards = refreshed
-            return await _advance_after_expense_member(
-                call_id, session, page, text, cards, index
+            _set_expense_phase(session, "manage")
+            speech = _manage_ask_speech(
+                current, _member_existing_types(session, current)
+            )
+            _set_pending_question(session, "app_expenses_more", speech)
+            return _app_ok(
+                call_id,
+                session,
+                text,
+                "app_expenses_more",
+                "expense manage ask",
+                spoken_override=speech,
             )
         speech = _more_ask_speech(
             current, _member_existing_types(session, current)

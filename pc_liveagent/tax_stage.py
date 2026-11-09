@@ -7,6 +7,7 @@ before clicking Next.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -16,6 +17,9 @@ from typing import Any
 from playwright.async_api import Page
 
 logger = logging.getLogger(__name__)
+
+# Background waiters that finish Save and Return after the agent already spoke.
+_tax_save_wait_tasks: dict[str, asyncio.Task] = {}
 
 _TAX_STATUS_LABELS = (
     "Single",
@@ -1574,7 +1578,51 @@ async def _set_tax_who_members(
         return False
 
 
-async def _click_tax_save_return(page: Page) -> bool:
+async def _wait_tax_save_closed(
+    page: Page, *, timeout_s: float, started: float | None = None
+) -> str:
+    """Poll until summary is back. Returns ok | validation | timeout."""
+    t0 = time.monotonic() if started is None else started
+    last_state: dict[str, Any] = {}
+    deadline = time.monotonic() + max(0.2, timeout_s)
+    while time.monotonic() < deadline:
+        await page.wait_for_timeout(200)
+        try:
+            raw = await page.evaluate(
+                "() => {" + _tax_dom_js() + " return taxSummaryAfterSave(); }"
+            )
+        except Exception:
+            raw = {}
+        last_state = raw if isinstance(raw, dict) else {}
+        if last_state.get("validation_error"):
+            logger.warning(
+                "tax_save_validation_blocker error=%r modal_open=%s elapsed_ms=%s",
+                last_state.get("validation_error"),
+                last_state.get("modal_open"),
+                int((time.monotonic() - t0) * 1000),
+            )
+            return "validation"
+        if last_state.get("summary_visible") and not last_state.get("modal_open"):
+            logger.info(
+                "tax_save_ok cards=%s names=%s elapsed_ms=%s",
+                last_state.get("card_count"),
+                last_state.get("card_names"),
+                int((time.monotonic() - t0) * 1000),
+            )
+            return "ok"
+    logger.info(
+        "tax_save_wait_pending modal_open=%s summary=%s cards=%s "
+        "heading=%r elapsed_ms=%s",
+        last_state.get("modal_open"),
+        last_state.get("summary_visible"),
+        last_state.get("card_count"),
+        last_state.get("heading"),
+        int((time.monotonic() - t0) * 1000),
+    )
+    return "timeout"
+
+
+async def _click_tax_save_return(page: Page, *, wait_s: float = 6.5) -> bool:
     """Click the visible Save and Return control once; confirm summary is back.
 
     Discovers the actual button inside the open tax dialog (normalizing
@@ -1624,45 +1672,96 @@ async def _click_tax_save_return(page: Page) -> bool:
         clicked.get("label"),
         int((time.monotonic() - started) * 1000),
     )
-    # Short bounded poll — summary cards confirm the editor closed.
-    last_state: dict[str, Any] = {}
-    for _ in range(12):
-        await page.wait_for_timeout(200)
-        try:
-            raw = await page.evaluate(
-                "() => {" + _tax_dom_js() + " return taxSummaryAfterSave(); }"
-            )
-        except Exception:
-            raw = {}
-        last_state = raw if isinstance(raw, dict) else {}
-        if last_state.get("validation_error"):
-            logger.warning(
-                "tax_save_validation_blocker error=%r modal_open=%s elapsed_ms=%s",
-                last_state.get("validation_error"),
-                last_state.get("modal_open"),
-                int((time.monotonic() - started) * 1000),
-            )
-            return False
-        if last_state.get("summary_visible") and not last_state.get("modal_open"):
-            logger.info(
-                "tax_save_ok label=%r cards=%s names=%s elapsed_ms=%s",
-                clicked.get("label"),
-                last_state.get("card_count"),
-                last_state.get("card_names"),
-                int((time.monotonic() - started) * 1000),
-            )
-            return True
+    # Pointcare Save and Return often takes 2–4s; default wait covers that.
+    outcome = await _wait_tax_save_closed(page, timeout_s=wait_s, started=started)
+    if outcome == "ok":
+        return True
+    if outcome == "validation":
+        return False
     logger.warning(
-        "tax_save_modal_still_open label=%r modal_open=%s summary=%s "
-        "cards=%s heading=%r elapsed_ms=%s",
+        "tax_save_modal_still_open label=%r elapsed_ms=%s",
         clicked.get("label"),
-        last_state.get("modal_open"),
-        last_state.get("summary_visible"),
-        last_state.get("card_count"),
-        last_state.get("heading"),
         int((time.monotonic() - started) * 1000),
     )
     return False
+
+
+def _schedule_tax_save_finish(
+    call_id: str,
+    session: Any,
+    page: Page,
+    text: str,
+    step: str,
+    cards: list[dict[str, Any]],
+    index: int,
+    name: str,
+) -> None:
+    """Finish a slow Save and Return in the background; speak when done."""
+    prev = _tax_save_wait_tasks.pop(call_id, None)
+    if prev is not None and not prev.done():
+        prev.cancel()
+
+    async def _runner() -> None:
+        from .app_stage import _set_pending_question
+        from .call_turn import _speak_interrupt, get_controller
+
+        outcome = await _wait_tax_save_closed(page, timeout_s=5.0)
+        # Bail if a newer save replaced this waiter or phase left saving.
+        if _tax_save_wait_tasks.get(call_id) is not asyncio.current_task():
+            return
+        if _tax_phase(session) != "saving":
+            return
+        if outcome == "validation" or outcome == "timeout":
+            speech = (
+                f"I couldn't save tax details for {name}. "
+                "Please say save or continue to try again."
+            )
+            _set_pending_question(session, step, speech)
+            try:
+                ctrl = await get_controller(call_id)
+                ctrl.last_speech = speech
+            except Exception:
+                pass
+            await _speak_interrupt(call_id, speech)
+            logger.warning(
+                "tax_save_bg_failed call_id=%s member=%r outcome=%s",
+                call_id,
+                name,
+                outcome,
+            )
+            return
+        session.filled.pop("app_tax_saving_name", None)
+        session.filled.pop("app_tax_saving_index", None)
+        refreshed = await _scrape_tax_cards(page)
+        use_cards = refreshed or cards
+        result = await _advance_after_tax_member(
+            call_id, session, page, text, step, use_cards, index
+        )
+        spoken = str(result.get("spoken") or "").strip()
+        if spoken.upper().startswith("ASK:"):
+            spoken = spoken[4:].strip()
+        if spoken:
+            try:
+                ctrl = await get_controller(call_id)
+                ctrl.last_speech = spoken
+            except Exception:
+                pass
+            await _speak_interrupt(call_id, spoken)
+        logger.info(
+            "tax_save_bg_advanced call_id=%s member=%r",
+            call_id,
+            name,
+        )
+
+    task = asyncio.create_task(_runner(), name=f"tax-save-wait:{call_id}")
+    _tax_save_wait_tasks[call_id] = task
+
+    def _clear(done: asyncio.Task) -> None:
+        cur = _tax_save_wait_tasks.get(call_id)
+        if cur is done:
+            _tax_save_wait_tasks.pop(call_id, None)
+
+    task.add_done_callback(_clear)
 
 
 def _normalize_tax_spoken(spoken: str) -> str:
@@ -2146,7 +2245,7 @@ async def _save_tax_member_and_continue(
     )
     _set_pending_question(session, step, saving_speech)
     # Reminders / ASR revisions use ctrl.last_speech — replace the prior
-    # Who?/claimed_as prompt before the ~2s Save and Return wait.
+    # Who?/claimed_as prompt before the Save and Return wait (often 2–4s).
     try:
         from .call_turn import get_controller
 
@@ -2166,9 +2265,8 @@ async def _save_tax_member_and_continue(
     )
 
     started = time.monotonic()
-    saved = await _click_tax_save_return(page)
-    elapsed_ms = int((time.monotonic() - started) * 1000)
-    if not saved:
+
+    def _fail_speech() -> dict[str, Any]:
         speech = (
             f"I couldn't save tax details for {name}. "
             "Please say save or continue to try again."
@@ -2180,7 +2278,7 @@ async def _save_tax_member_and_continue(
             call_id,
             name,
             index,
-            elapsed_ms,
+            int((time.monotonic() - started) * 1000),
         )
         return {
             "ok": False,
@@ -2191,24 +2289,78 @@ async def _save_tax_member_and_continue(
             "step": step,
             "phase": "application",
         }
-    session.filled.pop("app_tax_saving_name", None)
-    session.filled.pop("app_tax_saving_index", None)
-    # Refresh cards and soft-verify the member still appears.
-    refreshed = await _scrape_tax_cards(page)
-    if refreshed:
-        cards = refreshed
+
+    async def _advance_now() -> dict[str, Any]:
+        session.filled.pop("app_tax_saving_name", None)
+        session.filled.pop("app_tax_saving_index", None)
+        refreshed = await _scrape_tax_cards(page)
+        use_cards = refreshed or cards
+        logger.info(
+            "tax_save_advance call_id=%s member=%r index=%s elapsed_ms=%s "
+            "advance_invoked=True cards=%s",
+            call_id,
+            name,
+            index,
+            int((time.monotonic() - started) * 1000),
+            [str(c.get("name") or "") for c in (use_cards or [])],
+        )
+        return await _advance_after_tax_member(
+            call_id, session, page, text, step, use_cards, index
+        )
+
+    # Click once, then wait only ~2s before speaking. Slow Pointcare closes
+    # finish in a background waiter so the caller is not silent for 4s+.
+    try:
+        clicked = await page.evaluate(
+            "() => {" + _tax_dom_js() + " return taxClickSaveReturnOnce(); }"
+        )
+    except Exception:
+        logger.exception("tax_save_click_evaluate_failed")
+        return _fail_speech()
+    if not isinstance(clicked, dict) or not clicked.get("ok"):
+        try:
+            raw = await page.evaluate(
+                "() => {" + _tax_dom_js() + " return taxSummaryAfterSave(); }"
+            )
+        except Exception:
+            raw = {}
+        if (
+            isinstance(raw, dict)
+            and raw.get("summary_visible")
+            and not raw.get("modal_open")
+        ):
+            return await _advance_now()
+        return _fail_speech()
     logger.info(
-        "tax_save_advance call_id=%s member=%r index=%s elapsed_ms=%s "
-        "advance_invoked=True cards=%s",
+        "tax_save_clicked kind=%s label=%r elapsed_ms=%s",
+        clicked.get("kind"),
+        clicked.get("label"),
+        int((time.monotonic() - started) * 1000),
+    )
+    outcome = await _wait_tax_save_closed(page, timeout_s=2.0, started=started)
+    if outcome == "ok":
+        return await _advance_now()
+    if outcome == "validation":
+        return _fail_speech()
+
+    _schedule_tax_save_finish(
+        call_id, session, page, text, step, cards or [], index, name
+    )
+    logger.info(
+        "tax_save_deferred call_id=%s member=%r index=%s elapsed_ms=%s",
         call_id,
         name,
         index,
-        elapsed_ms,
-        [str(c.get("name") or "") for c in (cards or [])],
+        int((time.monotonic() - started) * 1000),
     )
-    return await _advance_after_tax_member(
-        call_id, session, page, text, step, cards, index
-    )
+    return {
+        "ok": True,
+        "call_id": call_id,
+        "field_id": "application_answer",
+        "spoken": "ASK: " + saving_speech,
+        "step": step,
+        "phase": "application",
+    }
 
 
 def _match_who_names(spoken_chunks: list[str], options: list[str]) -> list[str]:
@@ -2471,7 +2623,7 @@ async def _handle_tax_step(
         )
         save_index_raw = str(session.filled.get("app_tax_saving_index") or "").strip()
         save_index = int(save_index_raw) if save_index_raw.isdigit() else index
-        # Prior click may have already closed the editor (~2s website save).
+        # Prior click may have already closed the editor (website save is slow).
         already_saved = False
         try:
             raw = await page.evaluate(
