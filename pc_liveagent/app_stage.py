@@ -20,8 +20,9 @@ logger = logging.getLogger(__name__)
 # Collect Mode questions — server owns order; live form may skip screens.
 APP_QUESTIONS: dict[str, str] = {
     "app_agent_offer": (
-        "Connecting with a licensed agent later is optional and not required to "
-        "finish this application. Would you like that option? Please say Yes or No."
+        "Would you like to connect with a licensed insurance agent to explore "
+        "Medicare or ACA Marketplace options and get help finishing enrollment? "
+        "Say Yes to connect, or No to continue without an agent."
     ),
     "app_citizenship": (
         "Are the household members listed on this application all U.S. Citizens? "
@@ -336,6 +337,10 @@ def _short_program_name(name: str) -> str:
     if "medicaid" in low or "medi-cal" in low or "medi cal" in low:
         if "medi-cal" in low or "medi cal" in low:
             return "Medi-Cal"
+        # Preserve state/program branding from the card instead of reducing
+        # "Health First Colorado (Medicaid)" to generic "Medicaid".
+        if low not in ("medicaid", "medicaid."):
+            return text[:80].rstrip(" .,:;")
         return "Medicaid"
     if "medicare" in low:
         return "Medicare"
@@ -387,36 +392,52 @@ async def scrape_program_summary(page: Page) -> dict[str, Any]:
               const programs = [];
               const seen = new Set();
               const nodes = [...document.querySelectorAll(
-                'label, li, [role="checkbox"], [role="listitem"], button, div, section'
-              )];
+                'label, li, [role="listitem"], article, div, section'
+              )].sort((a, b) => {
+                const at = norm(a.innerText || a.textContent || '').length;
+                const bt = norm(b.innerText || b.textContent || '').length;
+                return at - bt;
+              });
               for (const el of nodes) {
                 const r = el.getBoundingClientRect();
                 if (r.width < 40 || r.height < 20) continue;
-                let text = norm(el.innerText || el.textContent || '');
+                const rawText = (el.innerText || el.textContent || '').trim();
+                let text = norm(rawText);
                 if (!text || text.length < 4 || text.length > 320) continue;
                 const low = text.toLowerCase();
                 const looksProgram = (
                   /medicaid|medi-?cal|medicare|marketplace|covered california|\\baca\\b|medikids|healthy kids|florida/i.test(low)
                 );
                 if (!looksProgram) continue;
+                const hasResult = /may be eligible|might be eligible|eligible for|not eligible at this time|not eligible/i.test(low);
+                if (!hasResult) continue;
                 // Prefer compact cards over giant page wrappers.
                 if (text.length > 220) continue;
                 const notEligible = /not eligible at this time|not eligible/i.test(low);
                 const mayEligible = !notEligible && (
                   /may be eligible|might be eligible|eligible for/i.test(low)
                 );
-                // Extract a short name: first line or known keyword phrase.
-                let name = text.split('\\n')[0].slice(0, 80);
+                // Extract the card title while preserving state program branding.
+                const lines = rawText.split(/\\r?\\n/).map(norm).filter(Boolean);
+                let name = (lines.find((line) => (
+                  /medicaid|medi-?cal|medicare|marketplace|covered california|\\baca\\b|medikids|healthy kids/i.test(line)
+                  && !/may be eligible|might be eligible|eligible for|not eligible/i.test(line)
+                )) || '').slice(0, 80);
                 const nameMatch = text.match(
-                  /(Medi-?Cal|Medicaid|Medicare|ACA Marketplace|Covered California)/i
+                  /(Health First Colorado\\s*\\(Medicaid\\)|MediKids[^,;]{0,55}|Florida Healthy Kids[^,;]{0,45}|Health Connector\\s*\\(ACA Marketplace\\)|Medi-?Cal|Medicaid|Medicare|ACA Marketplace|Covered California)/i
                 );
-                if (nameMatch) name = nameMatch[1];
+                if (!name && nameMatch) name = nameMatch[1];
+                if (!name) continue;
                 const key = name.toLowerCase();
                 if (seen.has(key)) continue;
                 seen.add(key);
                 let checked = false;
                 const input = el.querySelector && el.querySelector('input[type=checkbox]');
                 if (input) checked = !!input.checked;
+                const roleBox = el.matches && el.matches('[role=checkbox]')
+                  ? el
+                  : (el.querySelector && el.querySelector('[role=checkbox]'));
+                if (roleBox && roleBox.getAttribute('aria-checked') === 'true') checked = true;
                 const aria = el.getAttribute && el.getAttribute('aria-checked');
                 if (aria === 'true') checked = true;
                 if (aria === 'false') checked = false;
@@ -467,8 +488,26 @@ def summary_from_session_filled(filled: dict[str, str]) -> dict[str, Any]:
         return {"programs": []}
 
 
+async def wait_for_program_summary(
+    page: Page, timeout_s: float = 8.0
+) -> dict[str, Any]:
+    """Wait for Great News cards before speaking program eligibility.
+
+    Pointcare can advance the step before the SPA finishes rendering the cards.
+    Scraping immediately stored an empty list and falsely announced no programs.
+    """
+    deadline = time.monotonic() + max(0.5, timeout_s)
+    last: dict[str, Any] = {"programs": []}
+    while time.monotonic() < deadline:
+        last = await scrape_program_summary(page)
+        if last.get("programs"):
+            return last
+        await page.wait_for_timeout(250)
+    return last
+
+
 async def store_program_summary(session: Any, page: Page) -> dict[str, Any]:
-    summary = await scrape_program_summary(page)
+    summary = await wait_for_program_summary(page)
     session.filled["program_summary_json"] = json.dumps(summary)
     speech = build_programs_permission_speech(summary)
     session.filled["programs_permission_speech"] = speech
@@ -508,6 +547,33 @@ async def click_exact_visible_text(page: Page, label: str) -> bool:
     except Exception:
         logger.exception("click_exact_visible_text failed label=%s", label)
         return False
+
+
+async def _finish_agent_offer(page: Page, *, wants_connect: bool) -> bool:
+    """Complete the optional agent screen after its Yes/No choice.
+
+    Choosing No expands a second panel whose real CTA is
+    ``Continue with Medicaid only``; it is not a generic Continue button.
+    """
+    labels = (
+        ("Continue", "Next")
+        if wants_connect
+        else (
+            "Continue with Medicaid only",
+            "Continue without an agent",
+            "Continue",
+        )
+    )
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        screen = await detect_application_screen(page)
+        if screen and screen not in ("app_agent_offer", "programs"):
+            return True
+        for label in labels:
+            if await click_exact_visible_text(page, label):
+                return True
+        await page.wait_for_timeout(250)
+    return False
 
 
 async def click_quick_apply(page: Page) -> str:
@@ -15483,26 +15549,24 @@ async def submit_application_answer(
 
     if step == "app_agent_offer":
         if _is_yes(text):
-            try:
-                await _click_exact_choice(page, "Yes, connect me")
-            except Exception:
+            selected = await click_exact_visible_text(page, "Yes, connect me")
+            if not selected:
                 try:
-                    await _click_yes_no(page, True)
-                except RuntimeError as exc:
+                    await _click_exact_choice(page, "Yes, connect me")
+                    selected = True
+                except Exception as exc:
                     return _yes_no_click_failure(call_id, session, step, text, exc)
         elif _is_no(text):
-            clicked_no = False
-            for label in ("No thanks", "No", "Continue without an agent"):
-                try:
-                    await _click_cta(page, label, attempts=1)
-                    clicked_no = True
+            selected = False
+            for label in ("No thanks", "No"):
+                if await click_exact_visible_text(page, label):
+                    selected = True
                     break
-                except Exception:
-                    continue
-            if not clicked_no:
+            if not selected:
                 try:
-                    await _click_yes_no(page, False)
-                except RuntimeError as exc:
+                    await _click_exact_choice(page, "No thanks")
+                    selected = True
+                except Exception as exc:
                     return _yes_no_click_failure(call_id, session, step, text, exc)
         else:
             return {
@@ -15514,10 +15578,22 @@ async def submit_application_answer(
                 "step": step,
                 "phase": "application",
             }
-        try:
-            await _click_cta(page, "Continue", attempts=2)
-        except Exception:
-            await _click_next_or_continue(page)
+        advanced = await _finish_agent_offer(
+            page, wants_connect=_is_yes(text)
+        )
+        if not advanced:
+            return {
+                "ok": False,
+                "call_id": call_id,
+                "field_id": "application_answer",
+                "spoken": (
+                    "ASK: I selected your answer, but I couldn't continue from "
+                    "the licensed-agent screen. Please say Yes or No to try again."
+                ),
+                "error": "agent_offer_continue_failed",
+                "step": step,
+                "phase": "application",
+            }
         next_step = await _advance_after_answer(
             page, session, allow_extra_next=False, leave_step=step
         )

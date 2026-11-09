@@ -256,13 +256,48 @@ class CallTurnTests(unittest.IsolatedAsyncioTestCase):
     async def test_language_then_sign_in_question(self) -> None:
         call_id = "turn-test"
         await drop_controller(call_id)
+        ctrl = await get_controller(call_id)
+        ctrl.phase = "language"
         r = await process_user_turn(call_id, "English is fine")
         self.assertIn("Google", r.speech)
         self.assertEqual(r.phase, "sign_in")
 
+    async def test_identity_yes_continues_to_language(self) -> None:
+        from pc_liveagent.call_turn import register_outbound_caller
+        from pc_liveagent.live_fill_prompt import LIVE_FILL_GREETING
+
+        call_id = "turn-id-yes"
+        await drop_controller(call_id)
+        register_outbound_caller(call_id, "Sam Lee")
+        ctrl = await get_controller(call_id)
+        ctrl.phase = "identity"
+        ctrl.caller_name = "Sam Lee"
+        ctrl.last_speech = "Hi, am I speaking with Sam Lee?"
+        r = await process_user_turn(call_id, "Yes")
+        self.assertEqual(r.phase, "language")
+        self.assertEqual(r.detail, "identity_confirmed")
+        self.assertEqual(r.speech, LIVE_FILL_GREETING)
+        self.assertFalse(r.end_call)
+
+    async def test_identity_no_ends_call(self) -> None:
+        from pc_liveagent.call_turn import WRONG_PERSON_CLOSING
+
+        call_id = "turn-id-no"
+        await drop_controller(call_id)
+        ctrl = await get_controller(call_id)
+        ctrl.phase = "identity"
+        ctrl.caller_name = "Sam Lee"
+        r = await process_user_turn(call_id, "No")
+        self.assertEqual(r.phase, "closing")
+        self.assertEqual(r.detail, "wrong_person")
+        self.assertTrue(r.end_call)
+        self.assertEqual(r.speech, WRONG_PERSON_CLOSING)
+
     async def test_intro_for_what_stays_on_language_with_context(self) -> None:
         call_id = "turn-test"
         await drop_controller(call_id)
+        ctrl = await get_controller(call_id)
+        ctrl.phase = "language"
         r = await process_user_turn(call_id, "For what?")
         self.assertEqual(r.phase, "language")
         self.assertEqual(r.detail, "repeat")
@@ -4208,23 +4243,32 @@ class SpecialConditionAndPersonTests(unittest.TestCase):
         session.elig_step = "special"
         self.assertEqual(_screen_first_step("special", session), "special")
 
-    def test_repeated_condition_on_special_person_clarifies(self) -> None:
+    def test_repeated_condition_on_special_person_switches(self) -> None:
         from pc_liveagent.answer_parse import resolve_answer
         from pc_liveagent.elig_meta import get_field_meta
 
+        # Condition-only turns must reach live_form so Blind→Disabled can switch.
         r = resolve_answer(
             "special_person",
             "Someone is blind.",
             meta=get_field_meta("special_person"),
         )
-        self.assertIsNone(r.answer)
-        self.assertIn("household member", (r.clarify or "").lower())
+        self.assertEqual(r.answer, "Someone is blind.")
+        self.assertEqual(r.detail, "special_person_condition_switch")
         r2 = resolve_answer(
             "special_person",
-            "I said someone is blind.",
+            "Disabled",
             meta=get_field_meta("special_person"),
         )
-        self.assertIsNone(r2.answer)
+        self.assertEqual(r2.answer, "Disabled")
+        self.assertEqual(r2.detail, "special_person_condition_switch")
+        r3 = resolve_answer(
+            "special_person",
+            "Disabled applies to Agent T.",
+            meta=get_field_meta("special_person"),
+        )
+        self.assertEqual(r3.answer, "Disabled applies to Agent T.")
+        self.assertEqual(r3.detail, "special_person_condition_and_member")
 
     def test_angel_or_sanitizes_to_angel(self) -> None:
         from pc_liveagent.answer_parse import sanitize_person_name, resolve_answer
@@ -4580,42 +4624,31 @@ class SpecialConditionSelectTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("couldn't confirm", str(ctx.exception).lower())
         self.assertIn("pregnant", str(ctx.exception).lower())
 
-    async def test_multi_accepts_second_condition_without_member_count_increase(
+    async def test_multi_accepts_second_condition_when_checkbox_verifies(
         self,
     ) -> None:
-        """Second condition OK when scoped members appear even if count is flat."""
+        """Second condition OK when checkbox verifies even if member count is flat."""
         from pc_liveagent.live_form import _select_special_condition_checkbox
 
         page = AsyncMock()
         page.wait_for_timeout = AsyncMock()
-        calls = {"n": 0}
-
-        async def state(_page, _label):
-            calls["n"] += 1
-            if calls["n"] == 1:
-                return {"found": True, "checked": False, "source": "input"}
-            return {"found": False, "checked": False, "source": "missing"}
 
         with (
             patch(
                 "pc_liveagent.live_form._special_condition_checkbox_state",
-                new=AsyncMock(side_effect=state),
+                new=AsyncMock(
+                    side_effect=_sticky_state_side_effect(
+                        [
+                            {"found": True, "checked": False, "source": "input"},
+                            {"found": True, "checked": True, "source": "input"},
+                        ]
+                    )
+                ),
             ),
             patch(
                 "pc_liveagent.live_form._special_apply_to_member_count",
-                new=AsyncMock(return_value=2),
+                new=AsyncMock(return_value=2),  # Blind list already open
             ),
-            patch(
-                "pc_liveagent.live_form._discover_special_person_members",
-                new=AsyncMock(
-                    return_value={
-                        "members": [
-                            {"label": "Mickey M.", "checked": False, "dupIndex": 0}
-                        ],
-                        "strategy": "condition_scope",
-                    }
-                ),
-            ) as discover,
             patch(
                 "pc_liveagent.live_form._click_exact_choice",
                 new=AsyncMock(),
@@ -4628,9 +4661,6 @@ class SpecialConditionSelectTests(unittest.IsolatedAsyncioTestCase):
                 multi=True,
             )
         click.assert_awaited_once()
-        discover.assert_awaited()
-        # Scoped discover must use the active condition label.
-        self.assertIn("disabled", (discover.await_args.args[1] or "").lower())
 
     async def test_disabled_condition_one_click(self) -> None:
         from pc_liveagent.live_form import _select_special_condition_checkbox
@@ -4917,7 +4947,8 @@ class SpecialConditionSelectTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(click.await_count, 1)
 
-    async def test_multi_unreadable_accepted_without_next(self) -> None:
+    async def test_multi_unreadable_does_not_accept_via_scoped_list(self) -> None:
+        """multi=True must verify the checkbox — scoped members alone are not enough."""
         from pc_liveagent.live_form import _select_special_condition_checkbox
 
         page = AsyncMock()
@@ -4926,12 +4957,7 @@ class SpecialConditionSelectTests(unittest.IsolatedAsyncioTestCase):
             patch(
                 "pc_liveagent.live_form._special_condition_checkbox_state",
                 new=AsyncMock(
-                    side_effect=_sticky_state_side_effect(
-                        [
-                            {"found": False, "checked": False, "source": "missing"},
-                            {"found": False, "checked": False, "source": "missing"},
-                        ]
-                    )
+                    return_value={"found": False, "checked": False, "source": "missing"}
                 ),
             ),
             patch(
@@ -4939,13 +4965,24 @@ class SpecialConditionSelectTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(return_value=2),
             ),
             patch(
-                "pc_liveagent.live_form._discover_special_person_members",
+                "pc_liveagent.live_form._condition_scoped_members_ready",
                 new=AsyncMock(
                     return_value={
                         "members": [
                             {"label": "Mickey M.", "checked": False, "dupIndex": 0}
                         ],
                         "strategy": "condition_scope",
+                        "scope_exclusive": True,
+                    }
+                ),
+            ),
+            patch(
+                "pc_liveagent.live_form._special_condition_readonly_reinspect",
+                new=AsyncMock(
+                    return_value={
+                        "found": False,
+                        "checked": False,
+                        "source": "reinspect_missing",
                     }
                 ),
             ),
@@ -4953,11 +4990,13 @@ class SpecialConditionSelectTests(unittest.IsolatedAsyncioTestCase):
                 "pc_liveagent.live_form._click_exact_choice",
                 new=AsyncMock(),
             ) as click,
+            self.assertRaises(RuntimeError) as ctx,
         ):
             await _select_special_condition_checkbox(
                 page, "Someone is blind", call_id="sp6", multi=True
             )
-        self.assertEqual(click.await_count, 1)
+        click.assert_awaited_once()
+        self.assertIn("couldn't confirm", str(ctx.exception).lower())
 
     async def test_explicit_unchecked_after_click_clarifies_once(self) -> None:
         from pc_liveagent.live_form import _select_special_condition_checkbox
@@ -5035,6 +5074,10 @@ class SpecialConditionSelectTests(unittest.IsolatedAsyncioTestCase):
             patch(
                 "pc_liveagent.live_form._visible_choice_labels",
                 new=AsyncMock(return_value=labels),
+            ),
+            patch(
+                "pc_liveagent.live_form._clear_stale_special_condition_checkboxes",
+                new=AsyncMock(return_value=0),
             ),
             patch(
                 "pc_liveagent.live_form._special_condition_checkbox_state",
@@ -5126,6 +5169,10 @@ class SpecialConditionSelectTests(unittest.IsolatedAsyncioTestCase):
             patch(
                 "pc_liveagent.live_form._visible_choice_labels",
                 new=AsyncMock(return_value=labels),
+            ),
+            patch(
+                "pc_liveagent.live_form._clear_stale_special_condition_checkboxes",
+                new=AsyncMock(return_value=0),
             ),
             patch(
                 "pc_liveagent.live_form._special_condition_checkbox_state",
@@ -15280,17 +15327,25 @@ class FullCallFlowIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(config.application_after_signin_from_env())
 
     async def test_begin_speech_is_greeting_when_shortcuts_off(self) -> None:
-        from pc_liveagent.call_turn import begin_speech, drop_controller
-        from pc_liveagent.live_fill_prompt import LIVE_FILL_GREETING
+        from pc_liveagent.call_turn import (
+            begin_speech,
+            drop_controller,
+            get_controller,
+            identity_opening,
+            register_outbound_caller,
+        )
 
         call_id = "full-greet"
         await drop_controller(call_id)
+        register_outbound_caller(call_id, "Jordan Blake")
         with (
             patch("pc_liveagent.config.APPLICATION_TEST_MODE", False),
             patch("pc_liveagent.config.APPLICATION_AFTER_SIGNIN", False),
         ):
             speech = await begin_speech(call_id)
-        self.assertEqual(speech, LIVE_FILL_GREETING)
+        ctrl = await get_controller(call_id)
+        self.assertEqual(speech, identity_opening("Jordan Blake"))
+        self.assertEqual(ctrl.phase, "identity")
 
     def test_stage_d_ends_at_programs(self) -> None:
         from pc_liveagent.live_form import LiveFormSession, _next_elig_step

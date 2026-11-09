@@ -3,6 +3,7 @@ import logging
 import re
 import sys
 import time
+from pathlib import Path
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import HTMLResponse
@@ -10,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from . import config
 from .browser import close_browser
+from .call_turn import register_outbound_caller
 from .form_bridge import (
     enrich_webhook_call,
     event_kind,
@@ -31,7 +33,10 @@ if sys.platform == "win32":
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Pointcare Live Agent")
+app = FastAPI(title="PointCare Live FormFiller")
+
+_FRONTEND_DIR = Path(__file__).resolve().parent / "frontend"
+_FRONTEND_INDEX = _FRONTEND_DIR / "index.html"
 
 
 @app.on_event("shutdown")
@@ -51,36 +56,23 @@ class WelcomeTestIn(BaseModel):
     form_url: str | None = None
 
 
-INDEX = """<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>Pointcare Live Agent</title>
-  <style>
-    body { font-family: system-ui, sans-serif; max-width: 44rem; margin: 2rem auto; padding: 0 1rem; }
-    code, pre { background: #f7f7f7; }
-    pre { padding: 0.75rem; overflow: auto; }
-  </style>
-</head>
-<body>
-  <h1>Pointcare Live Agent</h1>
-  <p>Collect Mode: Retell Custom LLM + Playwright fills Pointcare in real time.</p>
-  <p>Start with <code>venv313\\Scripts\\python.exe run.py</code> (port 8001).</p>
-  <ul>
-    <li><code>POST /form-filler/outbound/</code> — place a live call</li>
-    <li><code>GET /form-filler/sessions/{{call_id}}</code> — live session + Chrome URL</li>
-    <li><code>GET /form-filler/sessions/{{call_id}}/chrome</code> — open/focus agent Chrome</li>
-    <li><code>WS /llm-websocket/{call_id}</code> — Retell Custom LLM</li>
-    <li><code>POST /webhooks/retell</code> and <code>/webhooks/retell/tool</code></li>
-  </ul>
-</body>
-</html>
-"""
+def _load_frontend_html() -> str:
+    try:
+        return _FRONTEND_INDEX.read_text(encoding="utf-8")
+    except OSError as exc:
+        logger.exception("Failed to load frontend index.html")
+        return (
+            "<!DOCTYPE html><html><body>"
+            "<h1>PointCare Live FormFiller</h1>"
+            f"<p>Frontend missing: {exc}</p>"
+            "<p>POST /form-filler/outbound/ still works.</p>"
+            "</body></html>"
+        )
 
 
 @app.get("/", response_class=HTMLResponse)
 def home():
-    return INDEX
+    return HTMLResponse(content=_load_frontend_html())
 
 
 def _request_base_url(request: Request) -> str:
@@ -127,6 +119,8 @@ async def form_filler_outbound(
             detail=result.get("error") or "Failed to place call.",
         )
     call_id = str(result.get("call_id") or "")
+    if call_id:
+        register_outbound_caller(call_id, payload.name)
     form_url = (payload.form_url or "").strip() or config.POINTCARE_URL
     base = _request_base_url(request)
     chrome_link = _chrome_session_url(base, call_id)

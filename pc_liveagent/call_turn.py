@@ -98,9 +98,38 @@ CALL_PURPOSE = (
     "I'm Kyle from Bay Area Community Health, calling to help you with "
     "Pointcare registration and check household eligibility."
 )
+WRONG_PERSON_CLOSING = (
+    "I'm sorry for the mistake. Thank you for your time. Goodbye."
+)
 SIGN_IN_QUESTION = (
     "How would you like to sign in, with Google, with Apple, or with email?"
 )
+
+
+def identity_opening(name: str = "") -> str:
+    who = (name or "").strip()
+    if who:
+        return f"Hi, am I speaking with {who}?"
+    return "Hi, am I speaking with the person I was trying to reach?"
+
+
+# Outbound caller display name keyed by Retell call_id (set before WS opens).
+_caller_names: dict[str, str] = {}
+
+
+def register_outbound_caller(call_id: str, name: str = "") -> None:
+    cid = (call_id or "").strip()
+    who = (name or "").strip()
+    if not cid:
+        return
+    if who:
+        _caller_names[cid] = who
+    else:
+        _caller_names.pop(cid, None)
+
+
+def peek_outbound_caller(call_id: str) -> str:
+    return (_caller_names.get((call_id or "").strip()) or "").strip()
 EMAIL_QUESTION = "What email address should I use?"
 EMAIL_CLARIFY = (
     "I didn't catch a full email address. Please say it slowly, like "
@@ -276,13 +305,14 @@ def _wants_email_go_back(text: str) -> bool:
 @dataclass
 class CallController:
     call_id: str
-    # language|sign_in|email|email_confirm|email_await_secure|google_email|eligibility|application|closing
-    phase: str = "language"
+    # identity|language|sign_in|email|email_confirm|email_await_secure|google_email|eligibility|application|closing
+    phase: str = "identity"
     turn_seq: int = 0
     # Dedupe key includes phase/step so consecutive Yes/No across questions apply.
     last_user_fp: str = ""
     last_dedupe_ctx: str = ""
     last_speech: str = LIVE_FILL_GREETING
+    caller_name: str = ""
     pending_op_id: str = ""
     committed: list[dict[str, Any]] = field(default_factory=list)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -365,6 +395,7 @@ async def drop_controller(call_id: str) -> None:
     except Exception:
         pass
     clear_call_trace(call_id)
+    _caller_names.pop((call_id or "").strip(), None)
     async with _controllers_lock:
         _controllers.pop(call_id, None)
 
@@ -805,9 +836,10 @@ async def begin_speech(call_id: str) -> str:
     async with _controllers_lock:
         existing = _controllers.get(call_id)
         if existing is not None and (
-            existing.turn_seq > 0 or existing.phase not in ("", "language")
+            existing.turn_seq > 0
+            or existing.phase not in ("", "identity", "language")
         ):
-            speech = existing.last_speech or LIVE_FILL_GREETING
+            speech = existing.last_speech or identity_opening(existing.caller_name)
             logger.info(
                 "WS resume call_id=%s phase=%s turn_seq=%s speech=%r",
                 call_id,
@@ -838,9 +870,13 @@ async def begin_speech(call_id: str) -> str:
         ctrl.last_speech = opening
         logger.info("application_test_opening call_id=%s", call_id)
         return opening
-    ctrl.phase = "language"
-    ctrl.last_speech = LIVE_FILL_GREETING
-    return LIVE_FILL_GREETING
+    who = peek_outbound_caller(call_id) or (ctrl.caller_name or "").strip()
+    ctrl.caller_name = who
+    ctrl.phase = "identity"
+    speech = identity_opening(who)
+    ctrl.last_speech = speech
+    logger.info("identity_opening call_id=%s name=%r", call_id, who[:40] if who else "")
+    return speech
 
 
 def _application_test_opening(session: Any) -> str:
@@ -1712,6 +1748,8 @@ def _should_watch_signin(spoken: str) -> bool:
 async def _repeat_with_context(call_id: str, ctrl: CallController) -> str:
     """Re-speak the current step with purpose context — never advance the flow."""
     phase = ctrl.phase or ""
+    if phase == "identity":
+        return identity_opening(ctrl.caller_name or peek_outbound_caller(call_id))
     if phase == "language":
         return LIVE_FILL_GREETING
     if phase == "sign_in":
@@ -2407,6 +2445,44 @@ async def process_user_turn(
                 phase=ctrl.phase,
                 turn_id=turn_id,
                 detail="repeat",
+            )
+
+        if ctrl.phase == "identity":
+            who = (ctrl.caller_name or peek_outbound_caller(call_id) or "").strip()
+            ctrl.caller_name = who
+            if _is_no(text):
+                ctrl.last_user_fp = fp
+                ctrl.last_dedupe_ctx = dedupe_ctx
+                ctrl.phase = "closing"
+                ctrl.last_speech = WRONG_PERSON_CLOSING
+                return TurnResult(
+                    speech=WRONG_PERSON_CLOSING,
+                    end_call=True,
+                    phase="closing",
+                    turn_id=turn_id,
+                    detail="wrong_person",
+                )
+            if _is_yes(text):
+                ctrl.last_user_fp = fp
+                ctrl.last_dedupe_ctx = dedupe_ctx
+                ctrl.phase = "language"
+                ctrl.last_speech = LIVE_FILL_GREETING
+                return TurnResult(
+                    speech=LIVE_FILL_GREETING,
+                    phase="language",
+                    turn_id=turn_id,
+                    detail="identity_confirmed",
+                )
+            clarify = (
+                f"Just to confirm — am I speaking with {who or 'the right person'}? "
+                "Please say yes or no."
+            )
+            ctrl.last_speech = clarify
+            return TurnResult(
+                speech=clarify,
+                phase="identity",
+                turn_id=turn_id,
+                detail="identity_clarify",
             )
 
         if ctrl.phase == "language":

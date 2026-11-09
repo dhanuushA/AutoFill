@@ -79,18 +79,18 @@ class ApplicationOnlyFlagTests(unittest.TestCase):
             "",
         )
 
-    def test_local_env_enables_the_flag_without_changing_the_default(self) -> None:
+    def test_local_env_uses_full_flow_without_changing_the_default(self) -> None:
         from pc_liveagent.config import application_only_test_mode_from_env
 
         text = Path(__file__).resolve().parents[1].joinpath(".env").read_text(
             encoding="utf-8"
         )
         self.assertRegex(
-            text, r"(?m)^POINTCARE_APPLICATION_ONLY_TEST_MODE=true\s*$"
+            text, r"(?m)^POINTCARE_APPLICATION_ONLY_TEST_MODE=false\s*$"
         )
-        self.assertRegex(
+        self.assertNotRegex(
             text,
-            r"(?m)^POINTCARE_APPLICATION_START_AT=app_address_review\s*$",
+            r"(?m)^POINTCARE_APPLICATION_START_AT=(?:app_address_review|app_income)\s*$",
         )
         self.assertFalse(application_only_test_mode_from_env({}))
 
@@ -133,17 +133,26 @@ class ApplicationOnlyStartupTests(unittest.IsolatedAsyncioTestCase):
         await drop_controller(call_id)
 
     async def test_normal_mode_still_opens_with_the_greeting(self) -> None:
-        from pc_liveagent.call_turn import LIVE_FILL_GREETING, begin_speech, drop_controller
+        from pc_liveagent.call_turn import (
+            begin_speech,
+            drop_controller,
+            get_controller,
+            identity_opening,
+            register_outbound_caller,
+        )
 
         call_id = "full-open"
         await drop_controller(call_id)
+        register_outbound_caller(call_id, "Alex Rivera")
         with (
             patch("pc_liveagent.config.APPLICATION_ONLY_TEST_MODE", False),
             patch("pc_liveagent.config.APPLICATION_TEST_MODE", False),
             patch("pc_liveagent.call_turn._schedule_application_only") as schedule,
         ):
             speech = await begin_speech(call_id)
-        self.assertEqual(speech, LIVE_FILL_GREETING)
+        ctrl = await get_controller(call_id)
+        self.assertEqual(speech, identity_opening("Alex Rivera"))
+        self.assertEqual(ctrl.phase, "identity")
         schedule.assert_not_called()
         await drop_controller(call_id)
 

@@ -34,6 +34,7 @@ from .live_form import (
     _map_relationship_label,
     _map_special_condition_labels,
     _map_support_yes_label,
+    _parse_babies_count,
     _resolve_income_period_label,
     _spoken_has_age_range_connector,
     _wants_income_period_reselect,
@@ -60,12 +61,16 @@ _FAST_PATH_DETAILS = frozenset(
         "special_mapped",
         "special_multi",
         "special_member_name",
+        "special_more_condition",
+        "special_person_condition_switch",
+        "special_person_condition_and_member",
         "age_mapped",
         "age_free",  # clear spoken age; Playwright opens chips and verifies
         "income_period",
         "income_period_switch",
         "income_period_reselect",
         "income_range_mapped",
+        "babies_count",
         "name",
         "special_person",
         "support_no",
@@ -485,6 +490,20 @@ def resolve_answer(
         else:
             answer_type = "text"
 
+    if step == "babies_count":
+        count = _parse_babies_count(text)
+        if count is not None:
+            # Canonical numeric text goes directly to Playwright. This must not
+            # depend on Claude; a timeout would leave the modal untouched.
+            return ResolveResult(answer=str(count), detail="babies_count")
+        return ResolveResult(
+            clarify=_with_full_question(
+                step,
+                "Please say one whole number, or a term like twins or triplets.",
+            ),
+            detail="babies_count_unclear",
+        )
+
     if step == "support":
         if _is_no(text):
             return ResolveResult(answer="No", detail="support_no")
@@ -524,6 +543,25 @@ def resolve_answer(
                 answer=("No" if token.startswith("n") else "Yes"),
                 detail="yes_no_clear",
             )
+        # special_more: a clearly named condition means "add this condition",
+        # not an unclear Yes/No.
+        if step == "special_more":
+            from .live_form import _affirmed_condition_keys
+
+            keys = _affirmed_condition_keys(text)
+            if len(keys) == 1:
+                return ResolveResult(
+                    answer=text, detail="special_more_condition"
+                )
+            if len(keys) > 1:
+                return ResolveResult(
+                    clarify=_with_full_question(
+                        step,
+                        "Please say one condition to add, like blind or disabled, "
+                        "or Yes or No.",
+                    ),
+                    detail="special_more_condition_ambiguous",
+                )
         # Application start gate: accept clear start/continue intent as Yes.
         if step in (
             "proceed_application",
@@ -783,14 +821,26 @@ def resolve_answer(
         )
 
     if step == "special_person":
-        # Member assignment only — never treat condition chips as the person.
-        if re.search(
-            r"\bsomeone is\b|\bsomeone has\b|\bi said someone\b|"
-            r"^\s*(blind|pregnant|breast cancer|cervical cancer|disabled|"
-            r"none of the above|ssdi)\s*[.!]?\s*$",
-            text,
-            re.I,
-        ):
+        from .live_form import (
+            _affirmed_condition_keys,
+            _utterance_is_only_condition,
+        )
+
+        keys = _affirmed_condition_keys(text)
+        # Condition-only: live_form must switch the active condition (Blind→Disabled).
+        if _utterance_is_only_condition(text):
+            if len(keys) == 1:
+                return ResolveResult(
+                    answer=text, detail="special_person_condition_switch"
+                )
+            if len(keys) > 1:
+                return ResolveResult(
+                    clarify=_with_full_question(
+                        step,
+                        "Please say exactly one condition, like blind or disabled.",
+                    ),
+                    detail="special_person_condition_ambiguous",
+                )
             return ResolveResult(
                 clarify=_with_full_question(
                     step,
@@ -798,6 +848,11 @@ def resolve_answer(
                     "Please say the household member's name.",
                 ),
                 detail="special_person_got_condition",
+            )
+        # Condition + member in one utterance — keep full text for live_form.
+        if keys:
+            return ResolveResult(
+                answer=text, detail="special_person_condition_and_member"
             )
         cleaned = sanitize_person_name(text)
         if not cleaned:
@@ -1104,12 +1159,27 @@ def validate_claude_result(
             result.reject_reason = "empty_text"
             result.needs_clarify = True
             return result
-        # Never accept condition phrases as special_person members.
+        # Bare condition names are routed by resolve_answer for active-condition
+        # switches; Claude must not invent a household member from them.
         if step == "special_person" and re.search(
-            r"\bsomeone is\b|^\s*(blind|pregnant|none of the above)\b",
+            r"\bsomeone is\b|^\s*(blind|pregnant|disabled|ssdi|none of the above)\b",
             cleaned,
             re.I,
         ):
+            from .live_form import (
+                _affirmed_condition_keys,
+                _utterance_is_only_condition,
+            )
+
+            if _utterance_is_only_condition(cleaned) and len(
+                _affirmed_condition_keys(cleaned)
+            ) == 1:
+                result.answer = cleaned
+                result.matched_option = None
+                result.accepted = True
+                result.needs_clarify = False
+                result.reject_reason = ""
+                return result
             result.accepted = False
             result.reject_reason = "condition_not_person"
             result.needs_clarify = True

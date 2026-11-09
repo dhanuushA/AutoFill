@@ -591,7 +591,10 @@ class OpeningSpeechTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(heard, LIVE_FILL_GREETING)
         with patch("pc_liveagent.config.APPLICATION_TEST_MODE", False):
             heard_off = await begin_speech("speech-off")
-        self.assertEqual(heard_off, LIVE_FILL_GREETING)
+        from pc_liveagent.call_turn import identity_opening
+
+        self.assertEqual(heard_off, identity_opening())
+        self.assertNotEqual(heard_off, LIVE_FILL_GREETING)
 
     async def test_yes_from_language_phase_starts_application_not_signin(self) -> None:
         from pc_liveagent.call_turn import drop_controller, get_controller, process_user_turn

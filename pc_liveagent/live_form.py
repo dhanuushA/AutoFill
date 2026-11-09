@@ -1242,6 +1242,9 @@ async def _begin_eligibility(session: LiveFormSession, page: Page) -> str:
     session.after_person = ""
     session.last_applied = ""
     session.last_result = None
+    session.last_step_answer = None
+    # Never reuse Blind/Disabled/etc. from a previous eligibility run.
+    _clear_special_session_state(session)
     session.filled["eligibility_intro_pending"] = "1"
     opening = _spoken_question_for_step(session, session.elig_step)
     # Persist so post-sign-in speech helpers cannot drop the purpose intro.
@@ -3037,11 +3040,17 @@ async def submit_field(
                     return result
                 # Stale marital (etc.) arriving after we already advanced to a Yes/No step.
                 # Programs decision accepts continue/start phrasing — do not stale-ignore it.
+                # special_more also accepts a clearly named condition to add next.
+                special_more_condition = (
+                    session.elig_step == "special_more"
+                    and len(_affirmed_condition_keys(text)) == 1
+                )
                 if (
                     session.elig_step in YES_NO_ELIG_STEPS
                     and session.elig_step != "programs"
                     and not _is_yes(text)
                     and not _is_no(text)
+                    and not special_more_condition
                 ):
                     spoken = ELIG_QUESTIONS[session.elig_step]
                     logger.info(
@@ -6821,6 +6830,100 @@ def _special_condition_negated(text: str, cue: str) -> bool:
     return False
 
 
+def _affirmed_condition_keys(raw: str) -> list[str]:
+    """Return every explicitly affirmed special-condition key in an utterance."""
+    text = re.sub(r"\s+", " ", (raw or "").lower()).strip()
+    if not text:
+        return []
+    patterns = (
+        ("cervical", r"\bcervical\b"),
+        ("breast", r"\bbreast\b"),
+        ("blind", r"\bblind\b"),
+        ("pregnant", r"\b(pregnant|pregnancy|expecting)\b"),
+        ("foster", r"\bfoster\b"),
+        ("disabled", r"\b(disabled|ssdi|disability|on disability)\b"),
+    )
+    affirmed: list[str] = []
+    for key, pattern in patterns:
+        if not re.search(pattern, text):
+            continue
+        if key == "disabled" and re.search(r"\bvisual(?:ly)?\s+disab", text):
+            continue
+        cue = "visual" if key == "blind" and "visual" in text else key
+        if _special_condition_negated(text, cue):
+            continue
+        if _special_condition_excluded(text, cue):
+            continue
+        if key == "blind" and _special_condition_negated(text, "visual"):
+            continue
+        if key not in affirmed:
+            affirmed.append(key)
+    return affirmed
+
+
+def _resolve_special_condition_label(
+    key_or_label: str, session: LiveFormSession | None = None
+) -> str:
+    """Map a bare key or partial phrase to a full Pointcare condition label."""
+    text = (key_or_label or "").strip()
+    if not text:
+        return ""
+    key = _special_condition_key(text)
+    if not key:
+        return text
+    pools: list[str] = []
+    if session is not None:
+        pools.extend(
+            [
+                session.filled.get("special_conditions") or "",
+                session.filled.get("special_active_conditions") or "",
+                session.filled.get("special_person_queue") or "",
+            ]
+        )
+    for pool in pools:
+        for item in re.split(r"[|,]", pool):
+            item = item.strip()
+            if item and _special_condition_key(item) == key:
+                return item
+    for canon in _REAL_SPECIAL_CONDITIONS:
+        if _special_condition_key(canon) == key:
+            return canon
+    return text
+
+
+def _special_condition_excluded(text: str, cue: str) -> bool:
+    """True when the cue is excluded (apart from / except / other than)."""
+    lowered = re.sub(r"\s+", " ", (text or "").lower()).strip()
+    cue_re = re.escape(cue)
+    return bool(
+        re.search(
+            rf"\b(?:apart\s+from|except(?:\s+for)?|excluding|other\s+than)\s+"
+            rf"(?:\w+\s+){{0,2}}{cue_re}\b",
+            lowered,
+        )
+    )
+
+
+def _special_condition_key(label: str) -> str:
+    """Canonical key for a special-condition label or spoken cue."""
+    low = re.sub(r"\s+", " ", (label or "").strip().lower())
+    if not low:
+        return ""
+    if "cervical" in low:
+        return "cervical"
+    if "breast" in low:
+        return "breast"
+    if "blind" in low:
+        return "blind"
+    if "pregnant" in low or "pregnancy" in low or "expecting" in low:
+        return "pregnant"
+    if "foster" in low:
+        return "foster"
+    if "disabled" in low or "ssdi" in low or "disability" in low:
+        return "disabled"
+    return ""
+
+
 def _short_special_condition_label(label: str) -> str:
     """Spoken-friendly short form of a Pointcare special-condition chip."""
     text = (label or "").strip()
@@ -6857,6 +6960,60 @@ _REAL_SPECIAL_CONDITIONS = (
 )
 
 
+_SPECIAL_FILLED_KEYS = (
+    "special_conditions",
+    "special_active_conditions",
+    "special_person_queue",
+    "special_person_assigned",
+    "special_last_assigned_labels",
+    "special_assignment_pairs",
+    "special_member_labels",
+    "special_ui_cleared",
+    "pregnancy_members",
+    "pregnancy_babies_count",
+    "pregnancy_details_pending",
+    "pregnancy_details_immediate",
+)
+
+
+async def _clear_stale_special_condition_checkboxes(page: Page) -> int:
+    """Uncheck leftover Special Cases boxes from a prior unfinished Pointcare check.
+
+    Only for a fresh special visit (no session-recorded conditions). Follow-ups
+    after special_more keep prior checks and must not call this.
+    """
+    cleared = 0
+    for label in list(_REAL_SPECIAL_CONDITIONS) + ["None of the above"]:
+        state = await _special_condition_checkbox_state(page, label)
+        if not (state.get("found") and state.get("checked")):
+            continue
+        try:
+            await _click_special_condition_control(page, label)
+            await page.wait_for_timeout(250)
+        except Exception:
+            logger.exception(
+                "clear stale special condition click failed label=%r", label
+            )
+            continue
+        after = await _special_condition_checkbox_state(page, label)
+        if after.get("found") and after.get("checked"):
+            logger.warning(
+                "stale special condition still checked after clear label=%r",
+                label,
+            )
+            continue
+        cleared += 1
+    if cleared:
+        logger.info("Cleared %s stale special condition checkbox(es)", cleared)
+    return cleared
+
+
+def _clear_special_session_state(session: LiveFormSession) -> None:
+    """Drop prior-run special/pregnancy answers so the next check starts blank."""
+    for key in _SPECIAL_FILLED_KEYS:
+        session.filled.pop(key, None)
+
+
 async def _checked_real_special_conditions(page: Page) -> list[str]:
     """Conditions whose checkbox is already checked. Excludes None of the above."""
     checked: list[str] = []
@@ -6865,6 +7022,21 @@ async def _checked_real_special_conditions(page: Page) -> list[str]:
         if state.get("found") and state.get("checked"):
             checked.append(label)
     return checked
+
+
+def _condition_has_assignment(session: LiveFormSession, label: str) -> bool:
+    """True when this condition already has at least one recorded member."""
+    key = _special_condition_key(label)
+    if not key:
+        return False
+    pairs = session.filled.get("special_assignment_pairs") or ""
+    for chunk in pairs.split("||"):
+        if ">>>" not in chunk:
+            continue
+        cond, mem_part = chunk.split(">>>", 1)
+        if _special_condition_key(cond) == key and mem_part.strip():
+            return True
+    return False
 
 
 def _record_special_assignment_pairs(
@@ -7058,9 +7230,15 @@ def _map_special_condition_labels(spoken: str, labels: list[str]) -> list[str]:
     for cue_key, needles, matched in cue_checks:
         if not matched:
             continue
-        if cue_key != "none" and _special_condition_negated(text, cue_key):
+        if cue_key != "none" and (
+            _special_condition_negated(text, cue_key)
+            or _special_condition_excluded(text, cue_key)
+        ):
             continue
-        if cue_key == "blind" and _special_condition_negated(text, "visual"):
+        if cue_key == "blind" and (
+            _special_condition_negated(text, "visual")
+            or _special_condition_excluded(text, "visual")
+        ):
             continue
         label = _find(*needles) if cue_key != "none" else _find("none of the above")
         if not label and cue_key == "none":
@@ -7097,7 +7275,9 @@ def _map_special_condition_labels(spoken: str, labels: list[str]) -> list[str]:
             if not (spoken_words and spoken_words <= label_words and distinctive):
                 continue
             if any(
-                _special_condition_negated(text, word) for word in distinctive
+                _special_condition_negated(text, word)
+                or _special_condition_excluded(text, word)
+                for word in distinctive
             ):
                 continue
         else:
@@ -7116,7 +7296,10 @@ def _map_special_condition_labels(spoken: str, labels: list[str]) -> list[str]:
                 ),
                 "",
             )
-            if cue and _special_condition_negated(text, cue):
+            if cue and (
+                _special_condition_negated(text, cue)
+                or _special_condition_excluded(text, cue)
+            ):
                 continue
         hits.append(label)
 
@@ -7258,55 +7441,95 @@ _SPECIAL_MEMBER_DISCOVER_JS = """(conditionLabel) => {
   const findConditionCard = (label) => {
     const key = conditionKey(label);
     if (!key) return null;
-    const others = ['cervical', 'breast', 'blind', 'pregnant', 'foster', 'disabled']
-      .filter((item) => item !== key);
-    // Prefer climbing from the condition's own control — shared ancestors with
-    // other conditions are allowed; pick the smallest reliable apply-to block.
-    const seeds = [];
+    // Exclusive scope only: seed → following apply-to, no foreign condition seed
+    // inside the candidate card. Never accept a shared page wrapper that also
+    // holds Blind's (or another condition's) member rows.
+    const KEYS = ['cervical', 'breast', 'blind', 'pregnant', 'foster', 'disabled'];
+    const textOf = (el) => norm(el.innerText || el.textContent || '');
+    const allSeeds = [];
     for (const el of document.querySelectorAll(
       'label, button, [role=checkbox], [role=button], li, div, span'
     )) {
-      const t = norm(el.innerText || el.textContent || '');
+      const t = textOf(el);
       if (!t || t.length > 140) continue;
       if (!/someone is |someone has |someone was /i.test(t)) continue;
-      if (conditionKey(t) !== key) continue;
-      seeds.push({ el, len: t.length });
+      const k = conditionKey(t);
+      if (!k || KEYS.indexOf(k) < 0) continue;
+      const low = t.toLowerCase();
+      const foreignInText = KEYS.some((x) => x !== k && low.includes(x));
+      allSeeds.push({ el, len: t.length, key: k, foreignInText });
     }
-    seeds.sort((a, b) => a.len - b.len);
-    for (const seed of seeds) {
-      let cur = seed.el;
-      for (let depth = 0; depth < 14 && cur; depth++) {
-        const t = norm(cur.innerText || '').toLowerCase();
-        if (
-          t
-          && t.includes(key)
-          && /who does this apply to/i.test(t)
-          && cur.querySelector('input[type=checkbox], [role=checkbox]')
-        ) {
-          return cur;
+    allSeeds.sort((a, b) => a.len - b.len);
+    let mySeeds = allSeeds.filter((s) => s.key === key && !s.foreignInText);
+    if (!mySeeds.length) mySeeds = allSeeds.filter((s) => s.key === key);
+    // Prefer innermost seeds (drop parents that wrap a smaller same-key seed).
+    mySeeds = mySeeds.filter(
+      (s) => !mySeeds.some((o) => o !== s && s.el.contains(o.el) && o.el !== s.el)
+    );
+    if (!mySeeds.length) return null;
+    const applyHeadings = [];
+    for (const el of document.querySelectorAll(
+      'h1,h2,h3,h4,div,span,p,legend,label,strong,b,[role=heading]'
+    )) {
+      const t = textOf(el);
+      if (!t || t.length > 80) continue;
+      if (!/who does this apply to/i.test(t)) continue;
+      applyHeadings.push({ el, len: t.length });
+    }
+    applyHeadings.sort((a, b) => a.len - b.len);
+    // Document order only — do not treat ancestor.contains(heading) as "follows"
+    // (that reclaimed Blind's list via shared wrappers).
+    const docFollows = (a, b) => {
+      if (!a || !b) return false;
+      if (a === b) return true;
+      return !!(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+    };
+    const between = (start, mid, end) => {
+      if (!start || !mid || !end || mid === start || mid === end) return false;
+      return docFollows(start, mid) && docFollows(mid, end);
+    };
+    const cardHasForeignSeed = (card, seedEl) => allSeeds.some((other) => {
+      if (other.key === key) return false;
+      if (!card.contains(other.el)) return false;
+      if (seedEl.contains(other.el)) return false;
+      return true;
+    });
+    const candidates = [];
+    for (const seed of mySeeds) {
+      for (const heading of applyHeadings) {
+        const headingOk = docFollows(seed.el, heading.el) || seed.el.contains(heading.el);
+        if (!headingOk) continue;
+        const foreignBetween = allSeeds.some((other) => {
+          if (other.key === key || other.el === seed.el) return false;
+          return between(seed.el, other.el, heading.el);
+        });
+        if (foreignBetween) continue;
+        let card = heading.el;
+        for (let depth = 0; depth < 16 && card; depth++) {
+          if (
+            card.contains(seed.el)
+            && card.querySelector('input[type=checkbox], [role=checkbox]')
+          ) {
+            const t = textOf(card).toLowerCase();
+            if (
+              t.includes(key)
+              && /who does this apply to/i.test(t)
+              && !cardHasForeignSeed(card, seed.el)
+            ) {
+              candidates.push({
+                el: card,
+                len: t.length,
+                headLen: heading.len,
+              });
+              break;
+            }
+          }
+          card = card.parentElement;
         }
-        cur = cur.parentElement;
       }
     }
-    // Fallback: smallest container with this key + apply-to. Soft-penalize
-    // other condition keywords; do not hard-reject shared parents.
-    const hits = [];
-    for (const el of document.querySelectorAll('section, article, li, fieldset, div')) {
-      const t = norm(el.innerText || '').toLowerCase();
-      if (!t || t.length > 2500 || !t.includes(key)) continue;
-      if (!/who does this apply to/i.test(t)) continue;
-      if (!el.querySelector('input[type=checkbox], [role=checkbox]')) continue;
-      const otherCount = others.filter((item) => t.includes(item)).length;
-      const r = el.getBoundingClientRect();
-      hits.push({
-        el,
-        len: t.length,
-        otherCount,
-        area: Math.max(1, r.width * r.height),
-      });
-    }
-    hits.sort((a, b) => a.otherCount - b.otherCount || a.len - b.len || a.area - b.area);
-    return hits.length ? hits[0].el : null;
+    candidates.sort((a, b) => a.len - b.len || a.headLen - b.headLen);
+    return candidates.length ? candidates[0].el : null;
   };
   const bodyText = norm((document.body && document.body.innerText) || '').slice(0, 2500);
   const hasApplyTo = /who does this apply to/i.test(bodyText);
@@ -7449,17 +7672,26 @@ _SPECIAL_MEMBER_DISCOVER_JS = """(conditionLabel) => {
     url: (location && location.href) || '',
   };
 
-  // Active condition only. Never climb to a wrapper that also contains Blind
-  // or any other condition card, and never fall back to the first page list.
+  // Active condition only. Exclusive card — never Blind's open list for Disabled.
   if (conditionLabel) {
     const card = findConditionCard(conditionLabel);
     if (!card) {
-      return { members: [], strategy: 'condition_scope_missing', ...meta };
+      return {
+        members: [],
+        strategy: 'condition_scope_missing',
+        scopeExclusive: false,
+        foreignSeedInScope: true,
+        conditionKey: conditionKey(conditionLabel),
+        ...meta,
+      };
     }
     const scoped = collect(card);
     return {
       members: scoped,
       strategy: scoped.length ? 'condition_scope' : 'condition_members_missing',
+      scopeExclusive: true,
+      foreignSeedInScope: false,
+      conditionKey: conditionKey(conditionLabel),
       ...meta,
     };
   }
@@ -7555,6 +7787,9 @@ async def _discover_special_person_members(
             "url": "",
         }
     # Back-compat: unit tests may mock evaluate to return a bare list.
+    scope_exclusive = False
+    foreign_seed_in_scope = False
+    condition_key = ""
     if isinstance(raw, list):
         members_raw = raw
         strategy = "legacy_list"
@@ -7564,6 +7799,7 @@ async def _discover_special_person_members(
         has_special = False
         has_marital = False
         url = ""
+        scope_exclusive = not bool(condition)
     else:
         data = raw if isinstance(raw, dict) else {}
         members_raw = list(data.get("members") or [])
@@ -7574,6 +7810,13 @@ async def _discover_special_person_members(
         has_special = bool(data.get("hasSpecial"))
         has_marital = bool(data.get("hasMarital"))
         url = str(data.get("url") or "")[:160]
+        if "scopeExclusive" in data:
+            scope_exclusive = bool(data.get("scopeExclusive"))
+        else:
+            # Back-compat for mocked discover payloads.
+            scope_exclusive = strategy == "condition_scope"
+        foreign_seed_in_scope = bool(data.get("foreignSeedInScope"))
+        condition_key = str(data.get("conditionKey") or "")
 
     filtered: list[dict[str, Any]] = []
     for row in members_raw:
@@ -7615,6 +7858,12 @@ async def _discover_special_person_members(
                 "checked": bool(row.get("checked")),
             }
         )
+    # Condition-scoped discovery must be exclusive; never treat Blind's open
+    # list as Disabled's scope.
+    if condition and strategy == "condition_scope" and not scope_exclusive:
+        strategy = "condition_scope_missing"
+        members = []
+        foreign_seed_in_scope = True
     return {
         "members": members,
         "strategy": strategy,
@@ -7624,6 +7873,9 @@ async def _discover_special_person_members(
         "has_special": has_special,
         "has_marital": has_marital,
         "url": url,
+        "scope_exclusive": scope_exclusive,
+        "foreign_seed_in_scope": foreign_seed_in_scope,
+        "condition_key": condition_key or _special_condition_key(condition),
     }
 
 
@@ -7644,18 +7896,30 @@ async def _wait_for_special_apply_to_members(
     while True:
         last = await _discover_special_person_members(page, condition)
         members = list(last.get("members") or [])
-        if members:
+        strategy = str(last.get("strategy") or "")
+        exclusive = bool(last.get("scope_exclusive"))
+        foreign = bool(last.get("foreign_seed_in_scope"))
+        ready = bool(members)
+        if condition:
+            ready = (
+                bool(members)
+                and strategy == "condition_scope"
+                and exclusive
+                and not foreign
+            )
+        if ready:
             logger.info(
                 "special_apply_to_ready call_id=%s strategy=%s count=%s "
-                "wait_ms=%.0f condition=%r",
+                "exclusive=%s foreign_seed=%s wait_ms=%.0f condition=%r",
                 call_id,
-                last.get("strategy"),
+                strategy,
                 len(members),
+                exclusive,
+                foreign,
                 (time.time() - started) * 1000,
                 (condition or "")[:40],
             )
             return last
-        strategy = str(last.get("strategy") or "")
         if strategy.startswith("wrong_screen"):
             break
         if time.time() >= deadline:
@@ -7665,10 +7929,12 @@ async def _wait_for_special_apply_to_members(
         except Exception:
             break
     logger.warning(
-        "special_apply_to_not_ready call_id=%s strategy=%s wait_ms=%.0f "
-        "has_apply_to=%s has_special=%s condition=%r",
+        "special_apply_to_not_ready call_id=%s strategy=%s exclusive=%s "
+        "foreign_seed=%s wait_ms=%.0f has_apply_to=%s has_special=%s condition=%r",
         call_id,
         last.get("strategy"),
+        last.get("scope_exclusive"),
+        last.get("foreign_seed_in_scope"),
         (time.time() - started) * 1000,
         last.get("has_apply_to"),
         last.get("has_special"),
@@ -7773,45 +8039,90 @@ _SPECIAL_MEMBER_CLICK_JS = """({ label, dupIndex, mode, condition }) => {
   const findConditionCard = (value) => {
     const key = conditionKey(value);
     if (!key) return null;
-    const others = ['cervical', 'breast', 'blind', 'pregnant', 'foster', 'disabled']
-      .filter((item) => item !== key);
-    const seeds = [];
+    // Same exclusive-scope rules as discover JS — never reuse Blind's list.
+    const KEYS = ['cervical', 'breast', 'blind', 'pregnant', 'foster', 'disabled'];
+    const textOf = (el) => soft(el.innerText || el.textContent || '');
+    const allSeeds = [];
     for (const el of document.querySelectorAll(
       'label, button, [role=checkbox], [role=button], li, div, span'
     )) {
-      const t = soft(el.innerText || el.textContent || '');
+      const t = textOf(el);
       if (!t || t.length > 140) continue;
       if (!/someone is |someone has |someone was /i.test(t)) continue;
-      if (conditionKey(t) !== key) continue;
-      seeds.push({ el, len: t.length });
+      const k = conditionKey(t);
+      if (!k || KEYS.indexOf(k) < 0) continue;
+      const low = t.toLowerCase();
+      const foreignInText = KEYS.some((x) => x !== k && low.includes(x));
+      allSeeds.push({ el, len: t.length, key: k, foreignInText });
     }
-    seeds.sort((a, b) => a.len - b.len);
-    for (const seed of seeds) {
-      let cur = seed.el;
-      for (let depth = 0; depth < 14 && cur; depth++) {
-        const t = soft(cur.innerText || '').toLowerCase();
-        if (
-          t
-          && t.includes(key)
-          && /who does this apply to/i.test(t)
-          && cur.querySelector('input[type=checkbox], [role=checkbox]')
-        ) {
-          return cur;
+    allSeeds.sort((a, b) => a.len - b.len);
+    let mySeeds = allSeeds.filter((s) => s.key === key && !s.foreignInText);
+    if (!mySeeds.length) mySeeds = allSeeds.filter((s) => s.key === key);
+    mySeeds = mySeeds.filter(
+      (s) => !mySeeds.some((o) => o !== s && s.el.contains(o.el) && o.el !== s.el)
+    );
+    if (!mySeeds.length) return null;
+    const applyHeadings = [];
+    for (const el of document.querySelectorAll(
+      'h1,h2,h3,h4,div,span,p,legend,label,strong,b,[role=heading]'
+    )) {
+      const t = textOf(el);
+      if (!t || t.length > 80) continue;
+      if (!/who does this apply to/i.test(t)) continue;
+      applyHeadings.push({ el, len: t.length });
+    }
+    applyHeadings.sort((a, b) => a.len - b.len);
+    const docFollows = (a, b) => {
+      if (!a || !b) return false;
+      if (a === b) return true;
+      return !!(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+    };
+    const between = (start, mid, end) => {
+      if (!start || !mid || !end || mid === start || mid === end) return false;
+      return docFollows(start, mid) && docFollows(mid, end);
+    };
+    const cardHasForeignSeed = (card, seedEl) => allSeeds.some((other) => {
+      if (other.key === key) return false;
+      if (!card.contains(other.el)) return false;
+      if (seedEl.contains(other.el)) return false;
+      return true;
+    });
+    const candidates = [];
+    for (const seed of mySeeds) {
+      for (const heading of applyHeadings) {
+        const headingOk = docFollows(seed.el, heading.el) || seed.el.contains(heading.el);
+        if (!headingOk) continue;
+        const foreignBetween = allSeeds.some((other) => {
+          if (other.key === key || other.el === seed.el) return false;
+          return between(seed.el, other.el, heading.el);
+        });
+        if (foreignBetween) continue;
+        let card = heading.el;
+        for (let depth = 0; depth < 16 && card; depth++) {
+          if (
+            card.contains(seed.el)
+            && card.querySelector('input[type=checkbox], [role=checkbox]')
+          ) {
+            const t = textOf(card).toLowerCase();
+            if (
+              t.includes(key)
+              && /who does this apply to/i.test(t)
+              && !cardHasForeignSeed(card, seed.el)
+            ) {
+              candidates.push({
+                el: card,
+                len: t.length,
+                headLen: heading.len,
+              });
+              break;
+            }
+          }
+          card = card.parentElement;
         }
-        cur = cur.parentElement;
       }
     }
-    const hits = [];
-    for (const el of document.querySelectorAll('section, article, li, fieldset, div')) {
-      const t = soft(el.innerText || '').toLowerCase();
-      if (!t || t.length > 2500 || !t.includes(key)) continue;
-      if (!/who does this apply to/i.test(t)) continue;
-      if (!el.querySelector('input[type=checkbox], [role=checkbox]')) continue;
-      const otherCount = others.filter((item) => t.includes(item)).length;
-      hits.push({ el, len: t.length, otherCount });
-    }
-    hits.sort((a, b) => a.otherCount - b.otherCount || a.len - b.len);
-    return hits.length ? hits[0].el : null;
+    candidates.sort((a, b) => a.len - b.len || a.headLen - b.headLen);
+    return candidates.length ? candidates[0].el : null;
   };
   const findRoot = () => {
     if (condition) return findConditionCard(condition);
@@ -8123,6 +8434,189 @@ async def _assign_one_special_person_member(
     return label
 
 
+async def _ensure_special_condition_ready_for_members(
+    page: Page,
+    session: LiveFormSession,
+    condition: str,
+    *,
+    call_id: str = "",
+) -> tuple[dict[str, Any], str]:
+    """Select/expand one condition, then return its own scoped member list.
+
+    Commits special_active_conditions only after the checkbox is verified and
+    THIS condition's exclusive member scope is established. Never reuses Blind's
+    open list for Disabled. On failure, prior active state is left unchanged.
+    """
+    cid = call_id or session.call_id
+    label = _resolve_special_condition_label(condition, session)
+    if not label:
+        raise RuntimeError(
+            "SPECIAL_PERSON_CLARIFY: Which condition does this person apply to?"
+        )
+    label_key = _special_condition_key(label)
+    prior_active = (session.filled.get("special_active_conditions") or "").strip()
+    active_key = _special_condition_key(
+        prior_active.split("|")[0] if prior_active else ""
+    )
+    prior_conditions = [
+        item.strip()
+        for item in (session.filled.get("special_conditions") or "").split(",")
+        if item.strip()
+    ]
+    already_known = any(
+        _special_condition_key(item) == label_key for item in prior_conditions if label_key
+    )
+    switching = bool(
+        (label_key and active_key and label_key != active_key)
+        or (label_key and not already_known)
+    )
+    logger.info(
+        "special_ensure_begin call_id=%s requested=%r prior_active=%r "
+        "switching=%s already_known=%s",
+        cid,
+        label,
+        prior_active[:60],
+        switching,
+        already_known,
+    )
+
+    def _exclusive_scope_ok(ready: dict[str, Any]) -> bool:
+        """True when members belong to THIS condition's exclusive card.
+
+        Mocked waits that omit scope_exclusive are treated as exclusive when
+        strategy is condition_scope (unit-test back-compat).
+        """
+        members_ok = bool(ready.get("members"))
+        strategy_ok = str(ready.get("strategy") or "") == "condition_scope"
+        if not members_ok or not strategy_ok:
+            return False
+        if "scope_exclusive" in ready:
+            return bool(ready.get("scope_exclusive")) and not bool(
+                ready.get("foreign_seed_in_scope")
+            )
+        return not bool(ready.get("foreign_seed_in_scope"))
+
+    async def _select_and_expand() -> dict[str, Any]:
+        await _select_special_condition_checkbox(
+            page, label, call_id=cid, multi=True
+        )
+        state = await _special_condition_checkbox_state(page, label)
+        logger.info(
+            "special_ensure_after_select call_id=%s label=%r found=%s checked=%s",
+            cid,
+            label,
+            state.get("found"),
+            state.get("checked"),
+        )
+        # multi path requires verified checkbox — fail closed if still unchecked.
+        if state.get("found") and not state.get("checked"):
+            raise RuntimeError(
+                "SPECIAL_PERSON_CLARIFY: I couldn't select "
+                f"{_short_special_condition_label(label)}. "
+                "Please say that condition again."
+            )
+        return await _wait_for_special_apply_to_members(
+            page, timeout_ms=4000, call_id=cid, condition=label
+        )
+
+    try:
+        if switching:
+            ready = await _select_and_expand()
+        else:
+            ready = await _wait_for_special_apply_to_members(
+                page, timeout_ms=4000, call_id=cid, condition=label
+            )
+            strategy_probe = str(ready.get("strategy") or "")
+            if strategy_probe.startswith("wrong_screen") or ready.get("has_marital"):
+                raise RuntimeError(
+                    "SPECIAL_PERSON_CLARIFY: This is not the Special Cases "
+                    "member list. Please say the condition again."
+                )
+            if not _exclusive_scope_ok(ready):
+                ready = await _select_and_expand()
+
+        if not _exclusive_scope_ok(ready):
+            try:
+                await page.wait_for_timeout(250)
+            except Exception:
+                pass
+            ready = await _wait_for_special_apply_to_members(
+                page, timeout_ms=2500, call_id=cid, condition=label
+            )
+
+        members = list(ready.get("members") or [])
+        strategy = str(ready.get("strategy") or "")
+        exclusive = _exclusive_scope_ok(ready)
+        foreign = bool(ready.get("foreign_seed_in_scope"))
+
+        if strategy.startswith("wrong_screen") or ready.get("has_marital"):
+            raise RuntimeError(
+                "SPECIAL_PERSON_CLARIFY: This is not the Special Cases "
+                "member list. Please say the condition again."
+            )
+        if strategy == "condition_scope_missing" or not exclusive:
+            raise RuntimeError(
+                "SPECIAL_PERSON_CLARIFY: I couldn't uniquely identify the "
+                f"{_short_special_condition_label(label)} section. "
+                "Please say that condition again."
+            )
+        if not members:
+            raise RuntimeError(
+                "SPECIAL_PERSON_CLARIFY: I couldn't find the member list for "
+                f"{_short_special_condition_label(label)}. "
+                "Please say the person's name again."
+            )
+        if strategy != "condition_scope":
+            raise RuntimeError(
+                "SPECIAL_PERSON_CLARIFY: I couldn't open the member list for "
+                f"{_short_special_condition_label(label)}. "
+                "Please say that condition again."
+            )
+    except Exception:
+        # Keep prior Blind (etc.) active — do not claim Disabled is ready.
+        logger.warning(
+            "special_ensure_failed call_id=%s requested=%r prior_active=%r",
+            cid,
+            label,
+            prior_active[:60],
+        )
+        raise
+
+    # Success only: merge selected conditions, commit active, refresh queue.
+    merged = list(prior_conditions)
+    if label not in merged and not _is_none_of_the_above_label(label):
+        merged.append(label)
+        if any(not _is_none_of_the_above_label(item) for item in merged):
+            merged = [
+                item for item in merged if not _is_none_of_the_above_label(item)
+            ]
+        session.filled["special_conditions"] = ", ".join(merged)
+    session.filled["special_active_conditions"] = label
+    queue = [
+        item
+        for item in (session.filled.get("special_person_queue") or "").split("|")
+        if item.strip()
+    ]
+    rest = [
+        item
+        for item in queue
+        if _special_condition_key(item) != label_key
+        and not _condition_has_assignment(session, item)
+    ]
+    session.filled["special_person_queue"] = "|".join([label] + rest)
+    logger.info(
+        "special_ensure_ok call_id=%s active=%r strategy=%s exclusive=%s "
+        "members=%s prior_active=%r",
+        cid,
+        label,
+        strategy,
+        exclusive,
+        len(members),
+        prior_active[:60],
+    )
+    return ready, label
+
+
 async def _assign_special_person_member(
     page: Page, answer: str, session: LiveFormSession
 ) -> None:
@@ -8145,9 +8639,6 @@ async def _assign_special_person_member(
     if not targets:
         # No condition was recorded. Keep the previous open-list assignment.
         targets = [""]
-    discovered: dict[str, Any] = {}
-    members: list[dict[str, Any]] = []
-    strategy = ""
     # Assign inside each active condition card. Do not reuse another card's checkbox.
     selected_labels: list[str] = []
     name_query = _member_query_without_condition(raw)
@@ -8156,13 +8647,24 @@ async def _assign_special_person_member(
         raise RuntimeError(
             "SPECIAL_PERSON_CLARIFY: Which household member does this apply to?"
         )
-    for condition in targets:
-        discovered = await _wait_for_special_apply_to_members(
-            page,
-            timeout_ms=4000,
-            call_id=session.call_id,
-            condition=condition,
-        )
+    resolved_targets = [
+        _resolve_special_condition_label(item, session) if item else ""
+        for item in targets
+    ]
+    # Serialize: for each condition — select → expand → assign → verify.
+    # Never stop after the first recognized condition when several were named.
+    for condition in resolved_targets:
+        if condition:
+            discovered, condition = await _ensure_special_condition_ready_for_members(
+                page, session, condition, call_id=session.call_id
+            )
+        else:
+            discovered = await _wait_for_special_apply_to_members(
+                page,
+                timeout_ms=4000,
+                call_id=session.call_id,
+                condition="",
+            )
         members = list(discovered.get("members") or [])
         strategy = str(discovered.get("strategy") or "")
         if not members:
@@ -8188,6 +8690,14 @@ async def _assign_special_person_member(
                 "SPECIAL_PERSON_CLARIFY: I couldn't find the 'Who does this apply to?' "
                 "member list. Please say the condition again."
             )
+        # Reinspect after expansion so member clicks never use a stale Blind list.
+        if condition:
+            rediscovered = await _discover_special_person_members(page, condition)
+            if list(rediscovered.get("members") or []) and str(
+                rediscovered.get("strategy") or ""
+            ) in {"condition_scope", "legacy_list"}:
+                members = list(rediscovered.get("members") or [])
+        assigned_here: list[str] = []
         for query in queries:
             label = await _assign_one_special_person_member(
                 page,
@@ -8197,14 +8707,17 @@ async def _assign_special_person_member(
                 raw_answer=raw,
                 condition=condition,
             )
+            assigned_here.append(label)
             if label not in selected_labels:
                 selected_labels.append(label)
+        if condition and assigned_here:
+            _record_special_assignment_pairs(session, [condition], assigned_here)
     logger.info(
         "special_person assigned call_id=%s labels=%r spoken=%r conditions=%r",
         session.call_id,
         selected_labels,
         (answer or "")[:40],
-        targets,
+        resolved_targets,
     )
     remembered = session.filled.get("special_person_assigned", "")
     bits = [x for x in remembered.split("|") if x]
@@ -8212,6 +8725,10 @@ async def _assign_special_person_member(
         if label not in bits:
             bits.append(label)
     session.filled["special_person_assigned"] = "|".join(bits)
+    # Per-turn labels are condition-scoped.  The cumulative list above is useful
+    # for recovery, but must never be reused when recording a newly selected
+    # condition (that caused prior Blind members to be attributed to Disabled).
+    session.filled["special_last_assigned_labels"] = "|".join(selected_labels)
     return
 
 
@@ -8261,50 +8778,512 @@ def _utterance_is_only_condition(raw: str) -> bool:
 
 
 def _condition_key_in_utterance(raw: str) -> str:
-    text = (raw or "").lower()
-    for key, pattern in (
-        ("cervical", r"\bcervical\b"),
-        ("breast", r"\bbreast\b"),
-        ("blind", r"\bblind\b"),
-        ("pregnant", r"\b(pregnant|pregnancy)\b"),
-        ("foster", r"\bfoster\b"),
-        ("disabled", r"\b(disabled|ssdi)\b"),
-    ):
-        if re.search(pattern, text):
-            return key
-    return ""
+    """Return the one affirmed condition named in a member-assignment answer.
+
+    An empty result means either no condition was named or multiple conditions
+    remain possible. Negated/excluded names never win because of match order.
+    """
+    affirmed = _affirmed_condition_keys(raw)
+    return affirmed[0] if len(affirmed) == 1 else ""
 
 
 def _member_query_without_condition(raw: str) -> str:
     text = re.sub(
+        r"\b(?:not|apart\s+from|except(?:\s+for)?|excluding|other\s+than)\s+"
+        r"(?:someone\s+is\s+)?(?:cervical cancer|breast cancer|pregnant|pregnancy|"
+        r"blind|foster care|ssdi|disabled)\b",
+        " ",
+        raw or "",
+        flags=re.I,
+    )
+    text = re.sub(
         r"\b(someone is|someone has|someone was|cervical cancer|breast cancer|"
         r"cervical|pregnant|pregnancy|blind|foster care|ssdi|disabled)\b",
         " ",
-        raw or "",
+        text,
+        flags=re.I,
+    )
+    text = re.sub(
+        r"\b(applies?|apply|to|for|is|the|condition|apart|from|except)\b",
+        " ",
+        text,
         flags=re.I,
     )
     return re.sub(r"\s+", " ", text).strip(" ,.")
 
 
 def _special_person_target_conditions(raw: str, session: LiveFormSession) -> list[str]:
+    """Resolve which condition(s) a member-assignment utterance targets.
+
+    An explicitly named condition always overrides stale Blind/etc. active state.
+    A bare member name may only use the single pending active condition — never
+    invent a target from the full selected-condition set or checked[0].
+    """
     active = [
         item
         for item in (session.filled.get("special_active_conditions") or "").split("|")
         if item.strip()
     ]
-    if not active:
-        active = [
-            item.strip()
-            for item in (session.filled.get("special_conditions") or "").split(",")
-            if item.strip() and not re.search(r"none of the above", item, re.I)
-        ]
-    named = _condition_key_in_utterance(raw)
-    if named:
+    keys = _affirmed_condition_keys(raw)
+    if len(keys) == 1:
+        named = keys[0]
         matched = [item for item in active if named in item.lower()]
         if matched:
             return matched
-        return [named]
-    return active
+        # Newly named condition takes precedence over stale active Blind/etc.
+        return [_resolve_special_condition_label(named, session)]
+    if len(keys) > 1:
+        # Same spoken member may apply to several affirmed conditions.
+        matched = [
+            item
+            for item in active
+            if any(key in item.lower() for key in keys)
+        ]
+        if matched:
+            return matched
+        # Resolve every named condition; do not stop after the first key.
+        resolved = [
+            _resolve_special_condition_label(key, session) for key in keys
+        ]
+        if len(resolved) == len(keys) and all(resolved):
+            return resolved
+        raise RuntimeError(
+            "SPECIAL_PERSON_CLARIFY: I heard more than one condition. "
+            "Please say one condition and the household member it applies to."
+        )
+    mentioned = bool(
+        re.search(
+            r"\b(cervical|breast|blind|pregnant|pregnancy|foster|disabled|ssdi)\b",
+            raw or "",
+            re.I,
+        )
+    )
+    if mentioned:
+        raise RuntimeError(
+            "SPECIAL_PERSON_CLARIFY: I heard a condition exclusion or correction. "
+            "Please say exactly one condition and the household member's name."
+        )
+    # Bare member name: only the explicitly pending active condition.
+    if len(active) == 1:
+        return active
+    if len(active) > 1:
+        raise RuntimeError(
+            "SPECIAL_PERSON_CLARIFY: I can't determine which condition is active. "
+            "Please say the condition and the household member's name."
+        )
+    # No active set yet — allow a single remembered condition as the pending target.
+    filled = [
+        item.strip()
+        for item in (session.filled.get("special_conditions") or "").split(",")
+        if item.strip() and not re.search(r"none of the above", item, re.I)
+    ]
+    if len(filled) == 1:
+        return filled
+    if len(filled) > 1:
+        raise RuntimeError(
+            "SPECIAL_PERSON_CLARIFY: Which condition does this person apply to? "
+            "Please say blind, disabled, or another condition, then the member's name."
+        )
+    # No pending condition recorded — open-list assign (caller passes condition="").
+    return []
+
+
+_PREGNANCY_ADD_DETAILS_JS = """({ memberName }) => {
+  const soft = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase()
+    .replace(/\\.(?=\\s|$)/g, '');
+  const visible = (el) => {
+    if (!el || !el.getBoundingClientRect) return false;
+    const r = el.getBoundingClientRect();
+    const style = getComputedStyle(el);
+    return r.width > 0 && r.height > 0
+      && style.display !== 'none' && style.visibility !== 'hidden';
+  };
+  const member = soft(memberName || '');
+  const buttons = [...document.querySelectorAll('button, [role=button], a')]
+    .filter((el) => {
+      if (!visible(el)) return false;
+      const text = soft(el.innerText || el.textContent || el.getAttribute('aria-label') || '');
+      return text === 'add details' || text.includes('add details');
+    });
+  if (!buttons.length) return { clicked: false, reason: 'add_details_missing' };
+
+  const scoreButton = (el) => {
+    let score = 0;
+    let cur = el;
+    for (let depth = 0; depth < 10 && cur; depth++) {
+      const text = soft(cur.innerText || cur.textContent || '');
+      if (member && text.includes(member)) score += 40 - depth;
+      if (/someone is pregnant|pregnant/.test(text)) score += 20 - depth;
+      if (/pregnancy details|who does this apply to/.test(text)) score += 5;
+      cur = cur.parentElement;
+    }
+    return score;
+  };
+  const ranked = buttons
+    .map((el) => ({ el, score: scoreButton(el) }))
+    .sort((a, b) => b.score - a.score);
+  const chosen = ranked[0];
+  if (member && chosen.score < 20) {
+    return { clicked: false, reason: 'member_add_details_missing', score: chosen.score };
+  }
+  chosen.el.click();
+  return { clicked: true, score: chosen.score };
+}"""
+
+
+_PREGNANCY_DETAILS_JS = """({ action, memberName }) => {
+  const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+  const soft = (s) => norm(s).toLowerCase().replace(/\\.(?=\\s|$)/g, '');
+  const visible = (el) => {
+    if (!el || !el.getBoundingClientRect) return false;
+    const r = el.getBoundingClientRect();
+    const style = getComputedStyle(el);
+    return r.width > 0 && r.height > 0
+      && style.display !== 'none' && style.visibility !== 'hidden'
+      && style.pointerEvents !== 'none';
+  };
+  const member = soft(memberName || '');
+  const modalCandidates = [
+    ...document.querySelectorAll('[role=dialog], [aria-modal=true], section, form, div')
+  ].filter((el) => {
+    if (!visible(el)) return false;
+    const text = norm(el.innerText || '');
+    return /pregnancy details/i.test(text)
+      && /number of babies expected/i.test(text)
+      && text.length < 2200;
+  }).sort((a, b) => {
+    const at = soft(a.innerText || '');
+    const bt = soft(b.innerText || '');
+    const aMember = member && at.includes(member) ? 0 : 1;
+    const bMember = member && bt.includes(member) ? 0 : 1;
+    if (aMember !== bMember) return aMember - bMember;
+    const ar = a.getBoundingClientRect();
+    const br = b.getBoundingClientRect();
+    return (ar.width * ar.height) - (br.width * br.height);
+  });
+  const modal = modalCandidates[0] || null;
+  if (!modal) return { open: false, count: null, reason: 'modal_missing' };
+  const modalText = soft(modal.innerText || '');
+  if (member && !modalText.includes(member) && action === 'read') {
+    // Prefer member-matched modal; still allow when Pointcare omits the name.
+  }
+
+  const labelNode = [...modal.querySelectorAll('label, span, div, p, h1, h2, h3')]
+    .find((el) => {
+      if (!visible(el)) return false;
+      const t = soft(el.innerText || el.textContent || '');
+      return t === 'number of babies expected' || t.startsWith('number of babies expected');
+    });
+  let stepperRoot = labelNode;
+  if (labelNode) {
+    let cur = labelNode.parentElement;
+    for (let depth = 0; depth < 8 && cur; depth++) {
+      const buttons = [...cur.querySelectorAll('button, [role=button]')].filter(visible);
+      if (buttons.length >= 2) {
+        stepperRoot = cur;
+        break;
+      }
+      cur = cur.parentElement;
+    }
+  }
+  stepperRoot = stepperRoot || modal;
+
+  const buttons = [...stepperRoot.querySelectorAll('button, [role=button]')].filter(visible);
+  const buttonMeta = (el) => {
+    const text = soft(
+      (el.getAttribute('aria-label') || '') + ' '
+      + (el.getAttribute('title') || '') + ' '
+      + (el.innerText || el.textContent || '')
+    );
+    const disabled = !!(el.disabled || el.getAttribute('aria-disabled') === 'true');
+    return { text, disabled, el };
+  };
+  const labeledMinus = buttons.find((el) => {
+    const { text } = buttonMeta(el);
+    return /(^|\\s)(minus|decrease|subtract|decrement)(\\s|$)/.test(text)
+      || /^[−–—-]$/.test(text);
+  });
+  const labeledPlus = buttons.find((el) => {
+    const { text } = buttonMeta(el);
+    return /(^|\\s)(plus|increase|increment)(\\s|$)/.test(text)
+      || /^\\+$/.test(text);
+  });
+
+  const readCountFrom = (root) => {
+    const input = [...root.querySelectorAll('input')].find((el) => {
+      if (!visible(el)) return false;
+      const type = (el.getAttribute('type') || 'text').toLowerCase();
+      return type === 'number' || type === 'text' || !type;
+    });
+    if (input) {
+      const raw = norm(input.value || input.getAttribute('aria-valuenow') || '');
+      if (/^\\d+$/.test(raw)) return Number(raw);
+    }
+    const aria = root.getAttribute && root.getAttribute('aria-valuenow');
+    if (aria && /^\\d+$/.test(norm(aria))) return Number(norm(aria));
+    const numeric = [...root.querySelectorAll('span, p, output, div, strong')]
+      .filter((el) => {
+        if (!visible(el)) return false;
+        const own = norm(
+          [...el.childNodes]
+            .filter((n) => n.nodeType === 3)
+            .map((n) => n.textContent || '')
+            .join('')
+        );
+        const full = norm(el.innerText || el.textContent || '');
+        const value = own || full;
+        return /^\\d+$/.test(value);
+      })
+      .sort((a, b) => {
+        const ar = a.getBoundingClientRect();
+        const br = b.getBoundingClientRect();
+        return (ar.width * ar.height) - (br.width * br.height);
+      });
+    if (numeric.length) {
+      const node = numeric[0];
+      const own = norm(
+        [...node.childNodes]
+          .filter((n) => n.nodeType === 3)
+          .map((n) => n.textContent || '')
+          .join('')
+      );
+      return Number(own || norm(node.innerText || node.textContent || ''));
+    }
+    return null;
+  };
+  const count = readCountFrom(stepperRoot);
+
+  // Icon-only steppers: pick the left/right buttons around the numeric value.
+  let plus = labeledPlus || null;
+  let minus = labeledMinus || null;
+  if ((!plus || !minus) && buttons.length >= 2) {
+    const sorted = buttons
+      .map((el) => ({ el, x: el.getBoundingClientRect().left }))
+      .sort((a, b) => a.x - b.x);
+    if (!minus) minus = sorted[0].el;
+    if (!plus) plus = sorted[sorted.length - 1].el;
+  }
+
+  if (action === 'plus' || action === 'minus') {
+    const target = action === 'plus' ? plus : minus;
+    if (!target) {
+      return { open: true, count, clicked: false, reason: action + '_missing' };
+    }
+    if (target.disabled || target.getAttribute('aria-disabled') === 'true') {
+      return { open: true, count, clicked: false, reason: action + '_disabled' };
+    }
+    target.click();
+    return { open: true, count, clicked: true, control: action };
+  }
+  if (action === 'done') {
+    const doneButtons = [...modal.querySelectorAll('button, [role=button]')].filter(visible);
+    const done = doneButtons.find((el) => /^done$/i.test(norm(el.innerText || el.textContent || '')));
+    if (!done) return { open: true, count, clicked: false, reason: 'done_missing' };
+    done.click();
+    return { open: true, count, clicked: true, control: 'done' };
+  }
+  return {
+    open: true,
+    count,
+    hasPlus: !!plus,
+    hasMinus: !!minus,
+    memberMatched: !member || modalText.includes(member),
+    reason: count === null ? 'count_missing' : '',
+  };
+}"""
+
+
+async def _complete_pregnancy_details(page: Page, *, member_name: str = "") -> None:
+    """Click modal Done once and require the modal to actually close."""
+    result = await page.evaluate(
+        _PREGNANCY_DETAILS_JS,
+        {"action": "done", "memberName": member_name or ""},
+    )
+    if not isinstance(result, dict) or not result.get("clicked"):
+        raise RuntimeError(
+            "PREGNANCY_BLOCKED: I couldn't click Done in Pregnancy Details."
+        )
+    try:
+        await _wait_for_pregnancy_modal(
+            page, open_expected=False, timeout_s=8, member_name=member_name
+        )
+    except RuntimeError as exc:
+        hints = await _visible_validation_hints(page)
+        detail = f" Pointcare says: {hints}." if hints else ""
+        raise RuntimeError(
+            "PREGNANCY_BLOCKED: Pregnancy Details stayed open after Done."
+            + detail
+        ) from exc
+
+
+async def _open_pregnancy_details_for_member(page: Page, member_name: str) -> None:
+    """Click the Add details control associated with the pregnant household member."""
+    modal = await _pregnancy_details_state(page, member_name=member_name)
+    if modal.get("open"):
+        return
+    result = await page.evaluate(
+        _PREGNANCY_ADD_DETAILS_JS, {"memberName": member_name or ""}
+    )
+    if not isinstance(result, dict) or not result.get("clicked"):
+        raise RuntimeError(
+            "PREGNANCY_CLARIFY: I couldn't open Add details for "
+            + ((member_name or "the pregnant household member").strip() or "the member")
+            + "."
+        )
+    await _wait_for_pregnancy_modal(
+        page, open_expected=True, member_name=member_name, timeout_s=8
+    )
+
+
+async def _pregnancy_details_state(
+    page: Page, *, member_name: str = ""
+) -> dict[str, Any]:
+    try:
+        state = await page.evaluate(
+            _PREGNANCY_DETAILS_JS,
+            {"action": "read", "memberName": member_name or ""},
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"PREGNANCY_CLARIFY: I couldn't inspect Pregnancy Details: {exc}"
+        ) from exc
+    return state if isinstance(state, dict) else {}
+
+
+async def _set_pregnancy_babies_count(
+    page: Page, answer: str, *, member_name: str = ""
+) -> int:
+    """Drive the modal stepper to a spoken integer and verify its visible value."""
+    requested = _parse_babies_count(answer)
+    if requested is None:
+        raise RuntimeError(
+            "PREGNANCY_CLARIFY: Please say one whole number for the babies expected, "
+            "for example one or two."
+        )
+    state = await _wait_for_pregnancy_modal(
+        page, open_expected=True, member_name=member_name
+    )
+    current = state.get("count")
+    if not isinstance(current, int):
+        raise RuntimeError(
+            "PREGNANCY_CLARIFY: I couldn't read the current number of babies. "
+            "Please leave Pregnancy Details open and say the number again."
+        )
+    if current == requested:
+        return requested
+    for _ in range(abs(requested - current)):
+        action = "plus" if current < requested else "minus"
+        result = await page.evaluate(
+            _PREGNANCY_DETAILS_JS,
+            {"action": action, "memberName": member_name or ""},
+        )
+        if not isinstance(result, dict) or not result.get("clicked"):
+            reason = (result or {}).get("reason") if isinstance(result, dict) else ""
+            raise RuntimeError(
+                f"PREGNANCY_CLARIFY: I couldn't use the {action} control for "
+                f"Number of babies expected ({reason or 'missing'})."
+            )
+        before = current
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            await page.wait_for_timeout(100)
+            state = await _pregnancy_details_state(page, member_name=member_name)
+            value = state.get("count")
+            if isinstance(value, int) and value != before:
+                current = value
+                break
+        if current == before:
+            raise RuntimeError(
+                "PREGNANCY_CLARIFY: The displayed baby count did not change. "
+                "Please say the number again."
+            )
+        if current == requested:
+            break
+    final = await _pregnancy_details_state(page, member_name=member_name)
+    if final.get("count") != requested:
+        raise RuntimeError(
+            "PREGNANCY_CLARIFY: I couldn't verify the requested baby count. "
+            "Please say the number again."
+        )
+    return requested
+
+
+async def _wait_for_pregnancy_modal(
+    page: Page,
+    *,
+    open_expected: bool,
+    timeout_s: float = 8,
+    member_name: str = "",
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_s
+    last: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        last = await _pregnancy_details_state(page, member_name=member_name)
+        if bool(last.get("open")) == open_expected:
+            return last
+        await page.wait_for_timeout(150)
+    state = "open" if open_expected else "close"
+    raise RuntimeError(
+        f"PREGNANCY_BLOCKED: Pregnancy Details did not {state}; "
+        f"last state was {last!r}"
+    )
+
+
+def _babies_count_question(session: LiveFormSession) -> str:
+    members = _pregnancy_assigned_members(session)
+    if len(members) == 1:
+        return f"How many babies are expected for {members[0]}?"
+    if len(members) > 1:
+        joined = _join_spoken_choices(members[:4])
+        return f"How many babies are expected for {joined}?"
+    return ELIG_QUESTIONS.get("babies_count") or "How many babies are expected?"
+
+
+def _parse_babies_count(answer: str) -> int | None:
+    """Parse a spoken baby count, including common multiple-birth wording."""
+    lowered = (answer or "").lower()
+    birth_words = {
+        1: (r"\bsingleton\b", r"\bsingle baby\b"),
+        2: (r"\btwins?\b",),
+        3: (r"\btriplets?\b",),
+        4: (r"\bquadruplets?\b",),
+        5: (r"\bquintuplets?\b",),
+        6: (r"\bsextuplets?\b",),
+        7: (r"\bseptuplets?\b",),
+        8: (r"\boctuplets?\b",),
+        9: (r"\bnonuplets?\b",),
+        10: (r"\bdecuplets?\b",),
+    }
+    values = _extract_age_numbers(lowered)
+    for count, patterns in birth_words.items():
+        if any(re.search(pattern, lowered, re.I) for pattern in patterns):
+            values.append(count)
+    unique = set(values)
+    if len(unique) != 1:
+        return None
+    value = unique.pop()
+    return value if 1 <= value <= 20 else None
+
+
+def _pregnancy_assigned_members(session: LiveFormSession) -> list[str]:
+    """Return household members assigned to the pregnancy condition."""
+    remembered = [
+        item
+        for item in (session.filled.get("pregnancy_members") or "").split("|")
+        if item.strip()
+    ]
+    if remembered:
+        return list(dict.fromkeys(remembered))
+    members: list[str] = []
+    pairs = session.filled.get("special_assignment_pairs", "")
+    for chunk in pairs.split("||"):
+        if ">>>" not in chunk:
+            continue
+        condition, mem_part = chunk.split(">>>", 1)
+        if "pregnant" not in condition.lower():
+            continue
+        members.extend(m for m in mem_part.split("&") if m.strip())
+    return list(dict.fromkeys(members))
 
 
 _TENS_WORDS = frozenset(
@@ -9240,8 +10219,21 @@ async def _submit_eligibility_answer(
                     + _income_range_natural_clarify(answer, period=period_key)
                 )
         session.filled["income_range"] = mapped
+        # Fresh Special Cases visit: drop prior-run session memory and uncheck
+        # any leftover Pointcare chips from an unfinished household check.
+        _clear_special_session_state(session)
+        await _clear_stale_special_condition_checkboxes(page)
+        session.filled["special_ui_cleared"] = "1"
         next_step = "special"
     elif step == "special":
+        # If this run has not recorded conditions yet, ignore leftover UI checks
+        # from the last run (special_more → special keeps special_conditions).
+        if (
+            not (session.filled.get("special_conditions") or "").strip()
+            and session.filled.get("special_ui_cleared") != "1"
+        ):
+            await _clear_stale_special_condition_checkboxes(page)
+            session.filled["special_ui_cleared"] = "1"
         labels = await _visible_choice_labels(page)
         selected = _map_special_condition_labels(answer, labels)
         if not selected:
@@ -9255,24 +10247,65 @@ async def _submit_eligibility_answer(
             selected = _map_special_condition_labels(answer, labels)
         if not selected and _utterance_is_household_member(answer, labels):
             checked = await _checked_real_special_conditions(page)
-            if len(checked) != 1:
+            if not checked:
                 raise RuntimeError(
                     "SPECIAL_CLARIFY: Which condition applies to that person? "
                     "Please say pregnant, blind, disabled, or another condition. "
                     "I have not selected anyone yet."
                 )
-            # The condition is already checked in the browser. Reconcile, then
-            # assign this member without clicking another condition.
-            session.filled["special_conditions"] = checked[0]
-            session.filled["special_active_conditions"] = checked[0]
-            session.filled["special_person_queue"] = checked[0]
+            pending = [
+                item
+                for item in (
+                    session.filled.get("special_active_conditions") or ""
+                ).split("|")
+                if item.strip()
+            ]
+            # Prefer the explicitly pending active condition — never silently
+            # fall back to the first checked box when several are selected.
+            if len(pending) == 1:
+                target = pending[0]
+            elif len(checked) == 1:
+                target = checked[0]
+            else:
+                raise RuntimeError(
+                    "SPECIAL_CLARIFY: Several conditions are selected. "
+                    "Please say which condition this person applies to, "
+                    "for example blind or disabled."
+                )
+            # Preserve any previously remembered conditions; never overwrite with
+            # only the currently open checked card.
+            prior = [
+                item.strip()
+                for item in (session.filled.get("special_conditions") or "").split(",")
+                if item.strip()
+            ]
+            merged = list(prior)
+            for label in checked:
+                if label not in merged:
+                    merged.append(label)
+            if target not in merged:
+                merged.append(target)
+            session.filled["special_conditions"] = ", ".join(merged)
+            session.filled["special_active_conditions"] = target
+            queue = [
+                item
+                for item in (session.filled.get("special_person_queue") or "").split("|")
+                if item.strip()
+            ]
+            if target not in queue:
+                queue = [target] + [
+                    item
+                    for item in queue
+                    if not _condition_has_assignment(session, item)
+                ]
+            session.filled["special_person_queue"] = "|".join(queue)
             ready = await _wait_for_special_apply_to_members(
-                page, timeout_ms=3500, call_id=call_id, condition=checked[0]
+                page, timeout_ms=3500, call_id=call_id, condition=target
             )
             if not list(ready.get("members") or []):
                 raise RuntimeError(
                     "SPECIAL_CLARIFY: I see "
-                    f"{_short_special_condition_label(checked[0])} is selected, "
+                    f"{_short_special_condition_label(target)} is selected, "
                     "but the member list is not open. Please say the condition again."
                 )
             await _assign_special_person_member(page, answer, session)
@@ -9302,23 +10335,66 @@ async def _submit_eligibility_answer(
                 "SPECIAL_CLARIFY: Please say which condition applies. "
                 + (f"Options include: {shown}." if shown else "Say blind, disabled, or none.")
             )
-        for label in selected:
-            await _select_special_condition_checkbox(
-                page,
-                label,
-                call_id=call_id,
-                multi=len(selected) > 1,
-            )
-        # Preserve prior selections when adding more conditions after special_more.
         prior = [
             item.strip()
             for item in (session.filled.get("special_conditions") or "").split(",")
             if item.strip()
         ]
+        prior_real = [
+            item
+            for item in prior
+            if not re.search(r"none of the above", item, re.I)
+        ]
+        # Follow-up conditions after Blind is already selected must use multi-safe
+        # verification so Blind's open apply-to list cannot fake Disabled.
+        use_multi = len(selected) > 1 or bool(prior_real)
+        failed: list[str] = []
+        for label in selected:
+            try:
+                await _select_special_condition_checkbox(
+                    page,
+                    label,
+                    call_id=call_id,
+                    multi=use_multi,
+                )
+            except RuntimeError as exc:
+                logger.warning(
+                    "special condition select failed call_id=%s label=%r err=%s",
+                    call_id,
+                    label,
+                    str(exc)[:120],
+                )
+                failed.append(label)
+                continue
+        # Re-verify readable unchecked boxes. Unreadable state is trusted when
+        # _select_special_condition_checkbox already accepted the click.
+        for label in selected:
+            if re.search(r"none of the above", label, re.I) or label in failed:
+                continue
+            state = await _special_condition_checkbox_state(page, label)
+            if state.get("found") and not state.get("checked"):
+                failed.append(label)
+        if failed:
+            names = ", ".join(_short_special_condition_label(item) for item in failed)
+            raise RuntimeError(
+                "SPECIAL_CLARIFY: I couldn't select "
+                + names
+                + ". Please say the missing condition again."
+            )
+        # Preserve prior selections when adding more conditions after special_more.
         merged = list(prior)
         for label in selected:
             if label not in merged:
                 merged.append(label)
+        # Drop "None of the above" once any real condition is present.
+        if any(
+            not re.search(r"none of the above", item, re.I) for item in merged
+        ):
+            merged = [
+                item
+                for item in merged
+                if not re.search(r"none of the above", item, re.I)
+            ]
         session.filled["special_conditions"] = ", ".join(merged)
         none_selected = len(selected) == 1 and re.search(
             r"none of the above", selected[0], re.I
@@ -9337,8 +10413,15 @@ async def _submit_eligibility_answer(
                 for label in selected
                 if not re.search(r"none of the above", label, re.I)
             ]
-            session.filled["special_person_queue"] = "|".join(need_person)
-            current = need_person[0]
+            # Keep any still-pending conditions from an earlier turn.
+            pending = [
+                item
+                for item in (session.filled.get("special_person_queue") or "").split("|")
+                if item.strip() and item not in need_person
+            ]
+            queued = need_person + pending
+            session.filled["special_person_queue"] = "|".join(queued)
+            current = queued[0]
             session.filled["special_active_conditions"] = current
             ready = await _wait_for_special_apply_to_members(
                 page, timeout_ms=3500, call_id=call_id, condition=current
@@ -9364,65 +10447,19 @@ async def _submit_eligibility_answer(
                 current, list(ready.get("members") or [])
             )
     elif step == "special_person":
-        before_assigned = [
-            item
-            for item in (session.filled.get("special_person_assigned") or "").split("|")
-            if item
-        ]
-        await _assign_special_person_member(page, answer, session)
-        after_assigned = [
-            item
-            for item in (session.filled.get("special_person_assigned") or "").split("|")
-            if item
-        ]
-        newly = [item for item in after_assigned if item not in before_assigned]
-        if not newly:
-            newly = after_assigned
-        active = [
-            item
-            for item in (session.filled.get("special_active_conditions") or "").split("|")
-            if item
-        ]
-        if not active:
-            active = [
-                item.strip()
-                for item in (session.filled.get("special_conditions") or "").split(",")
-                if item.strip()
-            ]
-        # Record only against the current active condition(s), not the whole queue.
-        _record_special_assignment_pairs(session, active[:1] or active, newly)
-        queue = [
-            item
-            for item in (session.filled.get("special_person_queue") or "").split("|")
-            if item.strip()
-        ]
-        current = (active[0] if active else "").strip()
-        remaining = [
-            item
-            for item in queue
-            if item.strip().lower() != current.lower()
-        ]
-        if remaining:
-            nxt = remaining[0]
-            session.filled["special_person_queue"] = "|".join(remaining)
-            session.filled["special_active_conditions"] = nxt
-            # Ensure the next condition is checked and its apply-to list is open.
-            try:
-                await _select_special_condition_checkbox(
-                    page, nxt, call_id=call_id, multi=True
-                )
-            except RuntimeError:
-                # Already checked is fine; still need the member list.
-                pass
-            ready = await _wait_for_special_apply_to_members(
-                page, timeout_ms=3500, call_id=call_id, condition=nxt
-            )
-            if not list(ready.get("members") or []):
+        # Condition-only turn: select/expand the named condition and ask who it
+        # applies to. Do NOT leave Blind active and ask for a bare member name.
+        if _utterance_is_only_condition(answer):
+            keys = _affirmed_condition_keys(answer)
+            if len(keys) != 1:
                 raise RuntimeError(
-                    "SPECIAL_CLARIFY: I need the member list for "
-                    f"{_short_special_condition_label(nxt)}. "
-                    "Please say that condition again."
+                    "SPECIAL_PERSON_CLARIFY: Please say exactly one condition, "
+                    "like blind or disabled."
                 )
+            label = _resolve_special_condition_label(keys[0], session)
+            ready, label = await _ensure_special_condition_ready_for_members(
+                page, session, label, call_id=call_id
+            )
             session.filled["special_member_labels"] = "|".join(
                 str(m.get("label") or "")
                 for m in (ready.get("members") or [])[:12]
@@ -9430,41 +10467,239 @@ async def _submit_eligibility_answer(
             )
             next_step = "special_person"
             spoken_override = _special_person_question(
-                nxt, list(ready.get("members") or [])
+                label, list(ready.get("members") or [])
             )
         else:
-            session.filled.pop("special_person_queue", None)
-            spoken_override = _special_more_confirm_speech(session)
-            next_step = "special_more"
+            before_assigned = {
+                item
+                for item in (
+                    session.filled.get("special_person_assigned") or ""
+                ).split("|")
+                if item
+            }
+            session.filled.pop("special_last_assigned_labels", None)
+            await _assign_special_person_member(page, answer, session)
+            newly = [
+                item
+                for item in (
+                    session.filled.get("special_last_assigned_labels") or ""
+                ).split("|")
+                if item
+            ]
+            if not newly:
+                # Backward-compatible for tests/integrations that patch the
+                # assignment helper: only use a true cumulative delta.
+                newly = [
+                    item
+                    for item in (
+                        session.filled.get("special_person_assigned") or ""
+                    ).split("|")
+                    if item and item not in before_assigned
+                ]
+            if not newly:
+                raise RuntimeError(
+                    "SPECIAL_PERSON_CLARIFY: I couldn't verify the household member "
+                    "for this condition. Please say the member's name again."
+                )
+            active = [
+                item
+                for item in (
+                    session.filled.get("special_active_conditions") or ""
+                ).split("|")
+                if item
+            ]
+            if not active:
+                active = [
+                    item.strip()
+                    for item in (
+                        session.filled.get("special_conditions") or ""
+                    ).split(",")
+                    if item.strip()
+                ]
+            # Record only against the current active condition(s), not the queue.
+            _record_special_assignment_pairs(session, active[:1] or active, newly)
+            queue = [
+                item
+                for item in (
+                    session.filled.get("special_person_queue") or ""
+                ).split("|")
+                if item.strip()
+            ]
+            current = (active[0] if active else "").strip()
+            remaining = [
+                item
+                for item in queue
+                if item.strip().lower() != current.lower()
+                and not _condition_has_assignment(session, item)
+            ]
+            if "pregnant" in current.lower():
+                # Pregnancy details are required per assigned member. Open the
+                # current member's Add details modal immediately, before asking
+                # about more conditions or moving to another queued condition.
+                pregnant_members = _pregnancy_assigned_members(session)
+                if pregnant_members:
+                    session.filled["pregnancy_members"] = "|".join(
+                        pregnant_members
+                    )
+                member_name = newly[0] if newly else (
+                    pregnant_members[0] if pregnant_members else ""
+                )
+                modal = await _pregnancy_details_state(
+                    page, member_name=member_name
+                )
+                if not modal.get("open"):
+                    await _open_pregnancy_details_for_member(page, member_name)
+                session.filled["pregnancy_details_pending"] = "true"
+                session.filled["pregnancy_details_immediate"] = "true"
+                session.filled["special_person_queue"] = "|".join(remaining)
+                next_step = "babies_count"
+                spoken_override = _babies_count_question(session)
+            elif remaining:
+                nxt = remaining[0]
+                session.filled["special_person_queue"] = "|".join(remaining)
+                session.filled["special_active_conditions"] = nxt
+                try:
+                    await _select_special_condition_checkbox(
+                        page, nxt, call_id=call_id, multi=True
+                    )
+                except RuntimeError:
+                    pass
+                ready = await _wait_for_special_apply_to_members(
+                    page, timeout_ms=3500, call_id=call_id, condition=nxt
+                )
+                if not list(ready.get("members") or []):
+                    raise RuntimeError(
+                        "SPECIAL_CLARIFY: I need the member list for "
+                        f"{_short_special_condition_label(nxt)}. "
+                        "Please say that condition again."
+                    )
+                session.filled["special_member_labels"] = "|".join(
+                    str(m.get("label") or "")
+                    for m in (ready.get("members") or [])[:12]
+                    if m.get("label")
+                )
+                next_step = "special_person"
+                spoken_override = _special_person_question(
+                    nxt, list(ready.get("members") or [])
+                )
+            else:
+                session.filled.pop("special_person_queue", None)
+                spoken_override = _special_more_confirm_speech(session)
+                next_step = "special_more"
     elif step == "special_more":
         if _is_yes(answer):
             next_step = "special"
         elif _is_no(answer):
             await _verify_special_selections_before_next(page, session)
             if "pregnant" in (session.filled.get("special_conditions") or "").lower():
-                try:
-                    await _click_cta(page, "Add details", attempts=2)
-                except Exception:
-                    pass
+                pregnant_members = _pregnancy_assigned_members(session)
+                if pregnant_members:
+                    session.filled["pregnancy_members"] = "|".join(pregnant_members)
+                member_name = pregnant_members[0] if pregnant_members else ""
+                modal = await _pregnancy_details_state(
+                    page, member_name=member_name
+                )
+                if not modal.get("open"):
+                    await _open_pregnancy_details_for_member(page, member_name)
+                else:
+                    # Modal already open from a prior duplicate No — do not re-click.
+                    logger.info(
+                        "pregnancy modal already open call_id=%s member=%r",
+                        call_id,
+                        member_name,
+                    )
+                session.filled["pregnancy_details_pending"] = "true"
                 next_step = "babies_count"
+                spoken_override = _babies_count_question(session)
             else:
-                await _click_cta(page, "Next", attempts=3)
+                await _click_cta(page, "Next", attempts=1)
                 await _wait_for_screen(page, ("programs",))
                 next_step, spoken_override = await _enter_programs_step(session, page)
         else:
-            raise RuntimeError(
-                "SPECIAL_MORE_CLARIFY: "
-                + _special_more_confirm_speech(session)
+            # Named condition instead of Yes/No — add it and enter member assignment.
+            labels = await _visible_choice_labels(page)
+            selected = _map_special_condition_labels(answer, labels)
+            if not selected:
+                keys = _affirmed_condition_keys(answer)
+                if len(keys) == 1:
+                    selected = [
+                        _resolve_special_condition_label(keys[0], session)
+                    ]
+            if len(selected) > 1:
+                raise RuntimeError(
+                    "SPECIAL_MORE_CLARIFY: Please say one condition to add, "
+                    "like blind or disabled, or Yes or No."
+                )
+            if len(selected) != 1 or _is_none_of_the_above_label(selected[0]):
+                raise RuntimeError(
+                    "SPECIAL_MORE_CLARIFY: "
+                    + _special_more_confirm_speech(session)
+                )
+            label = selected[0]
+            ready, label = await _ensure_special_condition_ready_for_members(
+                page, session, label, call_id=call_id
+            )
+            session.filled["special_member_labels"] = "|".join(
+                str(m.get("label") or "")
+                for m in (ready.get("members") or [])[:12]
+                if m.get("label")
+            )
+            next_step = "special_person"
+            spoken_override = _special_person_question(
+                label, list(ready.get("members") or [])
             )
     elif step == "babies_count":
-        await _strict_fill(page, "Number of babies", answer)
-        next_step = "due_date"
-    elif step == "due_date":
-        await _strict_fill(page, "Due date", _normalize_dob(answer))
-        await _click_cta(page, "Done", attempts=2)
-        await _click_cta(page, "Next", attempts=3)
-        await _wait_for_screen(page, ("programs",))
-        next_step, spoken_override = await _enter_programs_step(session, page)
+        pregnant_members = _pregnancy_assigned_members(session)
+        if pregnant_members:
+            session.filled["pregnancy_members"] = "|".join(pregnant_members)
+        member_name = pregnant_members[0] if pregnant_members else ""
+        count = await _set_pregnancy_babies_count(
+            page, answer, member_name=member_name
+        )
+        session.filled["pregnancy_babies_count"] = str(count)
+        await _complete_pregnancy_details(page, member_name=member_name)
+        session.filled.pop("pregnancy_details_pending", None)
+        immediate = session.filled.pop("pregnancy_details_immediate", None) == "true"
+        if immediate:
+            remaining = [
+                item
+                for item in (
+                    session.filled.get("special_person_queue") or ""
+                ).split("|")
+                if item.strip()
+            ]
+            if remaining:
+                nxt = remaining[0]
+                session.filled["special_active_conditions"] = nxt
+                await _select_special_condition_checkbox(
+                    page, nxt, call_id=call_id, multi=True
+                )
+                ready = await _wait_for_special_apply_to_members(
+                    page, timeout_ms=3500, call_id=call_id, condition=nxt
+                )
+                if not list(ready.get("members") or []):
+                    raise RuntimeError(
+                        "SPECIAL_CLARIFY: I need the member list for "
+                        f"{_short_special_condition_label(nxt)}. "
+                        "Please say that condition again."
+                    )
+                session.filled["special_member_labels"] = "|".join(
+                    str(m.get("label") or "")
+                    for m in (ready.get("members") or [])[:12]
+                    if m.get("label")
+                )
+                next_step = "special_person"
+                spoken_override = _special_person_question(
+                    nxt, list(ready.get("members") or [])
+                )
+            else:
+                session.filled.pop("special_person_queue", None)
+                next_step = "special_more"
+                spoken_override = _special_more_confirm_speech(session)
+        else:
+            await _click_cta(page, "Next", attempts=1)
+            await _wait_for_screen(page, ("programs",))
+            next_step, spoken_override = await _enter_programs_step(session, page)
     elif step == "programs":
         from .app_stage import handle_programs_decision
 
@@ -10171,20 +11406,27 @@ async def _special_condition_checkbox_state(
               }
               candidates.sort((a, b) => textOf(a).length - textOf(b).length);
 
-              const readInput = (root) => {
+              const readCheckbox = (root) => {
                 if (!root) return null;
-                if (root.tagName === 'INPUT' && root.type === 'checkbox') return root;
+                if (
+                  (root.tagName === 'INPUT' && root.type === 'checkbox')
+                  || (root.getAttribute && root.getAttribute('role') === 'checkbox')
+                ) return root;
                 if (root.tagName === 'LABEL' && root.control
                     && root.control.type === 'checkbox') {
                   return root.control;
                 }
                 if (root.querySelector) {
-                  const nested = root.querySelector('input[type=checkbox]');
+                  const nested = root.querySelector(
+                    'input[type=checkbox], [role=checkbox]'
+                  );
                   if (nested) return nested;
                 }
                 if (root.previousElementSibling
                     && root.previousElementSibling.matches
-                    && root.previousElementSibling.matches('input[type=checkbox]')) {
+                    && root.previousElementSibling.matches(
+                      'input[type=checkbox], [role=checkbox]'
+                    )) {
                   return root.previousElementSibling;
                 }
                 return null;
@@ -10193,12 +11435,16 @@ async def _special_condition_checkbox_state(
               for (const el of candidates) {
                 let cur = el;
                 for (let depth = 0; depth < 8 && cur; depth++) {
-                  const input = readInput(cur);
-                  if (input) {
+                  const box = readCheckbox(cur);
+                  if (box) {
                     return {
                       found: true,
-                      checked: !!input.checked,
-                      source: 'input',
+                      checked: !!(
+                        box.checked
+                        || box.getAttribute('aria-checked') === 'true'
+                        || box.getAttribute('data-state') === 'checked'
+                      ),
+                      source: box.tagName === 'INPUT' ? 'input' : 'role_checkbox',
                     };
                   }
                   const aria = cur.getAttribute && cur.getAttribute('aria-checked');
@@ -10213,19 +11459,9 @@ async def _special_condition_checkbox_state(
                   if (/\\b(selected|checked|active|pressed)\\b/.test(cls)) {
                     return { found: true, checked: true, source: 'class' };
                   }
-                  // Condition-scoped apply-to expansion under the same card.
-                  const block = (cur.innerText || '').toLowerCase();
-                  if (
-                    block.includes(want)
-                    && /who does this apply to/.test(block)
-                    && !/none of the above/.test(want)
-                  ) {
-                    return {
-                      found: true,
-                      checked: true,
-                      source: 'apply_to_near',
-                    };
-                  }
+                  // Never infer checkbox state from a nearby apply-to list.
+                  // A shared ancestor can contain Blind's expanded list while
+                  // Pregnant/Disabled remain unchecked.
                   cur = cur.parentElement;
                 }
               }
@@ -10242,6 +11478,71 @@ async def _special_condition_checkbox_state(
     except Exception:
         logger.exception("special checkbox state read failed label=%r", phrase[:60])
     return {"found": False, "checked": False, "source": "error"}
+
+
+async def _click_special_condition_control(page: Page, label: str) -> None:
+    """Click the checkbox belonging to one exact Special Cases condition.
+
+    Pointcare's custom checkbox can have no accessible name, so role locators
+    alone are insufficient. Resolve the shortest exact-text row and click its
+    own checkbox control; never a checkbox from an expanded member list.
+    """
+    phrase = (label or "").strip()
+    clicked: Any = None
+    try:
+        clicked = await page.evaluate(
+            """(phrase) => {
+              const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+              const want = norm(phrase);
+              const conditionRx = /someone is |someone has |someone was |none of the above/;
+              const textOf = (el) => norm(
+                el.innerText || el.textContent || el.getAttribute('aria-label') || ''
+              );
+              const texts = [...document.querySelectorAll(
+                'label, span, div, p, button, [role=button], [role=checkbox]'
+              )].filter((el) => textOf(el) === want);
+              texts.sort((a, b) => a.childElementCount - b.childElementCount);
+              for (const textNode of texts) {
+                let cur = textNode;
+                for (let depth = 0; depth < 6 && cur; depth++, cur = cur.parentElement) {
+                  const rowText = textOf(cur);
+                  if (rowText.length > want.length + 36) continue;
+                  const conditionHits = (rowText.match(
+                    /someone is |someone has |someone was |none of the above/g
+                  ) || []).length;
+                  if (conditionHits > 1 || !conditionRx.test(rowText)) continue;
+                  const controls = [];
+                  if (
+                    (cur.matches && cur.matches('input[type=checkbox], [role=checkbox]'))
+                  ) controls.push(cur);
+                  if (cur.querySelectorAll) {
+                    controls.push(...cur.querySelectorAll(
+                      'input[type=checkbox], [role=checkbox]'
+                    ));
+                  }
+                  const box = controls.find((candidate) => {
+                    const owner = norm(
+                      candidate.getAttribute('aria-label')
+                      || (candidate.parentElement && candidate.parentElement.innerText)
+                      || ''
+                    );
+                    return !owner || owner === want || owner.startsWith(want);
+                  });
+                  if (!box) continue;
+                  box.click();
+                  return true;
+                }
+              }
+              return false;
+            }""",
+            phrase,
+        )
+    except Exception:
+        logger.exception("special condition direct checkbox click failed label=%r", phrase)
+    # Unit-test mocks return AsyncMock objects; only a literal browser boolean
+    # is authoritative. Fall back to the existing resilient choice click.
+    if clicked is not True:
+        await _click_exact_choice(page, phrase)
 
 
 async def _special_next_enabled(page: Page) -> bool | None:
@@ -10380,13 +11681,36 @@ async def _special_condition_readonly_reinspect(
 async def _condition_scoped_members_ready(
     page: Page, label: str
 ) -> dict[str, Any] | None:
-    """Return discovery result when THIS condition's member list is visible."""
+    """Return discovery only when THIS condition's exclusive member scope is ready.
+
+    Rejects shared ancestors that still contain another condition's seed (e.g.
+    Blind's open list while locating Disabled).
+    """
     if _is_none_of_the_above_label(label):
         return None
     discovered = await _discover_special_person_members(page, label)
     members = list(discovered.get("members") or [])
     strategy = str(discovered.get("strategy") or "")
-    if members and strategy in {"condition_scope", "legacy_list"}:
+    exclusive = bool(discovered.get("scope_exclusive"))
+    foreign = bool(discovered.get("foreign_seed_in_scope"))
+    logger.info(
+        "special_scope_probe call_id=- condition=%r strategy=%s exclusive=%s "
+        "foreign_seed=%s members=%s",
+        (label or "")[:40],
+        strategy,
+        exclusive,
+        foreign,
+        len(members),
+    )
+    if (
+        members
+        and strategy == "condition_scope"
+        and exclusive
+        and not foreign
+    ):
+        return discovered
+    # legacy_list only when no condition key was requested (open-list path).
+    if members and strategy == "legacy_list" and not label:
         return discovered
     return None
 
@@ -10401,24 +11725,60 @@ async def _select_special_condition_checkbox(
     """Select one Special Cases option with at most one click — never toggle off.
 
     Isolated to the special step. Does not modify shared choice helpers.
-    Accept only when THIS condition's checkbox is verified or its own apply-to
-    member section is discoverable. Never invent success without evidence.
-    Do not require the page-wide member count to increase for a second condition.
+    Multi-condition path requires a verified checkbox for THIS condition — never
+    invent success from another condition's already-open member list.
     """
     is_none = _is_none_of_the_above_label(label)
-    state = await _special_condition_checkbox_state(page, label)
-    if state.get("found") and state.get("checked"):
+    state_before = await _special_condition_checkbox_state(page, label)
+    logger.info(
+        "special_condition_select_begin call_id=%s label=%r multi=%s "
+        "before_found=%s before_checked=%s",
+        call_id,
+        label,
+        multi,
+        state_before.get("found"),
+        state_before.get("checked"),
+    )
+    if state_before.get("found") and state_before.get("checked"):
         logger.info(
             "special condition already checked call_id=%s label=%r source=%s",
             call_id,
             label,
-            state.get("source"),
+            state_before.get("source"),
         )
+        if not is_none:
+            # Selection is true, but the apply-to section may still be collapsed.
+            scoped = await _condition_scoped_members_ready(page, label)
+            if scoped is None:
+                try:
+                    await page.evaluate(
+                        """(phrase) => {
+                          const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                          const needle = norm(phrase);
+                          const hit = [...document.querySelectorAll(
+                            'label, button, [role=checkbox], [role=button], div, span'
+                          )].find((el) => {
+                            const t = norm(el.innerText || el.textContent || '');
+                            return t && t.includes(needle) && t.length < 160;
+                          });
+                          if (hit && hit.scrollIntoView) {
+                            hit.scrollIntoView({ block: 'center' });
+                          }
+                          return !!hit;
+                        }""",
+                        label,
+                    )
+                    await page.wait_for_timeout(250)
+                except Exception:
+                    pass
+                await _wait_for_special_apply_to_members(
+                    page, timeout_ms=2500, call_id=call_id, condition=label
+                )
         return
 
     before_members = await _special_apply_to_member_count(page)
     started = time.time()
-    await _click_exact_choice(page, label)
+    await _click_special_condition_control(page, label)
 
     # Poll briefly for condition-specific evidence — never click a second time.
     last_after: dict[str, Any] = {"found": False, "checked": False, "source": "pending"}
@@ -10436,9 +11796,25 @@ async def _select_special_condition_checkbox(
                 attempt,
             )
             return
-        # Multi (or unreadable state): accept THIS condition's scoped member list
-        # even when page-wide member count did not increase.
-        if not is_none and (multi or not last_after.get("found")):
+        if attempt in (2, 5):
+            reinspect = await _special_condition_readonly_reinspect(page, label)
+            if reinspect.get("found") and reinspect.get("checked"):
+                logger.info(
+                    "special condition checked via reinspect call_id=%s label=%r "
+                    "source=%s",
+                    call_id,
+                    label,
+                    reinspect.get("source"),
+                )
+                return
+        # multi=True must NOT accept via any visible member list — Blind's open
+        # apply-to must never fake Disabled. First condition (multi=False) may
+        # still use exclusive scoped members when checkbox state is unreadable.
+        if (
+            not is_none
+            and not multi
+            and not last_after.get("found")
+        ):
             scoped = await _condition_scoped_members_ready(page, label)
             if scoped is not None:
                 logger.info(
@@ -10452,35 +11828,26 @@ async def _select_special_condition_checkbox(
                     (time.time() - started) * 1000,
                 )
                 return
-        if attempt in (2, 5):
-            reinspect = await _special_condition_readonly_reinspect(page, label)
-            if reinspect.get("found") and reinspect.get("checked"):
-                logger.info(
-                    "special condition checked via reinspect call_id=%s label=%r "
-                    "source=%s",
-                    call_id,
-                    label,
-                    reinspect.get("source"),
-                )
-                return
         if last_after.get("found") and not last_after.get("checked") and attempt >= 2:
             # Stable unchecked after one click — do NOT click again.
             break
-        # Single-select: page-wide apply-to growth is enough once state is unread.
-        if not is_none and not multi and not last_after.get("found"):
+        # First condition only: require genuine growth. Never treat another
+        # condition's already-open member list as proof this checkbox changed.
+        if (
+            not is_none
+            and not multi
+            and not last_after.get("found")
+            and before_members == 0
+        ):
             after_members = await _special_apply_to_member_count(page)
-            apply_heading = await _special_apply_to_heading_visible(page)
-            if after_members > before_members or (
-                apply_heading and after_members > 0
-            ):
+            if after_members > before_members:
                 logger.info(
-                    "special condition accepted via apply-to UI call_id=%s label=%r "
-                    "members_before=%s members_after=%s heading=%s attempt=%s",
+                    "special condition accepted via apply-to growth call_id=%s "
+                    "label=%r members_before=%s members_after=%s attempt=%s",
                     call_id,
                     label,
                     before_members,
                     after_members,
-                    apply_heading,
                     attempt,
                 )
                 return
@@ -10501,21 +11868,20 @@ async def _select_special_condition_checkbox(
         )
 
     after_members = await _special_apply_to_member_count(page)
-    apply_heading = await _special_apply_to_heading_visible(page)
-    # Single-select only: page-wide apply-to growth is enough when checkbox
-    # state is unreadable. Multi must use THIS condition's scoped evidence above.
-    if not is_none and not multi and (
-        after_members > before_members
-        or (apply_heading and after_members > 0)
+    # First condition only, and only when the member list actually grew.
+    if (
+        not is_none
+        and not multi
+        and before_members == 0
+        and after_members > before_members
     ):
         logger.info(
-            "special condition accepted via apply-to UI call_id=%s label=%r "
-            "members_before=%s members_after=%s heading=%s",
+            "special condition accepted via apply-to growth call_id=%s label=%r "
+            "members_before=%s members_after=%s",
             call_id,
             label,
             before_members,
             after_members,
-            apply_heading,
         )
         return
 

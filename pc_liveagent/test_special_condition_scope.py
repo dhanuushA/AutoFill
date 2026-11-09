@@ -65,6 +65,7 @@ class SpecialConditionScopeTests(unittest.IsolatedAsyncioTestCase):
         from pc_liveagent.live_form import _assign_special_person_member
 
         session = LiveFormSession(call_id="missing", url="https://example.test")
+        session.filled["special_conditions"] = "Someone has cervical cancer"
         session.filled["special_active_conditions"] = "Someone has cervical cancer"
 
         async def _wait(_page, *, timeout_ms=8000, call_id="", condition=""):
@@ -74,6 +75,10 @@ class SpecialConditionScopeTests(unittest.IsolatedAsyncioTestCase):
         click = AsyncMock(side_effect=AssertionError("must not click"))
         with (
             patch("pc_liveagent.live_form._wait_for_special_apply_to_members", new=_wait),
+            patch(
+                "pc_liveagent.live_form._select_special_condition_checkbox",
+                new=AsyncMock(),
+            ),
             patch("pc_liveagent.live_form._click_special_person_member", click),
         ):
             with self.assertRaises(RuntimeError) as ctx:
@@ -87,6 +92,7 @@ class SpecialConditionScopeTests(unittest.IsolatedAsyncioTestCase):
         from pc_liveagent.live_form import _assign_special_person_member
 
         session = LiveFormSession(call_id="ambig", url="https://example.test")
+        session.filled["special_conditions"] = "Someone has cervical cancer"
         session.filled["special_active_conditions"] = "Someone has cervical cancer"
 
         async def _wait(_page, *, timeout_ms=8000, call_id="", condition=""):
@@ -112,6 +118,7 @@ class SpecialConditionScopeTests(unittest.IsolatedAsyncioTestCase):
         from pc_liveagent.live_form import _assign_special_person_member
 
         session = LiveFormSession(call_id="verify", url="https://example.test")
+        session.filled["special_conditions"] = "Someone has cervical cancer"
         session.filled["special_active_conditions"] = "Someone has cervical cancer"
 
         async def _wait(_page, *, timeout_ms=8000, call_id="", condition=""):

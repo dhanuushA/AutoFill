@@ -383,8 +383,7 @@ class SignInRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ASK:", production)
 
     async def test_saved_account_keeps_intro_and_does_not_log_out(self) -> None:
-        from pc_liveagent.call_turn import begin_speech
-        from pc_liveagent.live_fill_prompt import LIVE_FILL_GREETING
+        from pc_liveagent.call_turn import begin_speech, identity_opening
         from pc_liveagent.live_form import start_live_form
 
         page = FakePage(DASHBOARD)
@@ -409,7 +408,7 @@ class SignInRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.elig_step, "")
         self.assertFalse(session.signed_in)
         self.assertTrue(session.welcome_done)
-        self.assertEqual(greeting, LIVE_FILL_GREETING)
+        self.assertEqual(greeting, identity_opening())
 
     async def test_logged_out_still_reaches_sign_in(self) -> None:
         from pc_liveagent.live_form import start_live_form

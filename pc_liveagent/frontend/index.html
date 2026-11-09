@@ -1,0 +1,964 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Pointcare FormFiller</title>
+  <style>
+    :root {
+      --navy: #0b3a6e;
+      --navy-deep: #072a52;
+      --blue: #1a5fad;
+      --blue-bright: #2563eb;
+      --blue-soft: #e8f1fb;
+      --blue-mid: #c5daf3;
+      --ink: #1c2430;
+      --muted: #5b6777;
+      --line: #d9e2ec;
+      --bg: #f3f6fa;
+      --white: #ffffff;
+      --danger: #b42318;
+      --ok: #067647;
+      --shadow: 0 8px 24px rgba(15, 40, 80, 0.08);
+      --radius: 14px;
+      --sidebar-w: 248px;
+    }
+
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+      color: var(--ink);
+      background: var(--bg);
+    }
+    button, input, select { font: inherit; }
+    a { color: var(--blue); }
+
+    .app {
+      display: grid;
+      grid-template-columns: var(--sidebar-w) 1fr;
+      min-height: 100vh;
+    }
+
+    .sidebar {
+      background: var(--white);
+      border-right: 1px solid var(--line);
+      padding: 1.25rem 1rem 1.5rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1.5rem;
+    }
+    .brand {
+      padding: 0.25rem 0.5rem 0.75rem;
+      border-bottom: 1px solid var(--line);
+    }
+    .brand-mark {
+      display: flex;
+      align-items: center;
+      gap: 0.65rem;
+      margin-bottom: 0.85rem;
+    }
+    .brand-mark svg { flex: 0 0 auto; }
+    .brand-name {
+      font-size: 0.95rem;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+      color: var(--navy);
+      line-height: 1.2;
+    }
+    .brand-sub {
+      font-size: 0.72rem;
+      color: var(--muted);
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    .product {
+      font-size: 1.05rem;
+      font-weight: 700;
+      color: var(--ink);
+      padding: 0 0.15rem;
+    }
+
+    .nav { display: flex; flex-direction: column; gap: 0.35rem; }
+    .nav button {
+      border: 0;
+      background: transparent;
+      text-align: left;
+      padding: 0.7rem 0.85rem;
+      border-radius: 10px;
+      color: var(--ink);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 0.7rem;
+      font-weight: 600;
+      font-size: 0.92rem;
+    }
+    .nav button:hover { background: #f5f8fc; }
+    .nav button.active {
+      background: var(--blue-soft);
+      color: var(--navy);
+    }
+    .nav svg { width: 18px; height: 18px; opacity: 0.9; flex: 0 0 auto; }
+
+    .main { display: flex; flex-direction: column; min-width: 0; }
+    .topbar {
+      height: 56px;
+      background: var(--white);
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 1.25rem;
+    }
+    .icon-btn {
+      border: 0;
+      background: transparent;
+      width: 36px;
+      height: 36px;
+      border-radius: 8px;
+      cursor: pointer;
+      color: var(--muted);
+    }
+    .icon-btn:hover { background: #f0f4f8; }
+    .user {
+      display: flex;
+      align-items: center;
+      gap: 0.65rem;
+      color: var(--muted);
+      font-size: 0.88rem;
+    }
+    .avatar {
+      width: 34px;
+      height: 34px;
+      border-radius: 50%;
+      background: var(--navy);
+      color: white;
+      display: grid;
+      place-items: center;
+      font-weight: 700;
+      font-size: 0.78rem;
+    }
+
+    .content {
+      padding: 1.5rem 1.25rem 2.5rem;
+      max-width: 920px;
+      width: 100%;
+      margin: 0 auto;
+    }
+
+    .card {
+      background: var(--white);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      padding: 1.5rem 1.5rem 1.25rem;
+    }
+    .card h1 {
+      margin: 0 0 0.35rem;
+      font-size: 1.55rem;
+      color: var(--ink);
+    }
+    .card .lede {
+      margin: 0 0 1.35rem;
+      color: var(--muted);
+      font-size: 0.95rem;
+      line-height: 1.45;
+    }
+
+    .section {
+      border-top: 1px solid var(--line);
+      padding-top: 1.15rem;
+      margin-top: 0.35rem;
+    }
+    .section-title {
+      display: flex;
+      align-items: center;
+      gap: 0.55rem;
+      color: var(--blue);
+      font-weight: 700;
+      font-size: 0.95rem;
+      margin-bottom: 0.95rem;
+    }
+    .section-title svg { width: 18px; height: 18px; }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.9rem 1rem;
+    }
+    .field { display: flex; flex-direction: column; gap: 0.35rem; }
+    .field.full { grid-column: 1 / -1; }
+    label {
+      font-size: 0.82rem;
+      font-weight: 600;
+      color: var(--ink);
+    }
+    label .req { color: #c62828; }
+    input, select {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 0.7rem 0.8rem;
+      background: #fff;
+      color: var(--ink);
+      outline: none;
+      width: 100%;
+    }
+    input:focus, select:focus {
+      border-color: var(--blue-mid);
+      box-shadow: 0 0 0 3px rgba(26, 95, 173, 0.12);
+    }
+    .hint {
+      font-size: 0.78rem;
+      color: var(--muted);
+      margin-top: 0.15rem;
+    }
+
+    .phone-row {
+      display: grid;
+      grid-template-columns: 92px 1fr;
+      gap: 0.55rem;
+    }
+
+    .actions {
+      display: flex;
+      justify-content: center;
+      gap: 0.75rem;
+      margin-top: 1.5rem;
+      padding-top: 0.25rem;
+    }
+    .actions.end {
+      justify-content: flex-end;
+    }
+    .btn {
+      border: 0;
+      border-radius: 8px;
+      padding: 0.72rem 1.25rem;
+      font-weight: 700;
+      cursor: pointer;
+      min-width: 132px;
+    }
+    .btn:disabled { opacity: 0.55; cursor: not-allowed; }
+    .btn-secondary {
+      background: #e9eef4;
+      color: var(--ink);
+    }
+    .btn-secondary:hover:not(:disabled) { background: #dde5ee; }
+    .btn-primary {
+      background: var(--navy);
+      color: white;
+    }
+    .btn-primary:hover:not(:disabled) { background: var(--navy-deep); }
+    .btn-ghost-blue {
+      background: var(--blue-soft);
+      color: var(--navy);
+      width: 100%;
+      min-width: 0;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.45rem;
+      font-weight: 700;
+    }
+    .btn-ghost-blue:hover { background: var(--blue-mid); }
+
+    .banner {
+      display: none;
+      margin-top: 1rem;
+      border-radius: 10px;
+      padding: 0.85rem 1rem;
+      font-size: 0.9rem;
+      line-height: 1.45;
+    }
+    .banner.show { display: block; }
+    .banner.ok {
+      background: #eaf7ef;
+      color: var(--ok);
+      border: 1px solid #b7e4c7;
+    }
+    .banner.err {
+      background: #fef3f2;
+      color: var(--danger);
+      border: 1px solid #fecdca;
+    }
+    .banner.warn {
+      background: #fff8eb;
+      color: #8a5a00;
+      border: 1px solid #f5d48a;
+    }
+    .banner.info {
+      background: var(--blue-soft);
+      color: var(--navy);
+      border: 1px solid var(--blue-mid);
+    }
+
+    .meta {
+      margin-top: 0.85rem;
+      font-size: 0.82rem;
+      color: var(--muted);
+      display: none;
+    }
+    .meta.show { display: block; }
+    .meta code, .card code {
+      background: #eef2f7;
+      padding: 0.1rem 0.35rem;
+      border-radius: 4px;
+      font-size: 0.85em;
+    }
+
+    .flow-steps {
+      display: grid;
+      gap: 0.7rem;
+      margin: 0 0 1.1rem;
+    }
+    .flow-step {
+      display: grid;
+      grid-template-columns: 28px 1fr;
+      gap: 0.75rem;
+      align-items: start;
+      padding: 0.85rem 1rem;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #fbfcfe;
+    }
+    .flow-step .num {
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      background: var(--navy);
+      color: #fff;
+      display: grid;
+      place-items: center;
+      font-size: 0.78rem;
+      font-weight: 700;
+    }
+    .flow-step strong { display: block; margin-bottom: 0.2rem; }
+    .flow-step span { color: var(--muted); font-size: 0.86rem; line-height: 1.4; }
+
+    .path-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 0.75rem;
+    }
+    @media (min-width: 760px) {
+      .path-grid { grid-template-columns: 1fr 1fr 1fr; }
+    }
+    .path-card {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 1rem;
+      background: #fff;
+      min-height: 100%;
+    }
+    .path-card .tag {
+      display: inline-block;
+      font-size: 0.7rem;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--blue);
+      background: var(--blue-soft);
+      border-radius: 999px;
+      padding: 0.2rem 0.55rem;
+      margin-bottom: 0.55rem;
+    }
+    .path-card h3 {
+      margin: 0 0 0.4rem;
+      font-size: 0.98rem;
+    }
+    .path-card p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.84rem;
+      line-height: 1.45;
+    }
+    .path-card .engine {
+      margin-top: 0.75rem;
+      font-size: 0.76rem;
+      color: var(--navy);
+      font-weight: 600;
+    }
+
+    /* Live agents */
+    .agent-list {
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+      margin-bottom: 1rem;
+    }
+    .agent-card {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 1rem 1.1rem 1.15rem;
+      background: #fff;
+    }
+    .agent-card-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.75rem;
+      margin-bottom: 0.95rem;
+    }
+    .agent-card-head .title {
+      font-weight: 700;
+      font-size: 1rem;
+      color: var(--ink);
+    }
+    .agent-card-tools {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+    .toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.45rem;
+      cursor: pointer;
+      user-select: none;
+    }
+    .toggle input { position: absolute; opacity: 0; width: 0; height: 0; }
+    .toggle-track {
+      width: 42px;
+      height: 24px;
+      border-radius: 999px;
+      background: #cfd8e3;
+      position: relative;
+      transition: background 0.15s ease;
+    }
+    .toggle-track::after {
+      content: "";
+      position: absolute;
+      top: 3px;
+      left: 3px;
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      background: #fff;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+      transition: transform 0.15s ease;
+    }
+    .toggle input:checked + .toggle-track {
+      background: var(--blue-bright);
+    }
+    .toggle input:checked + .toggle-track::after {
+      transform: translateX(18px);
+    }
+    .toggle-label {
+      font-size: 0.85rem;
+      font-weight: 600;
+      color: var(--muted);
+      min-width: 3.6rem;
+    }
+    .toggle input:checked ~ .toggle-label { color: var(--blue-bright); }
+    .icon-trash {
+      border: 0;
+      background: transparent;
+      color: #8a97a8;
+      width: 34px;
+      height: 34px;
+      border-radius: 8px;
+      cursor: pointer;
+      display: grid;
+      place-items: center;
+    }
+    .icon-trash:hover {
+      background: #fef3f2;
+      color: var(--danger);
+    }
+
+    .panel { display: none; }
+    .panel.active { display: block; }
+
+    .empty {
+      text-align: center;
+      color: var(--muted);
+      padding: 2rem 1rem;
+    }
+    .session-list { display: flex; flex-direction: column; gap: 0.75rem; }
+    .session-item {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 0.9rem 1rem;
+      background: #fbfcfe;
+    }
+    .session-item strong { display: block; margin-bottom: 0.25rem; }
+    .session-item .row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+      font-size: 0.85rem;
+      color: var(--muted);
+    }
+
+    @media (max-width: 860px) {
+      .app { grid-template-columns: 1fr; }
+      .sidebar {
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
+      }
+      .grid { grid-template-columns: 1fr; }
+      .nav { flex-direction: row; flex-wrap: wrap; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">
+          <svg width="40" height="40" viewBox="0 0 40 40" aria-hidden="true">
+            <rect width="40" height="40" rx="10" fill="#0b3a6e"/>
+            <path d="M8 26 L20 10 L32 26 Z" fill="none" stroke="#fff" stroke-width="2.2"/>
+            <path d="M14 26 L20 17 L26 26" fill="none" stroke="#7eb6ff" stroke-width="2"/>
+            <circle cx="20" cy="26" r="2.2" fill="#7eb6ff"/>
+          </svg>
+          <div>
+            <div class="brand-name">DataTerrain</div>
+            <div class="brand-sub">Health AI</div>
+          </div>
+        </div>
+        <div class="product">Pointcare FormFiller</div>
+      </div>
+
+      <nav class="nav" aria-label="Primary">
+        <button type="button" class="active" data-view="start">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M16 11c1.66 0 3-1.57 3-3.5S17.66 4 16 4s-3 1.57-3 3.5 1.34 3.5 3 3.5zM8 11c1.66 0 3-1.57 3-3.5S9.66 4 8 4 5 5.57 5 7.5 6.34 11 8 11z"/>
+            <path d="M8 13c-2.67 0-8 1.34-8 4v2h10v-2c0-1.1.45-2.1 1.17-2.9C10.2 13.4 9.13 13 8 13zm8 0c-.29 0-.58.02-.86.05 1.16.84 1.86 1.98 1.86 3.45v2h8v-2c0-2.66-5.33-4-9-4z"/>
+          </svg>
+          Start call
+        </button>
+        <button type="button" data-view="agents">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
+            <circle cx="9" cy="7" r="4"/>
+            <path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/>
+          </svg>
+          Live agents
+        </button>
+        <button type="button" data-view="calls">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6A19.79 19.79 0 0 1 2.12 4.18 2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.12.9.33 1.77.62 2.6a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.48-1.19a2 2 0 0 1 2.11-.45c.83.29 1.7.5 2.6.62A2 2 0 0 1 22 16.92z"/>
+          </svg>
+          Calls
+        </button>
+        <button type="button" data-view="settings">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="3"/>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+          </svg>
+          Settings
+        </button>
+      </nav>
+    </aside>
+
+    <div class="main">
+      <header class="topbar">
+        <button type="button" class="icon-btn" aria-label="Menu" title="Menu">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M4 7h16M4 12h16M4 17h16"/>
+          </svg>
+        </button>
+        <div class="user">
+          <span>admin@dataterrain.com</span>
+          <div class="avatar" aria-hidden="true">AD</div>
+        </div>
+      </header>
+
+      <main class="content">
+        <!-- Start call -->
+        <section id="view-start" class="panel active">
+          <div class="card">
+            <h1>Pointcare FormFiller</h1>
+            <p class="lede">
+              Add a patient and start an outreach call for PointCare registration and form help.
+            </p>
+
+            <form id="call-form" novalidate>
+              <div class="section" style="border-top:0;padding-top:0;margin-top:0;">
+                <div class="section-title">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
+                    <circle cx="12" cy="7" r="4"/>
+                  </svg>
+                  Patient information
+                </div>
+                <div class="grid">
+                  <div class="field">
+                    <label for="first_name">First name <span class="req">*</span></label>
+                    <input id="first_name" name="first_name" autocomplete="given-name" placeholder="Enter first name" required />
+                  </div>
+                  <div class="field">
+                    <label for="last_name">Last name <span class="req">*</span></label>
+                    <input id="last_name" name="last_name" autocomplete="family-name" placeholder="Enter last name" required />
+                  </div>
+                  <div class="field full">
+                    <label for="form_name">Reason for call</label>
+                    <input id="form_name" name="form_name" placeholder="e.g. PointCare eligibility and application" />
+                  </div>
+                </div>
+              </div>
+
+              <div class="section">
+                <div class="section-title">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6A19.79 19.79 0 0 1 2.12 4.18 2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.12.9.33 1.77.62 2.6a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.48-1.19a2 2 0 0 1 2.11-.45c.83.29 1.7.5 2.6.62A2 2 0 0 1 22 16.92z"/>
+                  </svg>
+                  Contact information
+                </div>
+                <div class="grid">
+                  <div class="field full">
+                    <label for="phone_local">Patient phone <span class="req">*</span></label>
+                    <div class="phone-row">
+                      <select id="phone_cc" aria-label="Country code">
+                        <option value="+1" selected>+1</option>
+                        <option value="+91">+91</option>
+                      </select>
+                      <input id="phone_local" name="phone_local" inputmode="tel" autocomplete="tel-national" placeholder="(302) 555-0199" required />
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="actions">
+                <button type="button" class="btn btn-secondary" id="btn-cancel">Cancel</button>
+                <button type="submit" class="btn btn-primary" id="btn-submit">Start call</button>
+              </div>
+            </form>
+
+            <div id="banner" class="banner" role="status" aria-live="polite"></div>
+            <div id="meta" class="meta"></div>
+          </div>
+        </section>
+
+        <!-- Live agents -->
+        <section id="view-agents" class="panel">
+          <div class="card">
+            <h1>Live agents</h1>
+            <p class="lede">
+              People who can take over a call when the patient asks for live help.
+            </p>
+
+            <div id="agent-list" class="agent-list" aria-live="polite"></div>
+
+            <button type="button" class="btn btn-ghost-blue" id="btn-add-agent">
+              <span aria-hidden="true">+</span> Add another agent
+            </button>
+
+            <div id="agents-banner" class="banner" role="status" aria-live="polite"></div>
+
+            <div class="actions end">
+              <button type="button" class="btn btn-secondary" id="btn-agents-discard">Discard changes</button>
+              <button type="button" class="btn btn-primary" id="btn-agents-save">Save settings</button>
+            </div>
+          </div>
+        </section>
+
+        <!-- Calls -->
+        <section id="view-calls" class="panel">
+          <div class="card">
+            <h1>Calls</h1>
+            <p class="lede">Patients you have started from Pointcare FormFiller.</p>
+            <div id="calls-empty" class="empty">No calls yet.</div>
+            <div id="calls-list" class="session-list"></div>
+          </div>
+        </section>
+
+        <!-- Settings -->
+        <section id="view-settings" class="panel">
+          <div class="card">
+            <h1>Settings</h1>
+            <p class="lede">Account and notification preferences.</p>
+            <div class="section">
+              <div class="section-title">Organization</div>
+              <p style="margin:0;color:var(--muted);font-size:0.92rem;line-height:1.55;">
+                DataTerrain · Pointcare FormFiller<br />
+                Signed in as admin@dataterrain.com
+              </p>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      const AGENTS_KEY = "pcff_live_agents_v1";
+      const DRAFTS_KEY = "pcff_call_drafts";
+      const DEFAULT_AGENTS = [
+        { id: "a1", name: "Kadher", cc: "+91", phone: "(730) 523-0194", active: true },
+        { id: "a2", name: "Bharath", cc: "+91", phone: "(987) 654-3210", active: false },
+      ];
+
+      const form = document.getElementById("call-form");
+      const banner = document.getElementById("banner");
+      const meta = document.getElementById("meta");
+      const agentList = document.getElementById("agent-list");
+      const agentsBanner = document.getElementById("agents-banner");
+
+      let agents = loadAgents();
+      let agentsSnapshot = JSON.stringify(agents);
+      let drafts = JSON.parse(localStorage.getItem(DRAFTS_KEY) || "[]");
+
+      function loadAgents() {
+        try {
+          const raw = JSON.parse(localStorage.getItem(AGENTS_KEY) || "null");
+          if (Array.isArray(raw) && raw.length) return raw;
+        } catch (_) {}
+        return DEFAULT_AGENTS.map((a) => ({ ...a }));
+      }
+
+      function uid() {
+        return "a" + Math.random().toString(36).slice(2, 9);
+      }
+
+      function showView(name) {
+        document.querySelectorAll(".panel").forEach((el) => {
+          el.classList.toggle("active", el.id === "view-" + name);
+        });
+        document.querySelectorAll(".nav button").forEach((btn) => {
+          btn.classList.toggle("active", btn.dataset.view === name);
+        });
+        if (name === "calls") renderDrafts();
+        if (name === "agents") renderAgents();
+      }
+
+      document.querySelectorAll(".nav button").forEach((btn) => {
+        btn.addEventListener("click", () => showView(btn.dataset.view));
+      });
+
+      function digitsOnly(value) {
+        return String(value || "").replace(/\D/g, "");
+      }
+
+      function buildE164() {
+        const cc = document.getElementById("phone_cc").value;
+        const local = digitsOnly(document.getElementById("phone_local").value);
+        if (!local) return "";
+        if (local.length >= 10 && (local.startsWith("1") || local.startsWith("91"))) {
+          return "+" + local;
+        }
+        return cc + local;
+      }
+
+      function setBanner(el, kind, html) {
+        el.className = "banner show " + kind;
+        el.innerHTML = html;
+      }
+
+      function clearBanner(el) {
+        el.className = "banner";
+        el.innerHTML = "";
+      }
+
+      /* ---- Start call (draft only) ---- */
+      document.getElementById("btn-cancel").addEventListener("click", () => {
+        form.reset();
+        clearBanner(banner);
+        meta.className = "meta";
+        meta.innerHTML = "";
+      });
+
+      form.addEventListener("submit", (ev) => {
+        ev.preventDefault();
+        const first = document.getElementById("first_name").value.trim();
+        const last = document.getElementById("last_name").value.trim();
+        const phone = buildE164();
+        const formName = document.getElementById("form_name").value.trim();
+
+        if (!first || !last) {
+          setBanner(banner, "err", "First name and last name are required for the identity check.");
+          return;
+        }
+        if (digitsOnly(phone).length < 10) {
+          setBanner(banner, "err", "Enter a valid patient phone number (at least 10 digits).");
+          return;
+        }
+
+        const draft = {
+          name: (first + " " + last).replace(/\s+/g, " ").trim(),
+          phone,
+          form_name: formName || "Pointcare FormFiller",
+          when: new Date().toLocaleString(),
+        };
+        drafts.push(draft);
+        drafts = drafts.slice(-20);
+        localStorage.setItem(DRAFTS_KEY, JSON.stringify(drafts));
+
+        setBanner(
+          banner,
+          "ok",
+          `Ready for <strong>${draft.name}</strong> at ${draft.phone}.`
+        );
+        meta.className = "meta";
+        meta.innerHTML = "";
+      });
+
+      function renderDrafts() {
+        const empty = document.getElementById("calls-empty");
+        const list = document.getElementById("calls-list");
+        list.innerHTML = "";
+        if (!drafts.length) {
+          empty.style.display = "block";
+          return;
+        }
+        empty.style.display = "none";
+        drafts.slice().reverse().forEach((c) => {
+          const item = document.createElement("div");
+          item.className = "session-item";
+          item.innerHTML =
+            `<strong>${c.name || "Patient"}</strong>` +
+            `<div class="row">` +
+            `<span>${c.phone || ""}</span>` +
+            `<span>${c.form_name || ""}</span>` +
+            `<span>${c.when || ""}</span>` +
+            `</div>`;
+          list.appendChild(item);
+        });
+      }
+
+      /* ---- Live agents ---- */
+      function renderAgents() {
+        agentList.innerHTML = "";
+        if (!agents.length) {
+          agentList.innerHTML =
+            '<div class="empty">No agents yet. Add a transfer destination below.</div>';
+          return;
+        }
+        agents.forEach((agent, index) => {
+          const card = document.createElement("div");
+          card.className = "agent-card";
+          card.dataset.id = agent.id;
+          const displayName = (agent.name || "").trim() || `Agent ${index + 1}`;
+          card.innerHTML =
+            `<div class="agent-card-head">` +
+            `<div class="title" data-role="title">${escapeHtml(displayName)}</div>` +
+            `<div class="agent-card-tools">` +
+            `<label class="toggle">` +
+            `<input type="checkbox" data-role="active" ${agent.active ? "checked" : ""} />` +
+            `<span class="toggle-track" aria-hidden="true"></span>` +
+            `<span class="toggle-label" data-role="active-label">${agent.active ? "Active" : "Inactive"}</span>` +
+            `</label>` +
+            `<button type="button" class="icon-trash" data-role="delete" title="Remove agent" aria-label="Remove agent">` +
+            `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">` +
+            `<path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/>` +
+            `</svg></button>` +
+            `</div></div>` +
+            `<div class="grid">` +
+            `<div class="field full">` +
+            `<label>Name</label>` +
+            `<input data-role="name" value="${escapeAttr(agent.name || "")}" placeholder="Agent name" />` +
+            `</div>` +
+            `<div class="field full">` +
+            `<label>Phone Number</label>` +
+            `<div class="phone-row">` +
+            `<select data-role="cc">` +
+            `<option value="+1"${agent.cc === "+1" ? " selected" : ""}>+1</option>` +
+            `<option value="+91"${agent.cc === "+91" ? " selected" : ""}>+91</option>` +
+            `</select>` +
+            `<input data-role="phone" value="${escapeAttr(agent.phone || "")}" inputmode="tel" placeholder="(730) 523-0194" />` +
+            `</div></div></div>`;
+
+          const nameInput = card.querySelector('[data-role="name"]');
+          const titleEl = card.querySelector('[data-role="title"]');
+          const activeInput = card.querySelector('[data-role="active"]');
+          const activeLabel = card.querySelector('[data-role="active-label"]');
+          const ccSelect = card.querySelector('[data-role="cc"]');
+          const phoneInput = card.querySelector('[data-role="phone"]');
+
+          nameInput.addEventListener("input", () => {
+            agent.name = nameInput.value;
+            titleEl.textContent = nameInput.value.trim() || `Agent ${index + 1}`;
+          });
+          activeInput.addEventListener("change", () => {
+            agent.active = activeInput.checked;
+            activeLabel.textContent = agent.active ? "Active" : "Inactive";
+          });
+          ccSelect.addEventListener("change", () => {
+            agent.cc = ccSelect.value;
+          });
+          phoneInput.addEventListener("input", () => {
+            agent.phone = phoneInput.value;
+          });
+          card.querySelector('[data-role="delete"]').addEventListener("click", () => {
+            agents = agents.filter((a) => a.id !== agent.id);
+            clearBanner(agentsBanner);
+            renderAgents();
+          });
+
+          agentList.appendChild(card);
+        });
+      }
+
+      function escapeHtml(s) {
+        return String(s)
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;");
+      }
+      function escapeAttr(s) {
+        return escapeHtml(s).replace(/'/g, "&#39;");
+      }
+
+      document.getElementById("btn-add-agent").addEventListener("click", () => {
+        agents.push({
+          id: uid(),
+          name: "",
+          cc: "+1",
+          phone: "",
+          active: true,
+        });
+        clearBanner(agentsBanner);
+        renderAgents();
+        const last = agentList.querySelector(".agent-card:last-child [data-role='name']");
+        if (last) last.focus();
+      });
+
+      document.getElementById("btn-agents-discard").addEventListener("click", () => {
+        agents = loadAgents();
+        agentsSnapshot = JSON.stringify(agents);
+        clearBanner(agentsBanner);
+        setBanner(agentsBanner, "warn", "Changes discarded. Reloaded last saved agents.");
+        renderAgents();
+      });
+
+      document.getElementById("btn-agents-save").addEventListener("click", () => {
+        const cleaned = agents.map((a) => ({
+          id: a.id || uid(),
+          name: (a.name || "").trim(),
+          cc: a.cc || "+1",
+          phone: (a.phone || "").trim(),
+          active: !!a.active,
+        }));
+        const missing = cleaned.find((a) => !a.name || digitsOnly(a.phone).length < 10);
+        if (missing) {
+          setBanner(
+            agentsBanner,
+            "err",
+            "Each agent needs a name and a phone number with at least 10 digits."
+          );
+          return;
+        }
+        agents = cleaned;
+        localStorage.setItem(AGENTS_KEY, JSON.stringify(agents));
+        agentsSnapshot = JSON.stringify(agents);
+        const activeCount = agents.filter((a) => a.active).length;
+        setBanner(
+          agentsBanner,
+          "ok",
+          `Saved ${agents.length} agent${agents.length === 1 ? "" : "s"}` +
+            ` (${activeCount} active).`
+        );
+        renderAgents();
+      });
+
+      renderAgents();
+      renderDrafts();
+    })();
+  </script>
+</body>
+</html>
