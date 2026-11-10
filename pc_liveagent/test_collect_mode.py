@@ -262,9 +262,9 @@ class CallTurnTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Google", r.speech)
         self.assertEqual(r.phase, "sign_in")
 
-    async def test_identity_yes_continues_to_language(self) -> None:
+    async def test_identity_yes_continues_to_mode_choice(self) -> None:
         from pc_liveagent.call_turn import register_outbound_caller
-        from pc_liveagent.live_fill_prompt import LIVE_FILL_GREETING
+        from pc_liveagent.mode_router import MODE_INTRO_AND_MENU
 
         call_id = "turn-id-yes"
         await drop_controller(call_id)
@@ -274,9 +274,17 @@ class CallTurnTests(unittest.IsolatedAsyncioTestCase):
         ctrl.caller_name = "Sam Lee"
         ctrl.last_speech = "Hi, am I speaking with Sam Lee?"
         r = await process_user_turn(call_id, "Yes")
-        self.assertEqual(r.phase, "language")
+        self.assertEqual(r.phase, "mode_choice")
         self.assertEqual(r.detail, "identity_confirmed")
-        self.assertEqual(r.speech, LIVE_FILL_GREETING)
+        self.assertEqual(r.speech, MODE_INTRO_AND_MENU)
+        low = r.speech.lower()
+        self.assertIn("three options", low)
+        self.assertIn("option a", low)
+        self.assertIn("live agent", low)
+        self.assertIn("option b", low)
+        self.assertIn("guide me through", low)
+        self.assertIn("option c", low)
+        self.assertIn("which option do you want", low)
         self.assertFalse(r.end_call)
 
     async def test_identity_no_ends_call(self) -> None:
@@ -292,6 +300,92 @@ class CallTurnTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.detail, "wrong_person")
         self.assertTrue(r.end_call)
         self.assertEqual(r.speech, WRONG_PERSON_CLOSING)
+
+    async def test_mode_live_agent_transfers_same_call(self) -> None:
+        call_id = "turn-mode-live"
+        await drop_controller(call_id)
+        from pc_liveagent.call_turn import register_outbound_caller
+
+        register_outbound_caller(call_id, "Sam Lee", agent_number="+14085550199")
+        ctrl = await get_controller(call_id)
+        ctrl.phase = "mode_choice"
+        with patch("pc_liveagent.call_turn._schedule_ai_fill_browser") as open_browser:
+            r = await process_user_turn(call_id, "Connect me with a live agent")
+            open_browser.assert_not_called()
+        self.assertEqual(r.detail, "live_agent_transfer")
+        self.assertEqual(r.transfer_number, "+14085550199")
+        self.assertFalse(r.end_call)
+        self.assertIn("connecting", r.speech.lower())
+
+    async def test_mode_guide_starts_coaching(self) -> None:
+        call_id = "turn-mode-guide"
+        await drop_controller(call_id)
+        ctrl = await get_controller(call_id)
+        ctrl.phase = "mode_choice"
+        with patch("pc_liveagent.call_turn._schedule_ai_fill_browser") as open_browser:
+            r = await process_user_turn(call_id, "Please guide me through it")
+            open_browser.assert_not_called()
+        self.assertEqual(r.phase, "guide")
+        self.assertEqual(r.detail, "mode_guide")
+        self.assertIn("guide", r.speech.lower())
+
+    async def test_mode_ai_fill_enters_language(self) -> None:
+        call_id = "turn-mode-ai"
+        await drop_controller(call_id)
+        ctrl = await get_controller(call_id)
+        ctrl.phase = "mode_choice"
+        with patch("pc_liveagent.call_turn._schedule_ai_fill_browser") as open_browser:
+            r = await process_user_turn(call_id, "Have the AI fill the form for me")
+            open_browser.assert_called_once()
+            self.assertEqual(open_browser.call_args.args[0], call_id)
+        self.assertEqual(r.phase, "language")
+        self.assertEqual(r.detail, "mode_ai_fill")
+        self.assertIn("english", r.speech.lower())
+
+    async def test_mode_mappings_cover_natural_phrases(self) -> None:
+        from pc_liveagent.mode_router import classify_help_mode
+
+        # Live agent — incomplete / paraphrase (not menu-exact wording)
+        self.assertEqual(classify_help_mode("I want to talk to a real person"), "live_agent")
+        self.assertEqual(classify_help_mode("can I get a human please"), "live_agent")
+        self.assertEqual(classify_help_mode("put me through to someone"), "live_agent")
+        self.assertEqual(classify_help_mode("yeah transfer me"), "live_agent")
+        self.assertEqual(classify_help_mode("I don't want the AI"), "live_agent")
+        self.assertEqual(classify_help_mode("nah the AI thing"), "live_agent")
+        self.assertEqual(classify_help_mode("uh a person"), "live_agent")
+        self.assertEqual(classify_help_mode("the human one"), "live_agent")
+        self.assertEqual(classify_help_mode("someone please"), "live_agent")
+        self.assertEqual(classify_help_mode("the first one"), "live_agent")
+        self.assertEqual(classify_help_mode("Option A works for me"), "live_agent")
+        self.assertEqual(classify_help_mode("I'll go with option A"), "live_agent")
+        self.assertEqual(classify_help_mode("option A"), "live_agent")
+
+        # Guide — coaching / self-serve paraphrases
+        self.assertEqual(classify_help_mode("walk me through step by step"), "guide")
+        self.assertEqual(classify_help_mode("I'll fill it myself"), "guide")
+        self.assertEqual(classify_help_mode("just tell me what to click"), "guide")
+        self.assertEqual(classify_help_mode("help me do it on my screen"), "guide")
+        self.assertEqual(classify_help_mode("coach me"), "guide")
+        self.assertEqual(classify_help_mode("second option"), "guide")
+        self.assertEqual(classify_help_mode("option two"), "guide")
+        self.assertEqual(classify_help_mode("I will go with option B"), "guide")
+        self.assertEqual(classify_help_mode("option B works for me"), "guide")
+
+        # AI fill — "you do the work" paraphrases
+        self.assertEqual(classify_help_mode("fill it on your own"), "ai_fill")
+        self.assertEqual(classify_help_mode("form filler"), "ai_fill")
+        self.assertEqual(classify_help_mode("you handle the form"), "ai_fill")
+        self.assertEqual(classify_help_mode("just ask me the questions"), "ai_fill")
+        self.assertEqual(classify_help_mode("do it for me"), "ai_fill")
+        self.assertEqual(classify_help_mode("fill it while I talk"), "ai_fill")
+        self.assertEqual(classify_help_mode("the last one"), "ai_fill")
+        self.assertEqual(classify_help_mode("go ahead and fill it"), "ai_fill")
+        self.assertEqual(classify_help_mode("fill it up for me"), "ai_fill")
+        self.assertEqual(classify_help_mode("option C"), "ai_fill")
+        self.assertEqual(classify_help_mode("I'll go with option C"), "ai_fill")
+
+        self.assertIsNone(classify_help_mode("maybe later"))
+        self.assertIsNone(classify_help_mode("huh"))
 
     async def test_intro_for_what_stays_on_language_with_context(self) -> None:
         call_id = "turn-test"
@@ -472,6 +566,10 @@ class CallTurnTests(unittest.IsolatedAsyncioTestCase):
                 AsyncMock(),
             ) as ensure,
             patch(
+                "pc_liveagent.live_form._wait_for_other_relationship_input",
+                AsyncMock(return_value=True),
+            ),
+            patch(
                 "pc_liveagent.live_form._other_relationship_input_visible",
                 AsyncMock(return_value=True),
             ),
@@ -510,7 +608,8 @@ class CallTurnTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.elig_step, "person_age")
         self.assertTrue(result2.get("ok"))
 
-    async def test_other_without_custom_field_continues(self) -> None:
+    async def test_other_without_custom_field_still_awaits_text(self) -> None:
+        """Bare Other must not advance — custom Relationship-to-me text is required."""
         from pc_liveagent.live_form import LiveFormSession, _submit_eligibility_answer
 
         session = LiveFormSession(
@@ -531,6 +630,10 @@ class CallTurnTests(unittest.IsolatedAsyncioTestCase):
                 AsyncMock(),
             ),
             patch(
+                "pc_liveagent.live_form._wait_for_other_relationship_input",
+                AsyncMock(return_value=False),
+            ),
+            patch(
                 "pc_liveagent.live_form._other_relationship_input_visible",
                 AsyncMock(return_value=False),
             ),
@@ -538,19 +641,64 @@ class CallTurnTests(unittest.IsolatedAsyncioTestCase):
                 "pc_liveagent.live_form._eligibility_screen",
                 AsyncMock(return_value="person_form"),
             ),
-            patch(
-                "pc_liveagent.live_form._relationship_speech_for_page",
-                AsyncMock(return_value="age next"),
-            ),
             patch("pc_liveagent.live_form._mark"),
         ):
             result = await _submit_eligibility_answer(
                 "rel-other-none", session, page, "Other", time.time()
             )
         self.assertEqual(session.filled.get("person_rel"), "Other")
+        self.assertEqual(session.filled.get("rel_other_awaiting"), "person_rel")
+        self.assertEqual(session.elig_step, "person_rel")
+        self.assertTrue(result.get("ok"))
+        self.assertIn("other relationship", (result.get("spoken") or "").lower())
+
+    async def test_other_rel_text_not_hijacked_by_spouse_screen_mismatch(self) -> None:
+        """Latest transcript: Other→Sibling was recovered to spouse_first as a name.
+
+        After Other hides relationship chips, screen can look like spouse_form.
+        Custom text must still fill Relationship-to-me and stay on the person form.
+        """
+        from pc_liveagent.live_form import LiveFormSession, _submit_eligibility_answer
+
+        session = LiveFormSession(
+            call_id="rel-other-sibling",
+            url="https://example.test",
+            elig_step="person_rel",
+        )
+        session.filled["person_rel"] = "Other"
+        session.filled["rel_other_awaiting"] = "person_rel"
+        page = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+
+        with (
+            patch(
+                "pc_liveagent.live_form._eligibility_screen",
+                AsyncMock(return_value="spouse_form"),
+            ),
+            patch(
+                "pc_liveagent.live_form._visible_choice_labels",
+                AsyncMock(
+                    return_value=["(0-1) Baby", "(1-5) Child", "(6-18) Youth", "Other"]
+                ),
+            ),
+            patch(
+                "pc_liveagent.live_form._fill_other_relationship_text",
+                AsyncMock(return_value="Sibling"),
+            ) as fill_other,
+            patch("pc_liveagent.live_form._mark"),
+        ):
+            result = await _submit_eligibility_answer(
+                "rel-other-sibling", session, page, "Sibling", time.time()
+            )
+
+        fill_other.assert_awaited_once()
+        self.assertTrue(result.get("ok"))
+        self.assertNotEqual(result.get("error"), "step_mismatch")
+        self.assertEqual(session.filled.get("person_rel"), "Other")
+        self.assertEqual(session.filled.get("person_rel_other"), "Sibling")
         self.assertNotIn("rel_other_awaiting", session.filled)
         self.assertEqual(session.elig_step, "person_age")
-        self.assertTrue(result.get("ok"))
+        self.assertNotEqual(session.elig_step, "spouse_first")
 
     async def test_ensure_relationship_raises_when_validation_still_blocks(self) -> None:
         """Fail only when the form still demands a selection after click attempts."""
@@ -3052,6 +3200,10 @@ class ControlIntentAndMetaTests(unittest.TestCase):
         self.assertEqual(_map_relationship_label("my stepdaughter", opts), "Stepchild")
         self.assertEqual(_map_relationship_label("my grandson", opts), "Grandchild")
         self.assertEqual(_map_relationship_label("a foster child", opts), "Foster Child")
+        # Latest-call ASR: "foster child" → "Pastor child" must not pick Child.
+        self.assertEqual(_map_relationship_label("Pastor child.", opts), "Foster Child")
+        self.assertEqual(_map_relationship_label("pastor child", opts), "Foster Child")
+        self.assertEqual(_map_relationship_label("forster child", opts), "Foster Child")
         self.assertEqual(_map_relationship_label("something else", opts), "Other")
         speech = relationship_question_speech("person_rel", opts)
         low = speech.lower()
@@ -3252,7 +3404,7 @@ class ConversationalNavTests(unittest.IsolatedAsyncioTestCase):
             return {
                 "ok": True,
                 "step": "child_age",
-                "spoken": "What is the child's age range?",
+                "spoken": "What is the child's age?",
             }
 
         async def slow_submit(*_a, **_k):
@@ -6143,7 +6295,7 @@ class AgeAndChildFormRegressionTests(unittest.IsolatedAsyncioTestCase):
         submit = AsyncMock(
             return_value={
                 "ok": True,
-                "spoken": "ASK: What is the child's age range?",
+                "spoken": "ASK: What is the child's age?",
                 "step": "child_age",
             }
         )
@@ -7778,13 +7930,53 @@ class StageETransitionTests(unittest.IsolatedAsyncioTestCase):
         low = speech.lower()
         self.assertIn("household eligibility check is complete", low)
         self.assertIn("aca marketplace", low)
-        self.assertIn("may be eligible", low)
+        self.assertIn("only eligible for", low)
         # Speak only eligible programs — never announce not-eligible cards.
         self.assertNotIn("not eligible at this time", low)
         self.assertNotIn("medicare", low)
         self.assertNotIn("medicaid", low)
-        self.assertIn("would you like to continue and start the application", low)
+        self.assertIn("continue to the application", low)
         self.assertNotIn("approved", low)
+
+    def test_build_programs_permission_speech_masshealth_only_says_medicaid(
+        self,
+    ) -> None:
+        """Screenshot case: only MassHealth eligible → say Medicaid only."""
+        from pc_liveagent.app_stage import build_programs_permission_speech
+
+        speech = build_programs_permission_speech(
+            {
+                "programs": [
+                    {
+                        "name": "MassHealth Standard / CarePlus (Medicaid)",
+                        "may_be_eligible": True,
+                        "checked": True,
+                        "detail": (
+                            "David and John, may be eligible for MassHealth Standard. "
+                            "Adam may be eligible for MassHealth Standard / CarePlus."
+                        ),
+                    },
+                    {
+                        "name": "Medicare",
+                        "may_be_eligible": False,
+                        "not_eligible": True,
+                        "detail": "Not eligible at this time",
+                    },
+                    {
+                        "name": "Health Connector (ACA Marketplace)",
+                        "may_be_eligible": False,
+                        "not_eligible": True,
+                        "detail": "Not eligible at this time",
+                    },
+                ]
+            }
+        )
+        low = speech.lower()
+        self.assertIn("you're only eligible for medicaid", low)
+        self.assertIn("continue to the application", low)
+        self.assertNotIn("medicare", low)
+        self.assertNotIn("health connector", low)
+        self.assertNotIn("not eligible", low)
 
     def test_build_programs_permission_speech_eligible_only_medikids(self) -> None:
         from pc_liveagent.app_stage import build_programs_permission_speech
@@ -7817,10 +8009,30 @@ class StageETransitionTests(unittest.IsolatedAsyncioTestCase):
         )
         low = speech.lower()
         self.assertIn("medikids", low)
-        self.assertIn("may be eligible", low)
+        self.assertIn("only eligible for", low)
         self.assertNotIn("not eligible", low)
         self.assertNotIn("medicare", low)
         self.assertNotIn("marketplace", low)
+
+    def test_build_programs_permission_speech_medicaid_fallback(self) -> None:
+        from pc_liveagent.app_stage import build_programs_permission_speech
+
+        speech = build_programs_permission_speech(
+            {
+                "programs": [
+                    {
+                        "name": "Medicaid",
+                        "may_be_eligible": True,
+                        "checked": True,
+                    }
+                ],
+                "medicaid_fallback_applied": True,
+            }
+        )
+        low = speech.lower()
+        self.assertIn("didn't show an eligible program", low)
+        self.assertIn("selected medicaid", low)
+        self.assertIn("continue to the application", low)
 
     def test_programs_context_does_not_navigate(self) -> None:
         from pc_liveagent.app_stage import programs_context_reply
@@ -7852,6 +8064,19 @@ class StageETransitionTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(return_value=True),
             ),
             patch(
+                "pc_liveagent.app_stage.wait_for_verified_first_stage_e_step",
+                new=AsyncMock(return_value="app_citizenship"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._first_stage_e_question_speech",
+                new=AsyncMock(
+                    return_value=(
+                        "Are the household members listed on this application "
+                        "all U.S. Citizens? Please say Yes or No."
+                    )
+                ),
+            ),
+            patch(
                 "pc_liveagent.app_stage.detect_application_screen",
                 new=AsyncMock(return_value="app_citizenship"),
             ),
@@ -7873,6 +8098,58 @@ class StageETransitionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(again.get("step"), "app_citizenship")
         # Second Yes must not re-click Start Applications (idempotent).
         self.assertEqual(session.filled.get("start_applications_clicked"), "Start Applications")
+
+    async def test_programs_yes_speaks_agent_offer_when_that_is_first_screen(
+        self,
+    ) -> None:
+        """Latest transcript: browser showed licensed-agent offer first, but speech
+        jumped to citizenship until the caller talked again."""
+        from pc_liveagent.app_stage import handle_programs_decision
+        from pc_liveagent.live_form import LiveFormSession
+
+        session = LiveFormSession(
+            call_id="prog-agent-first",
+            url="https://example.test",
+            elig_step="programs",
+        )
+        page = AsyncMock()
+        page.url = "https://my.pointcare.com/application/step-1"
+        with (
+            patch(
+                "pc_liveagent.app_stage.click_start_applications",
+                new=AsyncMock(return_value="Continue to Applications"),
+            ),
+            patch(
+                "pc_liveagent.app_stage.wait_for_application_started",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "pc_liveagent.app_stage.wait_for_verified_first_stage_e_step",
+                new=AsyncMock(return_value="app_agent_offer"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._first_stage_e_question_speech",
+                new=AsyncMock(
+                    return_value=(
+                        "Would you like to connect with a licensed insurance agent "
+                        "to explore Medicare or ACA Marketplace options and get help "
+                        "finishing enrollment? Say Yes to connect, or No to continue "
+                        "without an agent."
+                    )
+                ),
+            ),
+        ):
+            result = await handle_programs_decision(
+                "prog-agent-first", session, page, "Yes"
+            )
+        self.assertTrue(result.get("ok"))
+        self.assertEqual(result.get("step"), "app_agent_offer")
+        self.assertEqual(session.app_step, "app_agent_offer")
+        spoken = str(result.get("spoken") or "").lower()
+        self.assertIn("licensed", spoken)
+        self.assertIn("agent", spoken)
+        self.assertNotIn("u.s. citizen", spoken)
+        self.assertNotIn("citizen?", spoken)
 
     async def test_programs_no_preserves_results_no_click(self) -> None:
         from pc_liveagent.app_stage import (
@@ -15378,6 +15655,19 @@ class FullCallFlowIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 new=AsyncMock(return_value=True),
             ),
             patch(
+                "pc_liveagent.app_stage.wait_for_verified_first_stage_e_step",
+                new=AsyncMock(return_value="app_citizenship"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._first_stage_e_question_speech",
+                new=AsyncMock(
+                    return_value=(
+                        "Are the household members listed on this application "
+                        "all U.S. Citizens? Please say Yes or No."
+                    )
+                ),
+            ),
+            patch(
                 "pc_liveagent.app_stage.detect_application_screen",
                 new=AsyncMock(return_value="app_citizenship"),
             ),
@@ -15426,6 +15716,14 @@ class FullCallFlowIntegrationTests(unittest.IsolatedAsyncioTestCase):
             patch(
                 "pc_liveagent.app_stage.wait_for_application_started",
                 new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "pc_liveagent.app_stage.wait_for_verified_first_stage_e_step",
+                new=AsyncMock(return_value="app_citizenship"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._first_stage_e_question_speech",
+                new=AsyncMock(return_value="Are the household members listed on this application all U.S. Citizens? Please say Yes or No."),
             ),
             patch(
                 "pc_liveagent.app_stage.detect_application_screen",
@@ -15633,8 +15931,8 @@ class FullCallFlowIntegrationTests(unittest.IsolatedAsyncioTestCase):
         page = AsyncMock()
         permission = (
             "Your household eligibility check is complete. "
-            "Pointcare indicates that your household may be eligible for Medicaid. "
-            "Would you like to continue and start the application? Please say Yes or No."
+            "You're only eligible for Medicaid. "
+            "Would you like to continue to the application? Please say Yes or No."
         )
         with (
             patch("pc_liveagent.config.APPLICATION_TEST_MODE", False),
@@ -18747,6 +19045,19 @@ class ApplicationSyncBackDobTests(unittest.IsolatedAsyncioTestCase):
             patch(
                 "pc_liveagent.app_stage.wait_for_application_started",
                 new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "pc_liveagent.app_stage.wait_for_verified_first_stage_e_step",
+                new=AsyncMock(return_value="app_citizenship"),
+            ),
+            patch(
+                "pc_liveagent.app_stage._first_stage_e_question_speech",
+                new=AsyncMock(
+                    return_value=(
+                        "Are the household members listed on this application "
+                        "all U.S. Citizens? Please say Yes or No."
+                    )
+                ),
             ),
             patch(
                 "pc_liveagent.app_stage.store_program_summary",

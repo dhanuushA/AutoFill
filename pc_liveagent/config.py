@@ -294,6 +294,12 @@ RETELL_FROM_NUMBER = (
     or os.environ.get("FORM_FILLER_FROM_NUMBER", "").strip()
 )
 FORM_FILLER_AGENT_ID = os.environ.get("FORM_FILLER_AGENT_ID", "").strip()
+# Cold-transfer destination when caller chooses live agent (E.164).
+# Outbound payload agent_number overrides this per call.
+LIVE_AGENT_NUMBER = (
+    os.environ.get("LIVE_AGENT_NUMBER", "").strip()
+    or os.environ.get("FORM_FILLER_TRANSFER_NUMBER", "").strip()
+)
 RETELL_VOICE = os.environ.get("RETELL_VOICE", "").strip() or "retell-Cimo"
 RETELL_MODEL = os.environ.get("RETELL_MODEL", "").strip()
 

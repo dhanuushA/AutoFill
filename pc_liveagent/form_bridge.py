@@ -726,11 +726,59 @@ async def on_caller_transcript(call_id: str, call: dict[str, Any], form_url: str
     _fallback_tasks[call_id] = asyncio.create_task(_delayed(), name=f"elig-fallback-{call_id}")
 
 
-async def on_call_started(call_id: str, form_url: str = "") -> dict[str, Any]:
+async def on_call_started(
+    call_id: str,
+    form_url: str = "",
+    *,
+    open_browser: bool | None = None,
+) -> dict[str, Any]:
+    """Register the call; open PointCare Chrome only when requested.
+
+    Default: defer the browser until the caller chooses AI fill (or an explicit
+    open_browser=True helper like /form-filler/welcome/). Application test modes
+    still open immediately so those flows keep working.
+    """
     from .live_form import describe_live_browser, get_session
 
+    url = (form_url or "").strip() or config.POINTCARE_URL
+    if open_browser is None:
+        open_browser = bool(
+            getattr(config, "APPLICATION_TEST_MODE", False)
+            or getattr(config, "APPLICATION_ONLY_TEST_MODE", False)
+        )
+
     try:
-        session = await start_live_form(call_id, form_url or config.POINTCARE_URL)
+        from .call_turn import register_outbound_form_url
+
+        register_outbound_form_url(call_id, url)
+    except Exception:
+        logger.exception("register_outbound_form_url failed call_id=%s", call_id)
+
+    if not open_browser:
+        logger.info(
+            "on_call_started deferred_browser call_id=%s url=%s",
+            call_id,
+            url,
+        )
+        return {
+            "ok": True,
+            "deferred": True,
+            "call_id": call_id,
+            "url": url,
+            "status": "deferred",
+            "welcome_done": False,
+            "error": "",
+            "history": [],
+            "browser": {
+                "opened": False,
+                "deferred": True,
+                "url": url,
+                "error": "",
+            },
+        }
+
+    try:
+        session = await start_live_form(call_id, url)
     except Exception as exc:
         logger.exception("on_call_started failed call_id=%s", call_id)
         failed = await get_session(call_id)

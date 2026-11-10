@@ -303,7 +303,12 @@ async def handle_retell_llm_websocket(websocket: WebSocket, call_id: str) -> Non
                     "content": result.speech,
                     "content_complete": True,
                 }
-                if result.end_call:
+                # end_call and transfer_number are mutually exclusive (Retell).
+                transfer_to = (result.transfer_number or "").strip()
+                if transfer_to and not result.end_call:
+                    payload["transfer_number"] = transfer_to
+                    payload["no_interruption_allowed"] = True
+                elif result.end_call:
                     payload["end_call"] = True
                 await _send(websocket, payload)
                 if result.detail == "sso_ack":
@@ -314,12 +319,13 @@ async def handle_retell_llm_websocket(websocket: WebSocket, call_id: str) -> Non
                     )
                 logger.info(
                     "Custom LLM WS replied call_id=%s response_id=%s phase=%s "
-                    "detail=%s end=%s speech=%r",
+                    "detail=%s end=%s transfer=%s speech=%r",
                     call_id,
                     response_id,
                     result.phase,
                     result.detail,
                     result.end_call,
+                    bool(transfer_to and not result.end_call),
                     (result.speech or "")[:100],
                 )
                 continue

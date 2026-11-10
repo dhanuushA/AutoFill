@@ -687,7 +687,7 @@
   <script>
     (function () {
       const AGENTS_KEY = "pcff_live_agents_v1";
-      const DRAFTS_KEY = "pcff_call_drafts";
+      const CALLS_KEY = "pcff_calls";
       const DEFAULT_AGENTS = [
         { id: "a1", name: "Kadher", cc: "+91", phone: "(730) 523-0194", active: true },
         { id: "a2", name: "Bharath", cc: "+91", phone: "(987) 654-3210", active: false },
@@ -696,12 +696,13 @@
       const form = document.getElementById("call-form");
       const banner = document.getElementById("banner");
       const meta = document.getElementById("meta");
+      const submitBtn = document.getElementById("btn-submit");
       const agentList = document.getElementById("agent-list");
       const agentsBanner = document.getElementById("agents-banner");
 
       let agents = loadAgents();
       let agentsSnapshot = JSON.stringify(agents);
-      let drafts = JSON.parse(localStorage.getItem(DRAFTS_KEY) || "[]");
+      let calls = JSON.parse(sessionStorage.getItem(CALLS_KEY) || "[]");
 
       function loadAgents() {
         try {
@@ -722,7 +723,7 @@
         document.querySelectorAll(".nav button").forEach((btn) => {
           btn.classList.toggle("active", btn.dataset.view === name);
         });
-        if (name === "calls") renderDrafts();
+        if (name === "calls") renderCalls();
         if (name === "agents") renderAgents();
       }
 
@@ -754,7 +755,7 @@
         el.innerHTML = "";
       }
 
-      /* ---- Start call (draft only) ---- */
+      /* ---- Start call (existing form-filler outbound) ---- */
       document.getElementById("btn-cancel").addEventListener("click", () => {
         form.reset();
         clearBanner(banner);
@@ -762,7 +763,7 @@
         meta.innerHTML = "";
       });
 
-      form.addEventListener("submit", (ev) => {
+      form.addEventListener("submit", async (ev) => {
         ev.preventDefault();
         const first = document.getElementById("first_name").value.trim();
         const last = document.getElementById("last_name").value.trim();
@@ -770,7 +771,7 @@
         const formName = document.getElementById("form_name").value.trim();
 
         if (!first || !last) {
-          setBanner(banner, "err", "First name and last name are required for the identity check.");
+          setBanner(banner, "err", "First name and last name are required.");
           return;
         }
         if (digitsOnly(phone).length < 10) {
@@ -778,43 +779,98 @@
           return;
         }
 
-        const draft = {
+        const payload = {
+          phone_number: phone,
           name: (first + " " + last).replace(/\s+/g, " ").trim(),
-          phone,
           form_name: formName || "Pointcare FormFiller",
-          when: new Date().toLocaleString(),
         };
-        drafts.push(draft);
-        drafts = drafts.slice(-20);
-        localStorage.setItem(DRAFTS_KEY, JSON.stringify(drafts));
-
-        setBanner(
-          banner,
-          "ok",
-          `Ready for <strong>${draft.name}</strong> at ${draft.phone}.`
+        // First active Live agent number → same-call cold transfer if caller chooses that mode.
+        const activeAgent = (agents || []).find(
+          (a) => a && a.active && digitsOnly(a.phone || "").length >= 10
         );
+        if (activeAgent) {
+          const local = digitsOnly(activeAgent.phone);
+          const cc = (activeAgent.cc || "+1").replace(/\D/g, "") || "1";
+          payload.agent_number =
+            local.startsWith(cc) || local.startsWith("1") || local.startsWith("91")
+              ? "+" + local
+              : "+" + cc + local;
+        }
+
+        submitBtn.disabled = true;
+        submitBtn.textContent = "Calling…";
+        setBanner(banner, "ok", "Placing call…");
         meta.className = "meta";
         meta.innerHTML = "";
+
+        try {
+          const res = await fetch("/form-filler/outbound/", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Accept: "application/json" },
+            body: JSON.stringify(payload),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            const detail = data.detail || data.error || res.statusText || "Request failed";
+            throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+          }
+
+          const callId = data.call_id || "";
+          const chrome = data.chrome_url || (data.browser && data.browser.open_url) || "";
+          let msg = `Call started for <strong>${payload.name}</strong>.`;
+          if (data.browser && data.browser.deferred) {
+            msg += " Browser opens after they choose AI form fill.";
+          } else if (chrome) {
+            msg += ` <a href="${chrome}" target="_blank" rel="noopener">Open agent Chrome</a>`;
+          }
+          if (data.browser && data.browser.opened === false && data.browser.error) {
+            msg += `<br/><span style="color:var(--danger)">${data.browser.error}</span>`;
+          }
+          setBanner(banner, "ok", msg);
+          meta.className = "meta show";
+          meta.innerHTML =
+            `call_id: <code>${callId || "—"}</code>` +
+            (data.from_number ? ` · from: <code>${data.from_number}</code>` : "") +
+            (data.status ? ` · status: <code>${data.status}</code>` : "");
+
+          calls.push({
+            name: payload.name,
+            phone: payload.phone_number,
+            call_id: callId,
+            chrome_url: chrome,
+            when: new Date().toLocaleString(),
+          });
+          sessionStorage.setItem(CALLS_KEY, JSON.stringify(calls.slice(-20)));
+        } catch (err) {
+          setBanner(banner, "err", err.message || "Failed to place call.");
+        } finally {
+          submitBtn.disabled = false;
+          submitBtn.textContent = "Start call";
+        }
       });
 
-      function renderDrafts() {
+      function renderCalls() {
         const empty = document.getElementById("calls-empty");
         const list = document.getElementById("calls-list");
         list.innerHTML = "";
-        if (!drafts.length) {
+        if (!calls.length) {
           empty.style.display = "block";
           return;
         }
         empty.style.display = "none";
-        drafts.slice().reverse().forEach((c) => {
+        calls.slice().reverse().forEach((c) => {
           const item = document.createElement("div");
           item.className = "session-item";
+          const chrome = c.chrome_url
+            ? `<a href="${c.chrome_url}" target="_blank" rel="noopener">Open Chrome</a>`
+            : "—";
           item.innerHTML =
             `<strong>${c.name || "Patient"}</strong>` +
             `<div class="row">` +
             `<span>${c.phone || ""}</span>` +
-            `<span>${c.form_name || ""}</span>` +
+            `<span>call_id: <code>${c.call_id || "—"}</code></span>` +
             `<span>${c.when || ""}</span>` +
+            `<span>${chrome}</span>` +
             `</div>`;
           list.appendChild(item);
         });
@@ -957,7 +1013,7 @@
       });
 
       renderAgents();
-      renderDrafts();
+      renderCalls();
     })();
   </script>
 </body>

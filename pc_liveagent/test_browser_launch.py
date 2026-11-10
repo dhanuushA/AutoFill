@@ -242,7 +242,7 @@ class FormFillerRouteTests(unittest.TestCase):
 
 
 class BrowserStartupFailureTests(unittest.IsolatedAsyncioTestCase):
-    async def test_outbound_reports_opened_false_on_chrome_missing(self) -> None:
+    async def test_outbound_defers_browser_until_ai_fill(self) -> None:
         from pc_liveagent.main import form_filler_outbound, FormFillerCallIn
         from fastapi import BackgroundTasks, Request
 
@@ -255,31 +255,34 @@ class BrowserStartupFailureTests(unittest.IsolatedAsyncioTestCase):
         request = Request(scope)
         payload = FormFillerCallIn(phone_number="+15551234567", name="Test")
         bg = BackgroundTasks()
+        started = AsyncMock(
+            return_value={
+                "ok": True,
+                "deferred": True,
+                "call_id": "call_defer_chrome",
+                "browser": {"opened": False, "deferred": True},
+            }
+        )
 
         with (
             patch(
                 "pc_liveagent.main.place_form_filler_call",
-                return_value={"ok": True, "call_id": "call_fail_chrome"},
+                return_value={"ok": True, "call_id": "call_defer_chrome"},
             ),
-            patch(
-                "pc_liveagent.main.on_call_started",
-                new=AsyncMock(
-                    side_effect=RuntimeError(
-                        "Google Chrome was not found. Install Chrome or set CHROME_EXECUTABLE."
-                    )
-                ),
-            ),
+            patch("pc_liveagent.main.on_call_started", new=started),
             patch("pc_liveagent.main.config.PUBLIC_BASE_URL", "https://example.test"),
         ):
             result = await form_filler_outbound(payload, bg, request)
 
-        self.assertEqual(result.get("call_id"), "call_fail_chrome")
+        self.assertEqual(result.get("call_id"), "call_defer_chrome")
         browser = result.get("browser") or {}
         self.assertFalse(browser.get("opened"))
-        self.assertIn("Chrome was not found", browser.get("error") or "")
+        self.assertTrue(browser.get("deferred"))
+        started.assert_awaited()
+        self.assertEqual(started.await_args.kwargs.get("open_browser"), False)
         self.assertEqual(
             result.get("chrome_url"),
-            "https://example.test/form-filler/sessions/call_fail_chrome/chrome",
+            "https://example.test/form-filler/sessions/call_defer_chrome/chrome",
         )
 
 

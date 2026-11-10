@@ -185,7 +185,7 @@ ELIG_QUESTIONS: dict[str, str] = {
     "spouse_first": "What is their first name?",
     "spouse_last": "What is their last name?",
     "spouse_role": "Are they your spouse or your partner?",
-    "spouse_age": "What is their age range, or date of birth?",
+    "spouse_age": "What is their age?",
     "spouse_confirm": (
         "Please confirm those details. Say Yes to continue, or No to change them."
     ),
@@ -201,7 +201,7 @@ ELIG_QUESTIONS: dict[str, str] = {
         "Grandchild, Foster Child, or Other. Which best describes their "
         "relationship to you?"
     ),
-    "child_age": "What is the child's age range?",
+    "child_age": "What is the child's age?",
     "child_confirm": (
         "Please confirm those details. Say Yes to continue, or No to change them."
     ),
@@ -231,7 +231,7 @@ ELIG_QUESTIONS: dict[str, str] = {
         "Grandchild, Foster Child, or Other. Which best describes their "
         "relationship to you?"
     ),
-    "person_age": "What is their age range, or date of birth?",
+    "person_age": "What is their age?",
     "person_confirm": (
         "Please confirm those details. Say Yes to continue, or No to change them."
     ),
@@ -3483,19 +3483,46 @@ async def _eligibility_screen(page: Page) -> str:
             body,
         )
     )
+    spouse_form_heading = bool(
+        re.search(
+            r"tell us about your spouse(?: or partner)?|"
+            r"\babout your spouse\b|"
+            r"\bspouse'?s (first|last) name\b|"
+            r"\bpartner'?s (first|last) name\b",
+            body,
+        )
+    )
+    # After "Other" is chosen, relationship chips disappear and a free-text
+    # "Relationship to me" box appears. Dependent age bands still mean person/child.
+    dependent_age_bands = any(
+        re.search(
+            r"\((0\s*[-–]\s*1|0\s*[-–]\s*5|1\s*[-–]\s*5|6\s*[-–]\s*18|6\s*[-–]\s*20|"
+            r"13\s*[-–]\s*15|16\s*[-–]\s*18)\)|\bbaby\b|\byouth\b|\btoddler\b|\bteen\b",
+            item,
+        )
+        for item in labels
+    )
+    relationship_to_me = "relationship to me" in body
     if relationship_chips or age_chips or (
         "first name" in body and "last name" in body and not has_yes_no
     ):
         if child_form_heading:
             return "child_form"
-        if ("spouse" in body or "partner" in body) and not relationship_chips:
+        # Never treat dependent/other-person forms as spouse just because the page
+        # mentions spouse elsewhere, or because Other hid the relationship chips.
+        if (
+            spouse_form_heading
+            and not relationship_chips
+            and not dependent_age_bands
+            and not relationship_to_me
+        ):
             return "spouse_form"
         return "person_form"
     if child_form_heading and "first name" in body:
         return "child_form"
     if "tell us about" in body and "first name" in body and "relationship" in body:
         return "person_form"
-    if "tell us about your spouse or partner" in body:
+    if spouse_form_heading:
         return "spouse_form"
 
     if needle and screen in (
@@ -3776,14 +3803,9 @@ def build_options_help_speech(step: str, options: list[str] | None = None) -> st
         # Re-read options clearly without the generic "required field" chrome.
         return relationship_question_speech(step, options)
     if step in ("spouse_age", "child_age", "person_age") or meta.answer_type == "age":
-        age_opts = _age_option_labels(options or [])
-        if age_opts:
-            joined = _join_spoken_choices(age_opts[:6])
-            return f"The age choices are {joined}. Which one fits?"
-        return (
-            "Please say their age as a number, like twenty five, "
-            "or the age range that matches."
-        )
+        if step == "child_age":
+            return "What is the child's age? Please say the age as a number, like eight."
+        return "What is their age? Please say the age as a number, like twenty five."
     if step == "income_when" or meta.answer_type == "income_period":
         return (
             "You can say Annual for yearly income, Monthly, or Bi-weekly "
@@ -4174,15 +4196,25 @@ async def _read_named_input(page: Page, label: str) -> str:
         return ""
 
 
+_OTHER_REL_PROMPT = (
+    "What is the other relationship? "
+    "Please say how they are related to you — for example niece, cousin, or roommate."
+)
+
+
 async def _locate_other_relationship_input(page: Page):
-    """Find the free-text field that appears after selecting Other relationship."""
+    """Find the free-text field that appears after selecting Other relationship.
+
+    PointCare replaces the relationship chips with a text box under
+    "Relationship to me" once Other is chosen.
+    """
     labels = (
         "Please specify",
         "Specify relationship",
         "Other relationship",
         "Describe relationship",
-        "Relationship",
         "Relationship to me",
+        "Relationship",
     )
     for label in labels:
         loc = await _locate_named_input(page, label)
@@ -4199,38 +4231,78 @@ async def _locate_other_relationship_input(page: Page):
             ).lower()
         except Exception:
             aria = ""
-        if "first" in aria or "last" in aria:
+        if "first" in aria or "last" in aria or "age" in aria or "birth" in aria:
             continue
         return loc
-    # Fallback: visible text input near "Other" that is not a name field.
+    # Fallback: visible text input near the Relationship-to-me label / Other chip.
     try:
-        found = await page.evaluate(
+        handle = await page.evaluate(
             """() => {
               const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-              const inputs = [...document.querySelectorAll('input, textarea')].filter((el) => {
+              const isText = (el) => {
                 const r = el.getBoundingClientRect();
                 if (r.width < 2 || r.height < 2) return false;
                 if (el.disabled || el.readOnly) return false;
                 const type = (el.getAttribute('type') || 'text').toLowerCase();
-                if (type && type !== 'text' && type !== 'search' && el.tagName !== 'TEXTAREA') {
+                if (el.tagName === 'TEXTAREA') return true;
+                return !type || type === 'text' || type === 'search';
+              };
+              const metaOf = (el) => norm(
+                (el.getAttribute('aria-label') || '') + ' ' +
+                (el.getAttribute('placeholder') || '') + ' ' +
+                (el.getAttribute('name') || '') + ' ' +
+                (el.id || '')
+              );
+              const nearRelationshipLabel = (el) => {
+                let node = el;
+                for (let i = 0; i < 6 && node; i += 1) {
+                  const text = norm(node.innerText || node.textContent || '');
+                  if (text.includes('relationship to me') || text.includes('other relationship')) {
+                    return true;
+                  }
+                  node = node.parentElement;
+                }
+                const labels = [...document.querySelectorAll('label, p, span, div, h1, h2, h3, h4')];
+                const elTop = el.getBoundingClientRect().top;
+                return labels.some((lab) => {
+                  const t = norm(lab.innerText || lab.textContent || '');
+                  if (!(t.includes('relationship to me') || t === 'relationship' || t.includes('relationship'))) {
+                    return false;
+                  }
+                  const r = lab.getBoundingClientRect();
+                  return Math.abs(r.bottom - elTop) < 80 || (r.top <= elTop && elTop - r.bottom < 120);
+                });
+              };
+              const inputs = [...document.querySelectorAll('input, textarea')].filter((el) => {
+                if (!isText(el)) return false;
+                const meta = metaOf(el);
+                if (meta.includes('first') || meta.includes('last') || meta.includes('email') ||
+                    meta.includes('age') || meta.includes('birth') || meta.includes('phone')) {
                   return false;
                 }
-                const meta = norm(
-                  (el.getAttribute('aria-label') || '') + ' ' +
-                  (el.getAttribute('placeholder') || '') + ' ' +
-                  (el.getAttribute('name') || '') + ' ' +
-                  (el.id || '')
-                );
-                if (meta.includes('first') || meta.includes('last') || meta.includes('email')) {
-                  return false;
+                if (meta.includes('relat') || meta.includes('other') ||
+                    meta.includes('specify') || meta.includes('describe')) {
+                  return true;
                 }
-                return meta.includes('relat') || meta.includes('other') ||
-                  meta.includes('specify') || meta.includes('describe');
+                return nearRelationshipLabel(el);
               });
-              return inputs.length ? true : false;
+              if (!inputs.length) return null;
+              // Prefer the empty/custom field that replaced the chips.
+              inputs.sort((a, b) => {
+                const aEmpty = !(a.value || '').trim() ? 0 : 1;
+                const bEmpty = !(b.value || '').trim() ? 0 : 1;
+                if (aEmpty !== bEmpty) return aEmpty - bEmpty;
+                return a.getBoundingClientRect().top - b.getBoundingClientRect().top;
+              });
+              const chosen = inputs[0];
+              chosen.setAttribute('data-pc-other-rel', '1');
+              return true;
             }"""
         )
-        if found:
+        if handle:
+            marked = page.locator("[data-pc-other-rel='1']").first
+            if await marked.count() and await marked.is_visible():
+                return marked
             return page.locator(
                 "input[aria-label*='relat' i], input[placeholder*='relat' i], "
                 "input[aria-label*='other' i], input[placeholder*='specify' i], "
@@ -4251,19 +4323,52 @@ async def _other_relationship_input_visible(page: Page) -> bool:
         return False
 
 
+async def _wait_for_other_relationship_input(
+    page: Page, *, timeout_s: float = 3.0
+) -> bool:
+    """Wait for the Other free-text box after the chip is selected."""
+    deadline = time.monotonic() + max(0.4, timeout_s)
+    while time.monotonic() < deadline:
+        if await _other_relationship_input_visible(page):
+            return True
+        try:
+            await page.wait_for_timeout(150)
+        except Exception:
+            await asyncio.sleep(0.15)
+    return await _other_relationship_input_visible(page)
+
+
+def _is_bare_other_relationship(text: str) -> bool:
+    cleaned = re.sub(r"[.!?…]+$", "", (text or "").strip().lower())
+    cleaned = re.sub(r"\b(my|our|the|a|an|their|his|her)\b", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned in {
+        "other",
+        "something else",
+        "another relationship",
+        "a different relationship",
+        "none of those",
+        "none of these",
+        "none of the above",
+    }
+
+
 async def _fill_other_relationship_text(page: Page, value: str) -> str:
     """Fill the Other free-text relationship field and verify the value."""
     # Keep words like "in-law"; do not map onto predefined relationship chips.
     cleaned = re.sub(r"\s+", " ", (value or "").strip()).strip(" .")
-    if not cleaned:
+    if not cleaned or _is_bare_other_relationship(cleaned):
+        raise RuntimeError("REL_CLARIFY: " + _OTHER_REL_PROMPT)
+    if not await _wait_for_other_relationship_input(page, timeout_s=3.0):
         raise RuntimeError(
-            "REL_CLARIFY: What is their relationship to you?"
+            "REL_CLARIFY: I selected Other, but I don't see the text box yet. "
+            + _OTHER_REL_PROMPT
         )
     loc = await _locate_other_relationship_input(page)
     if loc is None:
         raise RuntimeError(
             "REL_CLARIFY: I selected Other, but I don't see a place to type the "
-            "custom relationship. Please say a listed relationship, or try Other again."
+            "custom relationship. " + _OTHER_REL_PROMPT
         )
     await loc.click(timeout=4000)
     await loc.fill("", timeout=3000)
@@ -4844,23 +4949,20 @@ async def correct_member_field(
                             "step": session.elig_step,
                         }
                     session.filled[rel_key] = mapped
-                    if mapped.lower().rstrip(" *") == "other":
-                        try:
-                            await page.wait_for_timeout(500)
-                        except Exception:
-                            pass
-                        if await _other_relationship_input_visible(page):
-                            session.filled["rel_other_awaiting"] = rel_key
-                            session.elig_step = rel_key
-                            return {
-                                "ok": True,
-                                "step": rel_key,
-                                "spoken": "What is the other relationship?",
-                                "value": mapped,
-                                "in_place": True,
-                                "field": key,
-                                "await_other_rel": True,
-                            }
+                    if mapped.lower().rstrip(" *") == "other" and kind != "spouse":
+                        await _wait_for_other_relationship_input(page, timeout_s=3.0)
+                        session.filled["rel_other_awaiting"] = rel_key
+                        session.filled.pop(f"{rel_key}_other", None)
+                        session.elig_step = rel_key
+                        return {
+                            "ok": True,
+                            "step": rel_key,
+                            "spoken": _OTHER_REL_PROMPT,
+                            "value": mapped,
+                            "in_place": True,
+                            "field": key,
+                            "await_other_rel": True,
+                        }
             session.elig_step = confirm_step
             return {
                 "ok": True,
@@ -6267,17 +6369,14 @@ async def _apply_relationship_chip_for_kind(
     await _ensure_relationship_choice_selected(page, mapped)
     session.filled[rel_key] = mapped
     if mapped.lower().rstrip(" *") == "other" and kind != "spouse":
-        try:
-            await page.wait_for_timeout(500)
-        except Exception:
-            pass
-        if await _other_relationship_input_visible(page):
-            session.filled["rel_other_awaiting"] = rel_key
-            return "What is the other relationship?"
-        session.filled.pop("rel_other_awaiting", None)
-    else:
-        session.filled.pop("rel_other_awaiting", None)
+        # Other always requires free-text in the Relationship-to-me box before
+        # advancing — never continue on the bare chip alone.
+        await _wait_for_other_relationship_input(page, timeout_s=3.0)
+        session.filled["rel_other_awaiting"] = rel_key
         session.filled.pop(f"{rel_key}_other", None)
+        return _OTHER_REL_PROMPT
+    session.filled.pop("rel_other_awaiting", None)
+    session.filled.pop(f"{rel_key}_other", None)
     return None
 
 
@@ -6382,6 +6481,9 @@ async def _reassert_member_relationship_before_continue(
             "What is their relationship to you?"
         )
     custom = (session.filled.get(f"{rel_key}_other") or "").strip()
+    awaiting_other = (session.filled.get("rel_other_awaiting") or "") == rel_key
+    if wanted.lower().rstrip(" *") == "other" and (awaiting_other or not custom):
+        raise RuntimeError("REL_CLARIFY: " + _OTHER_REL_PROMPT)
     chip = "Other" if custom else wanted
     if chip.lower().rstrip(" *") == "other":
         chip = "Other"
@@ -6396,16 +6498,20 @@ async def _reassert_member_relationship_before_continue(
             "REL_CLARIFY: The form still asks for a relationship. "
             "Please say the relationship again."
         )
-    if custom and await _other_relationship_input_visible(page):
-        current = ""
-        loc = await _locate_other_relationship_input(page)
-        if loc is not None:
-            try:
-                current = (await loc.input_value()).strip()
-            except Exception:
-                current = ""
-        if current.lower() != custom.lower():
-            await _fill_other_relationship_text(page, custom)
+    if custom:
+        # Ensure the Relationship-to-me text box still holds the custom value.
+        if not await _other_relationship_input_visible(page):
+            await _wait_for_other_relationship_input(page, timeout_s=2.0)
+        if await _other_relationship_input_visible(page):
+            current = ""
+            loc = await _locate_other_relationship_input(page)
+            if loc is not None:
+                try:
+                    current = (await loc.input_value()).strip()
+                except Exception:
+                    current = ""
+            if current.lower() != custom.lower():
+                await _fill_other_relationship_text(page, custom)
 
 
 async def _assert_member_form_ready_before_continue(
@@ -6426,7 +6532,7 @@ async def _assert_member_form_ready_before_continue(
     if not age:
         raise RuntimeError(
             "AGE_CLARIFY: Age is still blank on the form. "
-            "What is their age range?"
+            "What is their age?"
         )
     hints = await _visible_validation_hints(page)
     if _relationship_validation_blocking(hints):
@@ -7372,7 +7478,14 @@ def _map_relationship_label(spoken: str, labels: list[str]) -> str | None:
         ),
         (
             "foster child",
-            (r"\bfoster\b",),
+            (
+                # Exact + common ASR confusions (foster → pastor/forster/faster).
+                r"\bfoster([\s-]?child)?\b",
+                r"\bpastor([\s-]?child)?\b",
+                r"\bforster([\s-]?child)?\b",
+                r"\bfaster([\s-]?child)?\b",
+                r"\bfostered\b",
+            ),
         ),
         (
             "child",
@@ -7402,6 +7515,13 @@ def _map_relationship_label(spoken: str, labels: list[str]) -> str | None:
     for target_key, patterns in synonym_groups:
         if not any(re.search(pat, text, re.I) for pat in patterns):
             continue
+        # Never let bare "child" win when a more-specific compound / ASR variant is present.
+        if target_key == "child" and re.search(
+            r"\b(step|grand|foster|pastor|forster|faster)([\s-]?child|[\s-]?(?:son|daughter|kid))?\b",
+            text,
+            re.I,
+        ):
+            continue
         # Exact normalized label only — "child" must not match Stepchild/Grandchild.
         hits = [
             label
@@ -7414,13 +7534,16 @@ def _map_relationship_label(spoken: str, labels: list[str]) -> str | None:
             return hits[0]
         if len(hits) > 1:
             return None
-    # Unique containment as last resort.
+    # Unique containment as last resort — prefer the longest / most specific label.
     contains = [
         label
         for label in pool
         if label.lower() in text or text in label.lower()
     ]
-    if len(contains) == 1:
+    if not contains:
+        return None
+    contains.sort(key=lambda label: len(label), reverse=True)
+    if len(contains) == 1 or len(contains[0]) > len(contains[1]):
         return contains[0]
     return None
 
@@ -9493,14 +9616,9 @@ def _map_age_label(spoken: str, labels: list[str]) -> str | None:
 
 
 def _age_clarify_message(step: str, labels: list[str]) -> str:
-    question = ELIG_QUESTIONS.get(step) or "What is the age range?"
-    age_labels = _age_option_labels(labels)
-    if age_labels:
-        shown = ", ".join(age_labels[:6])
-        return f"{question} Please say one of: {shown}."
+    question = ELIG_QUESTIONS.get(step) or "What is their age?"
     return (
-        f"{question} Please say the age as a number, like twenty five, "
-        "or the age range shown on the form."
+        f"{question} Please say the age as a number, like twenty five."
     )
 
 
@@ -9580,7 +9698,16 @@ async def _submit_eligibility_answer(
         return await handle_application_gate(call_id, session, page, answer)
     screen = await _eligibility_screen(page)
     expected_group = _step_group(step)
-    if screen != "unknown" and screen != expected_group:
+    awaiting_other = (session.filled.get("rel_other_awaiting") or "").strip()
+    # While capturing Other free-text, stay on person_rel/child_rel even if the
+    # screen classifier briefly confuses person_form with spouse_form (chips gone).
+    member_forms = {"person_form", "child_form", "spouse_form"}
+    ignore_mismatch_for_other = (
+        awaiting_other in ("person_rel", "child_rel")
+        and step == awaiting_other
+        and screen in member_forms
+    )
+    if screen != "unknown" and screen != expected_group and not ignore_mismatch_for_other:
         # Do NOT treat mismatch as proof the caller's answer was applied.
         # Sync step to the browser and ask that question again.
         recovered = _screen_first_step(screen, session)
@@ -9606,6 +9733,15 @@ async def _submit_eligibility_answer(
             "step": recovered,
             "screen": screen,
         }
+    if ignore_mismatch_for_other and screen != expected_group:
+        logger.info(
+            "Eligibility step mismatch ignored for other-rel call_id=%s "
+            "server_step=%s browser_screen=%s awaiting=%s",
+            call_id,
+            step,
+            screen,
+            awaiting_other,
+        )
 
     _mark(call_id, "browser_action", started)
     lowered = answer.lower()
@@ -9918,11 +10054,25 @@ async def _submit_eligibility_answer(
         )
     elif step == "child_rel":
         if session.filled.get("rel_other_awaiting") == "child_rel":
-            custom = await _fill_other_relationship_text(page, answer)
-            session.filled["child_rel"] = "Other"
-            session.filled["child_rel_other"] = custom
-            session.filled.pop("rel_other_awaiting", None)
-            next_step = "child_age"
+            if _is_bare_other_relationship(answer):
+                raise RuntimeError("REL_CLARIFY: " + _OTHER_REL_PROMPT)
+            labels = await _visible_choice_labels(page)
+            remapped = _map_relationship_label(answer, labels)
+            if remapped and remapped.lower().rstrip(" *") != "other":
+                other_prompt = await _apply_relationship_chip_for_kind(
+                    session, page, "child", remapped
+                )
+                if other_prompt:
+                    next_step = "child_rel"
+                    spoken_override = other_prompt
+                else:
+                    next_step = "child_age"
+            else:
+                custom = await _fill_other_relationship_text(page, answer)
+                session.filled["child_rel"] = "Other"
+                session.filled["child_rel_other"] = custom
+                session.filled.pop("rel_other_awaiting", None)
+                next_step = "child_age"
         else:
             labels = await _visible_choice_labels(page)
             mapped = _map_relationship_label(answer, labels)
@@ -10029,11 +10179,25 @@ async def _submit_eligibility_answer(
         )
     elif step == "person_rel":
         if session.filled.get("rel_other_awaiting") == "person_rel":
-            custom = await _fill_other_relationship_text(page, answer)
-            session.filled["person_rel"] = "Other"
-            session.filled["person_rel_other"] = custom
-            session.filled.pop("rel_other_awaiting", None)
-            next_step = "person_age"
+            if _is_bare_other_relationship(answer):
+                raise RuntimeError("REL_CLARIFY: " + _OTHER_REL_PROMPT)
+            labels = await _visible_choice_labels(page)
+            remapped = _map_relationship_label(answer, labels)
+            if remapped and remapped.lower().rstrip(" *") != "other":
+                other_prompt = await _apply_relationship_chip_for_kind(
+                    session, page, "person", remapped
+                )
+                if other_prompt:
+                    next_step = "person_rel"
+                    spoken_override = other_prompt
+                else:
+                    next_step = "person_age"
+            else:
+                custom = await _fill_other_relationship_text(page, answer)
+                session.filled["person_rel"] = "Other"
+                session.filled["person_rel_other"] = custom
+                session.filled.pop("rel_other_awaiting", None)
+                next_step = "person_age"
         else:
             labels = await _visible_choice_labels(page)
             mapped = _map_relationship_label(answer, labels)

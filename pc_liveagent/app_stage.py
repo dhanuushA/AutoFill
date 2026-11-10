@@ -271,59 +271,66 @@ PROGRAMS_CLARIFY = (
 )
 
 
-def build_programs_permission_speech(summary: dict[str, Any]) -> str:
-    """Spoken permission ask from scraped program-summary data — never invent programs.
+def _eligible_program_names(summary: dict[str, Any]) -> list[str]:
+    """Short spoken names for programs marked eligible — never not-eligible cards."""
+    names: list[str] = []
+    seen: set[str] = set()
+    for program in summary.get("programs") or []:
+        if not isinstance(program, dict) or not program.get("may_be_eligible"):
+            continue
+        name = _short_program_name(str(program.get("name") or ""))
+        key = name.lower()
+        if not name or key in seen:
+            continue
+        seen.add(key)
+        names.append(name)
+    return names
 
-    Speak only programs that may be eligible. Do not list Medicare/Marketplace
-    (or any other card) marked \"Not eligible at this time\".
+
+def build_programs_permission_speech(summary: dict[str, Any]) -> str:
+    """Acknowledge Great News eligible programs, then ask to continue.
+
+    Examples:
+      - only Medicaid → "You're only eligible for Medicaid..."
+      - several eligible → read them out, then ask to continue
+      - none eligible / Medicaid fallback already applied → say Medicaid was
+        selected and ask to continue
+    Never lists Medicare/Marketplace cards marked \"Not eligible at this time\".
     """
-    eligible = [
-        p
-        for p in (summary.get("programs") or [])
-        if isinstance(p, dict) and p.get("may_be_eligible")
-    ]
-    parts: list[str] = ["Your household eligibility check is complete."]
-    if eligible:
-        names = [_short_program_name(str(p.get("name") or "")) for p in eligible]
-        names = [n for n in names if n]
-        if len(names) == 1:
-            parts.append(
-                f"Pointcare indicates that your household may be eligible for {names[0]}."
-            )
-        elif names:
-            joined = ", ".join(names[:-1]) + f", and {names[-1]}"
-            parts.append(
-                f"Pointcare indicates that your household may be eligible for {joined}."
-            )
-        details = []
-        for p in eligible:
-            detail = (p.get("detail") or "").strip()
-            # Skip page chrome like "Not eligible at this time" if it leaked in.
-            if re.search(r"not eligible", detail, re.I):
-                continue
-            if detail and len(detail) < 160:
-                details.append(detail)
-        if details and len(details) == 1:
-            # Soften approval language if the page used strong wording.
-            soft = re.sub(
-                r"\b(are eligible|is eligible|approved)\b",
-                "may be eligible",
-                details[0],
-                flags=re.I,
-            )
-            if soft.lower() not in " ".join(parts).lower():
-                parts.append(soft if soft.endswith(".") else soft + ".")
-        parts.append(
-            "Would you like to continue and start the application? "
-            "Please say Yes or No."
+    names = _eligible_program_names(summary)
+    fallback = bool(summary.get("medicaid_fallback_applied"))
+    ask = (
+        "Would you like to continue to the application? Please say Yes or No."
+    )
+    if fallback and (not names or names == ["Medicaid"]):
+        return (
+            "Your household eligibility check is complete. "
+            "Pointcare didn't show an eligible program, so I selected Medicaid "
+            "for you. " + ask
         )
-    else:
-        parts.append(
-            "Pointcare does not currently show a program marked as one your "
-            "household may be eligible for. "
-            "Would you like to continue and start the application? Please say Yes or No."
+    if len(names) == 1:
+        only = names[0]
+        # MassHealth / Medicaid-only Great News (screenshot scenario).
+        if only.lower() in {"medicaid", "medi-cal"}:
+            return (
+                f"Your household eligibility check is complete. "
+                f"You're only eligible for {only}. " + ask
+            )
+        return (
+            f"Your household eligibility check is complete. "
+            f"You're only eligible for {only}. " + ask
         )
-    return " ".join(parts)
+    if len(names) > 1:
+        joined = ", ".join(names[:-1]) + f", and {names[-1]}"
+        return (
+            f"Your household eligibility check is complete. "
+            f"You're eligible for {joined}. " + ask
+        )
+    return (
+        "Your household eligibility check is complete. "
+        "Pointcare does not currently show a program marked as one your "
+        "household may be eligible for. " + ask
+    )
 
 
 def _short_program_name(name: str) -> str:
@@ -334,19 +341,27 @@ def _short_program_name(name: str) -> str:
     low = text.lower()
     if "medikids" in low or "healthy kids" in low:
         return text[:80].rstrip(" .,:;")
+    # MassHealth / CommonHealth cards speak as Medicaid for the caller.
+    if "masshealth" in low or "commonhealth" in low:
+        return "Medicaid"
     if "medicaid" in low or "medi-cal" in low or "medi cal" in low:
         if "medi-cal" in low or "medi cal" in low:
             return "Medi-Cal"
-        # Preserve state/program branding from the card instead of reducing
-        # "Health First Colorado (Medicaid)" to generic "Medicaid".
-        if low not in ("medicaid", "medicaid."):
-            return text[:80].rstrip(" .,:;")
+        if "health first colorado" in low:
+            return "Medicaid"
         return "Medicaid"
     if "medicare" in low:
         return "Medicare"
-    if "marketplace" in low or "covered california" in low or "aca" in low:
+    if (
+        "marketplace" in low
+        or "health connector" in low
+        or "covered california" in low
+        or re.search(r"\baca\b", low)
+    ):
         if "covered california" in low:
             return "Covered California"
+        if "health connector" in low:
+            return "Health Connector"
         return "ACA Marketplace"
     # Keep short titles; trim long card text.
     return text[:48].rstrip(" .,:;")
@@ -406,7 +421,7 @@ async def scrape_program_summary(page: Page) -> dict[str, Any]:
                 if (!text || text.length < 4 || text.length > 320) continue;
                 const low = text.toLowerCase();
                 const looksProgram = (
-                  /medicaid|medi-?cal|medicare|marketplace|covered california|\\baca\\b|medikids|healthy kids|florida/i.test(low)
+                  /masshealth|commonhealth|medicaid|medi-?cal|medicare|marketplace|covered california|\\baca\\b|medikids|healthy kids|florida/i.test(low)
                 );
                 if (!looksProgram) continue;
                 const hasResult = /may be eligible|might be eligible|eligible for|not eligible at this time|not eligible/i.test(low);
@@ -420,27 +435,44 @@ async def scrape_program_summary(page: Page) -> dict[str, Any]:
                 // Extract the card title while preserving state program branding.
                 const lines = rawText.split(/\\r?\\n/).map(norm).filter(Boolean);
                 let name = (lines.find((line) => (
-                  /medicaid|medi-?cal|medicare|marketplace|covered california|\\baca\\b|medikids|healthy kids/i.test(line)
+                  /masshealth|commonhealth|medicaid|medi-?cal|medicare|marketplace|covered california|\\baca\\b|medikids|healthy kids/i.test(line)
                   && !/may be eligible|might be eligible|eligible for|not eligible/i.test(line)
                 )) || '').slice(0, 80);
                 const nameMatch = text.match(
-                  /(Health First Colorado\\s*\\(Medicaid\\)|MediKids[^,;]{0,55}|Florida Healthy Kids[^,;]{0,45}|Health Connector\\s*\\(ACA Marketplace\\)|Medi-?Cal|Medicaid|Medicare|ACA Marketplace|Covered California)/i
+                  /(MassHealth\\s+CommonHealth\\s*\\(Medicaid\\)|MassHealth\\s+CommonHealth|Health First Colorado\\s*\\(Medicaid\\)|MediKids[^,;]{0,55}|Florida Healthy Kids[^,;]{0,45}|Health Connector\\s*\\(ACA Marketplace\\)|Medi-?Cal|Medicaid|Medicare|ACA Marketplace|Covered California)/i
                 );
                 if (!name && nameMatch) name = nameMatch[1];
                 if (!name) continue;
                 const key = name.toLowerCase();
                 if (seen.has(key)) continue;
                 seen.add(key);
+                // Only the program-level checkbox — ignore "Who is applying?" members.
                 let checked = false;
-                const input = el.querySelector && el.querySelector('input[type=checkbox]');
-                if (input) checked = !!input.checked;
-                const roleBox = el.matches && el.matches('[role=checkbox]')
-                  ? el
-                  : (el.querySelector && el.querySelector('[role=checkbox]'));
-                if (roleBox && roleBox.getAttribute('aria-checked') === 'true') checked = true;
+                const programBoxes = [];
+                let pastWho = false;
+                const kids = [el, ...(el.querySelectorAll ? [...el.querySelectorAll('*')] : [])];
+                for (const node of kids) {
+                  const t = ((node.innerText || node.textContent || '') + '').trim();
+                  if (t.length < 40 && /who is applying/i.test(t)) {
+                    pastWho = true;
+                    continue;
+                  }
+                  if (pastWho) continue;
+                  if (node.matches && node.matches('input[type=checkbox], [role=checkbox]')) {
+                    programBoxes.push(node);
+                  }
+                }
+                const roleBox = programBoxes[0] || null;
+                if (roleBox) {
+                  if (roleBox.matches && roleBox.matches('input[type=checkbox]')) {
+                    checked = !!roleBox.checked;
+                  } else {
+                    checked = (roleBox.getAttribute('aria-checked') || '') === 'true';
+                  }
+                }
                 const aria = el.getAttribute && el.getAttribute('aria-checked');
                 if (aria === 'true') checked = true;
-                if (aria === 'false') checked = false;
+                if (aria === 'false' && !roleBox) checked = false;
                 programs.push({
                   name,
                   detail: text.slice(0, 200),
@@ -507,7 +539,30 @@ async def wait_for_program_summary(
 
 
 async def store_program_summary(session: Any, page: Page) -> dict[str, Any]:
+    """Scrape Great News, apply Medicaid-only fallback when needed, store speech."""
     summary = await wait_for_program_summary(page)
+    # 0-eligible / Continue disabled → select Medicaid alone, then ask to continue.
+    if _programs_need_medicaid_fallback(summary):
+        ready = await ensure_programs_ready_to_continue(page)
+        if ready.get("selected"):
+            summary = await scrape_program_summary(page)
+            summary["medicaid_fallback_applied"] = True
+            # Ensure speech can name Medicaid even if scrape still lags.
+            eligible = _eligible_program_names(summary)
+            if not eligible:
+                summary.setdefault("programs", []).append(
+                    {
+                        "name": "Medicaid",
+                        "may_be_eligible": True,
+                        "checked": True,
+                        "detail": "Selected Medicaid to continue",
+                    }
+                )
+        logger.info(
+            "programs_summary_medicaid_fallback selected=%s eligible=%s",
+            ready.get("selected"),
+            len(_eligible_program_names(summary)),
+        )
     session.filled["program_summary_json"] = json.dumps(summary)
     speech = build_programs_permission_speech(summary)
     session.filled["programs_permission_speech"] = speech
@@ -1023,6 +1078,7 @@ async def run_application_only_browser(session: Any, page: Page, set_state) -> d
         # Exactly one Start Applications click, then wait for a real app screen.
         # URL alone must never prove the application opened.
         try:
+            await ensure_programs_ready_to_continue(page)
             clicked = await click_start_applications(page)
         except RuntimeError as exc:
             logger.warning(
@@ -1380,29 +1436,7 @@ def build_start_confirmation(summary: dict[str, Any]) -> str:
 
     Do not announce programs marked not eligible.
     """
-    eligible = [
-        p
-        for p in (summary.get("programs") or [])
-        if isinstance(p, dict) and p.get("may_be_eligible")
-    ]
-    parts: list[str] = []
-    names = [_short_program_name(str(p.get("name") or "")) for p in eligible]
-    names = [n for n in names if n]
-    if len(names) == 1:
-        parts.append(f"Pointcare shows your household may be eligible for {names[0]}.")
-    elif names:
-        joined = ", ".join(names[:-1]) + f", and {names[-1]}"
-        parts.append(f"Pointcare shows your household may be eligible for {joined}.")
-    else:
-        parts.append(
-            "Pointcare does not currently show a program marked as one your "
-            "household may be eligible for."
-        )
-    parts.append(
-        "Should I start the application for the eligible programs? "
-        "Please say Yes to start, or No to stop."
-    )
-    return " ".join(parts)
+    return build_programs_permission_speech(summary)
 
 
 async def begin_application_after_signin(session: Any, page: Page) -> str:
@@ -1594,6 +1628,7 @@ async def _start_application_from_permission(
 
     if surface == "programs":
         await store_program_summary(session, page)
+        await ensure_programs_ready_to_continue(page)
         clicked = await click_start_applications(page)
         started = await wait_for_application_started(page)
         if not started:
@@ -1844,6 +1879,7 @@ async def handle_application_gate(
             "Application already started",
             spoken_override=app_question_for_step(session.app_step),
         )
+    await ensure_programs_ready_to_continue(page)
     clicked = await click_start_applications(page)
     started = await wait_for_application_started(page)
     if not started:
@@ -1870,10 +1906,34 @@ async def handle_application_gate(
     session.filled["application_started"] = "1"
     session.filled["start_applications_clicked"] = clicked
     session.elig_step = ""
-    screen = await detect_application_screen(page)
-    next_step = screen if screen and screen != "programs" else "app_citizenship"
+    next_step = await wait_for_verified_first_stage_e_step(page, timeout_ms=12000)
+    if not next_step:
+        screen = await detect_application_screen(page)
+        if screen in _FIRST_STAGE_E_STEPS:
+            next_step = screen
+    if not next_step:
+        logger.error(
+            "stage_e_first_question_missing call_id=%s clicked=%s",
+            call_id,
+            clicked,
+        )
+        return {
+            "ok": False,
+            "call_id": call_id,
+            "field_id": "eligibility_answer",
+            "value": answer,
+            "error": "stage_e_first_question_missing",
+            "spoken": (
+                "ASK: I've opened the application, but the first question is "
+                "still loading. Please say next when you're ready."
+            ),
+            "message": "Application started but first question not verified",
+            "step": "confirm_start_application",
+            "phase": "eligibility",
+        }
     session.app_step = next_step
-    intro = "Okay, I've started the application. " + app_question_for_step(next_step)
+    first_question = await _first_stage_e_question_speech(page, session, next_step)
+    intro = "Okay, I've started the application. " + first_question
     logger.info(
         "stage_e_started call_id=%s clicked=%s first_step=%s",
         call_id,
@@ -1888,6 +1948,328 @@ async def handle_application_gate(
         "Started application",
         spoken_override=intro,
     )
+
+
+def _programs_need_medicaid_fallback(summary: dict[str, Any]) -> bool:
+    """True when Great News has no usable eligible selection yet.
+
+    Pointcare can show \"John may be eligible…\" on MassHealth while the headline
+    still says \"0 eligible programs\" and Continue is disabled. Force MassHealth
+    only in that empty/disabled case. When programs are already eligible /
+    selected, leave the page alone — the caller's Yes is enough.
+    """
+    programs = [
+        p for p in (summary.get("programs") or []) if isinstance(p, dict)
+    ]
+    body = str(summary.get("body_sample") or "")
+    eligible = [p for p in programs if p.get("may_be_eligible")]
+    checked_eligible = [p for p in eligible if p.get("checked")]
+    if checked_eligible:
+        return False
+    if re.search(r"\b0\s+eligible\s+programs?\b|found\s+0\s+eligible", body, re.I):
+        return True
+    if re.search(r"applying\s+to\s+0\s+programs?", body, re.I):
+        return True
+    if not eligible:
+        return True
+    # Eligible program cards are present — do not force MassHealth.
+    return False
+
+
+async def select_masshealth_commonhealth_program(page: Page) -> dict[str, Any]:
+    """Check only MassHealth CommonHealth (Medicaid); leave Medicare/ACA unchecked.
+
+    Also checks Who-is-applying members under that one card. Explicitly unchecks
+    other program cards so Continue applies to Medicaid only.
+    """
+    try:
+        result = await page.evaluate(
+            """() => {
+              const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+              const low = (s) => norm(s).toLowerCase();
+              const present = (el) => {
+                if (!el) return false;
+                let cur = el;
+                while (cur && cur.nodeType === 1) {
+                  const st = window.getComputedStyle(cur);
+                  if (st.display === 'none' || st.visibility === 'hidden') return false;
+                  cur = cur.parentElement;
+                }
+                return true;
+              };
+              const isChecked = (box) => {
+                if (!box) return false;
+                if (box.matches && box.matches('input[type=checkbox]')) {
+                  return !!box.checked;
+                }
+                return (box.getAttribute('aria-checked') || '').toLowerCase() === 'true';
+              };
+              const setChecked = (box, want) => {
+                if (!box || !present(box)) return false;
+                const already = isChecked(box);
+                if (already === want) return true;
+                try {
+                  box.dispatchEvent(new MouseEvent('click', {
+                    bubbles: true, cancelable: true, view: window,
+                  }));
+                } catch (e) {}
+                try { box.click(); } catch (e2) {}
+                if (typeof box.onclick === 'function') {
+                  try { box.onclick(); } catch (e3) {}
+                }
+                if (box.matches && box.matches('input[type=checkbox]')) {
+                  box.checked = !!want;
+                  box.dispatchEvent(new Event('input', { bubbles: true }));
+                  box.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+                if (box.getAttribute && box.getAttribute('role') === 'checkbox') {
+                  box.setAttribute('aria-checked', want ? 'true' : 'false');
+                }
+                return isChecked(box) === want || true;
+              };
+              const titleLines = (el) =>
+                ((el.innerText || el.textContent || '') + '')
+                  .split(/\\r?\\n/)
+                  .map(norm)
+                  .filter(Boolean);
+              const programKind = (text) => {
+                const t = low(text);
+                if (/masshealth|commonhealth/.test(t) || (
+                  /\\bmedicaid\\b|medi-?cal|health first colorado/.test(t)
+                  && !/medicare|marketplace|health connector|covered california/.test(t)
+                )) {
+                  return 'medicaid';
+                }
+                if (/\\bmedicare\\b/.test(t) && !/medicaid|commonhealth|masshealth/.test(t)) {
+                  return 'medicare';
+                }
+                if (/marketplace|health connector|covered california|\\baca\\b/.test(t)
+                    && !/medicaid|commonhealth|masshealth/.test(t)) {
+                  return 'marketplace';
+                }
+                return '';
+              };
+              const programCheckbox = (card) => {
+                if (card.matches && card.matches('[role=checkbox]') && present(card)) {
+                  return card;
+                }
+                const boxes = [];
+                let pastWho = false;
+                const nodes = [card, ...card.querySelectorAll('*')];
+                for (const node of nodes) {
+                  const t = ((node.innerText || node.textContent || '') + '').trim();
+                  if (t.length < 40 && /who is applying/i.test(t)) {
+                    pastWho = true;
+                    continue;
+                  }
+                  if (pastWho) continue;
+                  if (!(node.matches && node.matches(
+                    'input[type=checkbox], [role=checkbox]'
+                  ))) continue;
+                  if (!present(node)) continue;
+                  boxes.push(node);
+                }
+                if (!boxes.length) return null;
+                const roleFirst = boxes.find(
+                  (b) => b.getAttribute && b.getAttribute('role') === 'checkbox'
+                );
+                return roleFirst || boxes[0];
+              };
+              // Single-program cards only — reject wrappers that list multiple programs.
+              const isSingleProgramCard = (el) => {
+                if (!present(el)) return false;
+                const text = norm(el.innerText || el.textContent || '');
+                if (text.length < 8 || text.length > 520) return false;
+                const kinds = new Set();
+                for (const line of titleLines(el)) {
+                  if (line.length > 90) continue;
+                  const kind = programKind(line);
+                  if (kind) kinds.add(kind);
+                }
+                // Also catch cards whose body only has one program phrase.
+                if (!kinds.size) {
+                  const kind = programKind(text);
+                  if (kind) kinds.add(kind);
+                }
+                return kinds.size === 1;
+              };
+              const allCards = [...document.querySelectorAll(
+                'section, article, li, div'
+              )].filter((el) => isSingleProgramCard(el) && !!programCheckbox(el));
+              // Smallest single-program card wins (avoid outer wrappers).
+              const byKind = (want) => allCards
+                .filter((el) => {
+                  const lines = titleLines(el);
+                  const hit = lines.find((line) => programKind(line) === want)
+                    || (programKind(el.innerText || '') === want ? (el.innerText || '') : '');
+                  return !!hit;
+                })
+                .sort((a, b) =>
+                  norm(a.innerText || '').length - norm(b.innerText || '').length
+                );
+              const medicaidCards = byKind('medicaid').filter((el) => {
+                const t = low(el.innerText || '');
+                // Prefer MassHealth CommonHealth when present.
+                return /masshealth|commonhealth|medicaid|medi-?cal|health first colorado/.test(t);
+              });
+              medicaidCards.sort((a, b) => {
+                const ta = low(a.innerText || '');
+                const tb = low(b.innerText || '');
+                const sa = /masshealth\\s+commonhealth|commonhealth/.test(ta) ? 0
+                  : /masshealth/.test(ta) ? 1 : 2;
+                const sb = /masshealth\\s+commonhealth|commonhealth/.test(tb) ? 0
+                  : /masshealth/.test(tb) ? 1 : 2;
+                if (sa !== sb) return sa - sb;
+                return norm(a.innerText || '').length - norm(b.innerText || '').length;
+              });
+              if (!medicaidCards.length) {
+                return { ok: false, error: 'masshealth_card_not_found' };
+              }
+              const card = medicaidCards[0];
+              const title = norm(
+                titleLines(card).find((line) => programKind(line) === 'medicaid')
+                || titleLines(card)[0]
+                || ''
+              ).slice(0, 80);
+              const box = programCheckbox(card);
+              const before = isChecked(box);
+              setChecked(box, true);
+
+              // Who is applying? — only inside THIS medicaid card (never page-wide).
+              let membersChecked = 0;
+              const nodes = [...card.querySelectorAll(
+                'label, li, div, [role="checkbox"], input[type=checkbox]'
+              )];
+              let inWho = false;
+              for (const node of nodes) {
+                const t = low(node.innerText || node.textContent || '');
+                if (/who is applying/.test(t)) {
+                  inWho = true;
+                  continue;
+                }
+                if (!inWho) continue;
+                if (/continue to applications|start applications|return to dashboard|applying to \\d/.test(t)) {
+                  break;
+                }
+                const memberBox = node.matches && (
+                  node.matches('input[type=checkbox]') || node.matches('[role=checkbox]')
+                ) ? node : (node.querySelector && (
+                  node.querySelector('input[type=checkbox], [role=checkbox]')
+                ));
+                if (!memberBox || !present(memberBox)) continue;
+                if (memberBox === box) continue;
+                if (setChecked(memberBox, true)) membersChecked += 1;
+              }
+
+              // Force Medicare / Marketplace program cards OFF.
+              let uncheckedOthers = 0;
+              for (const kind of ['medicare', 'marketplace']) {
+                for (const other of byKind(kind)) {
+                  // Skip if this node is inside the medicaid card we selected.
+                  if (card.contains(other) || other.contains(card)) continue;
+                  const otherBox = programCheckbox(other);
+                  if (!otherBox || otherBox === box) continue;
+                  if (isChecked(otherBox)) {
+                    setChecked(otherBox, false);
+                    uncheckedOthers += 1;
+                  }
+                }
+              }
+
+              return {
+                ok: true,
+                name: title,
+                was_checked: before,
+                now_checked: isChecked(box),
+                box_id: box.id || '',
+                box_aria: box.getAttribute ? (box.getAttribute('aria-checked') || '') : '',
+                members_checked: membersChecked,
+                unchecked_others: uncheckedOthers,
+              };
+            }"""
+        )
+    except Exception as exc:
+        logger.exception("select_masshealth_commonhealth_program failed")
+        return {"ok": False, "error": str(exc)[:200]}
+    if not isinstance(result, dict):
+        return {"ok": False, "error": "invalid_select_result"}
+    # Playwright click fallback: only the MassHealth card checkbox.
+    if result.get("ok") and not result.get("now_checked"):
+        try:
+            loc = page.get_by_text(
+                re.compile(
+                    r"MassHealth\s+CommonHealth\s*\(Medicaid\)|MassHealth\s+CommonHealth",
+                    re.I,
+                )
+            ).first
+            card = loc.locator(
+                "xpath=ancestor::*[self::section or self::article or self::li][1]"
+            )
+            box = card.locator('[role="checkbox"], input[type="checkbox"]').first
+            if await box.count() > 0:
+                await box.click(timeout=2500, force=True)
+                result["playwright_click"] = True
+        except Exception:
+            logger.info("masshealth playwright click fallback skipped", exc_info=True)
+    try:
+        await page.wait_for_timeout(400)
+    except Exception:
+        pass
+    return result
+
+
+async def ensure_programs_ready_to_continue(page: Page) -> dict[str, Any]:
+    """Before Continue/Start: select MassHealth only when nothing is eligible.
+
+    If Pointcare already shows eligible program(s), leave the UI alone and let
+    the caller's Yes drive Continue / Start Applications.
+    """
+    summary = await scrape_program_summary(page)
+    eligible = [
+        p
+        for p in (summary.get("programs") or [])
+        if isinstance(p, dict) and p.get("may_be_eligible")
+    ]
+    if not _programs_need_medicaid_fallback(summary):
+        reason = "already_selected" if any(
+            p.get("checked") for p in eligible
+        ) else "eligible_present"
+        logger.info(
+            "programs_ready reason=%s eligible=%s",
+            reason,
+            len(eligible),
+        )
+        return {
+            "ok": True,
+            "selected": False,
+            "reason": reason,
+            "eligible_count": len(eligible),
+        }
+
+    selected = await select_masshealth_commonhealth_program(page)
+    logger.info(
+        "programs_medicaid_fallback ok=%s name=%r members=%s error=%s",
+        selected.get("ok"),
+        str(selected.get("name") or "")[:60],
+        selected.get("members_checked"),
+        selected.get("error") or "",
+    )
+    # Card expand reveals "Who is applying?" — pass again for member boxes.
+    if selected.get("ok"):
+        try:
+            await page.wait_for_timeout(350)
+            again = await select_masshealth_commonhealth_program(page)
+            if again.get("ok"):
+                selected = again
+        except Exception:
+            pass
+    return {
+        "ok": bool(selected.get("ok")),
+        "selected": bool(selected.get("ok")),
+        "reason": "medicaid_fallback",
+        "detail": selected,
+        "eligible_count": len(eligible),
+    }
 
 
 async def click_start_applications(page: Page) -> str:
@@ -1974,13 +2356,19 @@ async def wait_for_application_started(page: Page, *, timeout_ms: int = 20000) -
         ):
             await page.wait_for_timeout(350)
             continue
+        # Require a real first-question cue. Bare "Step 1 of N" while loading
+        # used to mark success too early, then defaulted speech to citizenship
+        # while the licensed-agent offer was still painting.
         if "start applications" not in body and (
-            "u.s. citizen" in body
+            "licensed agent" in body
+            or "clearguide" in body
+            or (
+                "connect me" in body
+                and ("medicare" in body or "marketplace" in body or "agent" in body)
+            )
+            or "u.s. citizen" in body
             or "us citizen" in body
             or "application eligibility" in body
-            or "step 1 of" in body
-            or "licensed agent" in body
-            or "clearguide" in body
         ):
             return True
         await page.wait_for_timeout(350)
@@ -2028,7 +2416,20 @@ async def detect_application_screen(page: Page) -> str:
         return "programs"
     if _is_household_dashboard_text(body):
         return ""
-    if "licensed agent" in body or "clearguide" in body or "connect me" in body:
+    # Agent offer is often the first Stage E screen. Prefer it over citizenship
+    # chrome that can linger in the SPA shell while this question paints.
+    if (
+        "licensed agent" in body
+        or "clearguide" in body
+        or (
+            "connect me" in body
+            and ("medicare" in body or "marketplace" in body or "agent" in body)
+        )
+        or (
+            "insurance agent" in body
+            and ("medicare" in body or "marketplace" in body or "enrollment" in body)
+        )
+    ):
         return "app_agent_offer"
     # Later Stage E questions often still mention "U.S. Citizen" in household
     # chrome. Match the active question first so citizenship Yes→Next cannot be
@@ -2680,16 +3081,29 @@ async def _verified_application_question_one(page: Page) -> str:
     Never trusts URL or a previous call's ``app_step``. Citizenship requires
     citizen wording; agent-offer requires licensed-agent / ClearGuide cues.
     """
+    body = await _page_body_lower(page)
+    # Prefer agent-offer cues even when household chrome still mentions citizens.
+    if body and (
+        "licensed agent" in body
+        or "clearguide" in body
+        or "connect me with" in body
+        or (
+            "connect me" in body
+            and ("medicare" in body or "marketplace" in body or "agent" in body)
+        )
+    ):
+        return "app_agent_offer"
     screen = await detect_application_screen(page)
     if screen not in _FIRST_STAGE_E_STEPS:
         return ""
-    body = await _page_body_lower(page)
     if not body:
         # Scrape failed; detect already mapped a first-step key from prior reads.
         return screen
     if screen == "app_citizenship":
         if "citizen" not in body:
             return ""
+        # Loading spinner / Step 1 chrome alone is not enough when agent copy
+        # has not painted yet — wait_for_verified_* will poll again.
         return screen
     if screen == "app_agent_offer":
         if not (
@@ -2700,6 +3114,56 @@ async def _verified_application_question_one(page: Page) -> str:
             return ""
         return screen
     return ""
+
+
+async def wait_for_verified_first_stage_e_step(
+    page: Page, *, timeout_ms: int = 12000
+) -> str:
+    """Wait until the first real Stage E question is visible and verified.
+
+    Avoids the latest-call bug: Start Applications lands on licensed-agent
+    offer, but a premature default to ``app_citizenship`` spoke the wrong
+    question and only recovered after the caller talked again.
+    """
+    deadline = time.monotonic() + max(0.5, timeout_ms / 1000.0)
+    last = ""
+    while time.monotonic() < deadline:
+        step = await _verified_application_question_one(page)
+        if step in _FIRST_STAGE_E_STEPS:
+            if step != last:
+                logger.info("stage_e_first_question_verified step=%s", step)
+            return step
+        last = step or last
+        try:
+            await page.wait_for_timeout(250)
+        except Exception:
+            time.sleep(0.25)
+    final = await _verified_application_question_one(page)
+    logger.warning(
+        "stage_e_first_question_unverified last=%s final=%s",
+        last or "-",
+        final or "-",
+    )
+    return final if final in _FIRST_STAGE_E_STEPS else ""
+
+
+async def _first_stage_e_question_speech(page: Page, session: Any, step: str) -> str:
+    """Spoken first Stage E question matching the live screen."""
+    if step == "app_agent_offer":
+        return app_question_for_step(step, session)
+    if step == "app_citizenship":
+        body = await _page_body_lower(page)
+        # Prefer the household wording when the form asks about all members.
+        if body and (
+            "household members" in body
+            or "everyone listed" in body
+            or re.search(r"\ball\b.{0,40}\bcitizen", body)
+        ):
+            return APP_QUESTIONS["app_citizenship"]
+        return _citizenship_question(
+            await _citizenship_household_names(page, session)
+        )
+    return app_question_for_step(step, session)
 
 
 def _app_step_parent(step: str) -> str:
@@ -12229,14 +12693,22 @@ async def handle_programs_decision(
             spoken_override=app_question_for_step(session.app_step),
         )
 
+    # Zero-eligible Great News: check MassHealth CommonHealth first so Continue enables.
+    # Already-eligible summaries: leave selection alone; Yes alone continues.
+    ready = await ensure_programs_ready_to_continue(page)
+    session.filled["programs_ready_reason"] = str(ready.get("reason") or "")
+    if ready.get("selected"):
+        session.filled["programs_medicaid_selected"] = "1"
+
     clicked = await click_start_applications(page)
     started = await wait_for_application_started(page)
     if not started:
         logger.error(
-            "start_applications_not_verified call_id=%s clicked=%s url=%s",
+            "start_applications_not_verified call_id=%s clicked=%s url=%s ready=%s",
             call_id,
             clicked,
             (page.url or "")[:120],
+            ready.get("reason"),
         )
         return {
             "ok": False,
@@ -12256,15 +12728,33 @@ async def handle_programs_decision(
     session.filled["application_started"] = "1"
     session.filled["start_applications_clicked"] = clicked
     session.elig_step = ""
-    screen = await detect_application_screen(page)
-    next_step = screen if screen and screen != "programs" else "app_citizenship"
-    session.app_step = next_step
-    if next_step == "app_citizenship":
-        first_question = _citizenship_question(
-            await _citizenship_household_names(page, session)
+    next_step = await wait_for_verified_first_stage_e_step(page, timeout_ms=12000)
+    if not next_step:
+        screen = await detect_application_screen(page)
+        if screen in _FIRST_STAGE_E_STEPS:
+            next_step = screen
+    if not next_step:
+        logger.error(
+            "stage_e_first_question_missing call_id=%s clicked=%s",
+            call_id,
+            clicked,
         )
-    else:
-        first_question = app_question_for_step(next_step)
+        return {
+            "ok": False,
+            "call_id": call_id,
+            "field_id": "eligibility_answer",
+            "value": answer,
+            "error": "stage_e_first_question_missing",
+            "spoken": (
+                "ASK: I've opened the application, but the first question is "
+                "still loading. Please say next when you're ready."
+            ),
+            "message": "Application started but first question not verified",
+            "step": "programs",
+            "phase": "eligibility",
+        }
+    session.app_step = next_step
+    first_question = await _first_stage_e_question_speech(page, session, next_step)
     intro = "Okay, I've started the application. " + first_question
     logger.info(
         "stage_e_started call_id=%s clicked=%s first_step=%s",

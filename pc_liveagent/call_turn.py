@@ -31,6 +31,20 @@ from .answer_parse import (
 from .control_intent import detect_control_intent, parse_member_correction
 from .elig_meta import format_question, get_field_meta
 from .live_fill_prompt import LIVE_FILL_GREETING
+from .mode_router import (
+    AI_FILL_ACK,
+    GUIDE_DONE,
+    GUIDE_STEPS,
+    LIVE_AGENT_CONNECTING,
+    LIVE_AGENT_NO_NUMBER,
+    MODE_CLARIFY,
+    MODE_INTRO_AND_MENU,
+    classify_help_mode_async,
+    guide_speech_for_step,
+    guide_wants_advance,
+    guide_wants_ai_fill,
+    guide_wants_live_agent,
+)
 from .call_trace import clear_call_trace, trace_event
 from .live_form import (
     ELIG_QUESTIONS,
@@ -115,21 +129,65 @@ def identity_opening(name: str = "") -> str:
 
 # Outbound caller display name keyed by Retell call_id (set before WS opens).
 _caller_names: dict[str, str] = {}
+# Optional live-agent E.164 for cold transfer on this call.
+_caller_agent_numbers: dict[str, str] = {}
+# PointCare URL for deferred browser open (AI-fill only).
+_caller_form_urls: dict[str, str] = {}
+_ai_fill_browser_tasks: dict[str, asyncio.Task] = {}
 
 
-def register_outbound_caller(call_id: str, name: str = "") -> None:
+def register_outbound_caller(
+    call_id: str,
+    name: str = "",
+    agent_number: str = "",
+    form_url: str = "",
+) -> None:
     cid = (call_id or "").strip()
     who = (name or "").strip()
+    agent = (agent_number or "").strip()
     if not cid:
         return
     if who:
         _caller_names[cid] = who
     else:
         _caller_names.pop(cid, None)
+    if agent:
+        _caller_agent_numbers[cid] = agent
+    elif cid in _caller_agent_numbers and not agent:
+        # Keep prior agent number unless explicitly cleared via empty+pop elsewhere.
+        pass
+    if (form_url or "").strip():
+        register_outbound_form_url(cid, form_url)
+
+
+def register_outbound_form_url(call_id: str, form_url: str = "") -> None:
+    cid = (call_id or "").strip()
+    url = (form_url or "").strip()
+    if not cid or not url:
+        return
+    _caller_form_urls[cid] = url
 
 
 def peek_outbound_caller(call_id: str) -> str:
     return (_caller_names.get((call_id or "").strip()) or "").strip()
+
+
+def peek_outbound_agent_number(call_id: str) -> str:
+    return (_caller_agent_numbers.get((call_id or "").strip()) or "").strip()
+
+
+def peek_outbound_form_url(call_id: str) -> str:
+    return (_caller_form_urls.get((call_id or "").strip()) or "").strip()
+
+
+def resolve_live_agent_number(call_id: str = "") -> str:
+    """Per-call override, then LIVE_AGENT_NUMBER from env."""
+    from . import config as _cfg
+
+    return (
+        peek_outbound_agent_number(call_id)
+        or (getattr(_cfg, "LIVE_AGENT_NUMBER", "") or "").strip()
+    )
 EMAIL_QUESTION = "What email address should I use?"
 EMAIL_CLARIFY = (
     "I didn't catch a full email address. Please say it slowly, like "
@@ -233,6 +291,34 @@ class TurnResult:
     turn_id: str = ""
     ok: bool = True
     detail: str = ""
+    # Custom LLM cold transfer — Retell dials this after speech finishes.
+    transfer_number: str = ""
+
+
+def _route_live_agent(
+    ctrl: "CallController", call_id: str, *, turn_id: str = ""
+) -> TurnResult:
+    """Same-call cold transfer when a live-agent number is configured."""
+    ctrl.help_mode = "live_agent"
+    number = resolve_live_agent_number(call_id)
+    if not number:
+        ctrl.phase = "mode_choice"
+        ctrl.last_speech = LIVE_AGENT_NO_NUMBER
+        return TurnResult(
+            speech=LIVE_AGENT_NO_NUMBER,
+            phase="mode_choice",
+            turn_id=turn_id,
+            detail="live_agent_missing_number",
+        )
+    ctrl.phase = "closing"
+    ctrl.last_speech = LIVE_AGENT_CONNECTING
+    return TurnResult(
+        speech=LIVE_AGENT_CONNECTING,
+        phase="closing",
+        turn_id=turn_id,
+        detail="live_agent_transfer",
+        transfer_number=number,
+    )
 
 
 def _speakable_email(addr: str) -> str:
@@ -305,7 +391,7 @@ def _wants_email_go_back(text: str) -> bool:
 @dataclass
 class CallController:
     call_id: str
-    # identity|language|sign_in|email|email_confirm|email_await_secure|google_email|eligibility|application|closing
+    # identity|mode_choice|guide|language|sign_in|email|email_confirm|email_await_secure|google_email|eligibility|application|closing
     phase: str = "identity"
     turn_seq: int = 0
     # Dedupe key includes phase/step so consecutive Yes/No across questions apply.
@@ -313,6 +399,9 @@ class CallController:
     last_dedupe_ctx: str = ""
     last_speech: str = LIVE_FILL_GREETING
     caller_name: str = ""
+    # Index into GUIDE_STEPS while phase == guide.
+    guide_step: int = 0
+    help_mode: str = ""
     pending_op_id: str = ""
     committed: list[dict[str, Any]] = field(default_factory=list)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -395,7 +484,9 @@ async def drop_controller(call_id: str) -> None:
     except Exception:
         pass
     clear_call_trace(call_id)
-    _caller_names.pop((call_id or "").strip(), None)
+    cid = (call_id or "").strip()
+    _caller_names.pop(cid, None)
+    _caller_agent_numbers.pop(cid, None)
     async with _controllers_lock:
         _controllers.pop(call_id, None)
 
@@ -837,7 +928,8 @@ async def begin_speech(call_id: str) -> str:
         existing = _controllers.get(call_id)
         if existing is not None and (
             existing.turn_seq > 0
-            or existing.phase not in ("", "identity", "language")
+            or existing.phase
+            not in ("", "identity", "mode_choice", "language")
         ):
             speech = existing.last_speech or identity_opening(existing.caller_name)
             logger.info(
@@ -996,6 +1088,35 @@ async def sync_controller_to_eligibility(call_id: str) -> str | None:
         speech[:80],
     )
     return speech
+
+
+def _schedule_ai_fill_browser(call_id: str, form_url: str = "") -> None:
+    """Open PointCare Chrome only after the caller chooses AI fill."""
+    prev = _ai_fill_browser_tasks.get(call_id)
+    if prev is not None and not prev.done():
+        return
+
+    async def _run() -> None:
+        from .live_form import start_live_form
+
+        url = (
+            (form_url or "").strip()
+            or peek_outbound_form_url(call_id)
+            or config.POINTCARE_URL
+        )
+        try:
+            await start_live_form(call_id, url)
+            logger.info("ai_fill_browser_opened call_id=%s url=%s", call_id, url)
+        except Exception:
+            logger.exception("ai_fill_browser_open_failed call_id=%s", call_id)
+        finally:
+            current = _ai_fill_browser_tasks.get(call_id)
+            if current is asyncio.current_task():
+                _ai_fill_browser_tasks.pop(call_id, None)
+
+    _ai_fill_browser_tasks[call_id] = asyncio.create_task(
+        _run(), name=f"ai-fill-browser-{call_id}"
+    )
 
 
 def _schedule_application_only(call_id: str) -> None:
@@ -1750,6 +1871,10 @@ async def _repeat_with_context(call_id: str, ctrl: CallController) -> str:
     phase = ctrl.phase or ""
     if phase == "identity":
         return identity_opening(ctrl.caller_name or peek_outbound_caller(call_id))
+    if phase == "mode_choice":
+        return MODE_INTRO_AND_MENU
+    if phase == "guide":
+        return guide_speech_for_step(ctrl.guide_step)
     if phase == "language":
         return LIVE_FILL_GREETING
     if phase == "sign_in":
@@ -2465,11 +2590,11 @@ async def process_user_turn(
             if _is_yes(text):
                 ctrl.last_user_fp = fp
                 ctrl.last_dedupe_ctx = dedupe_ctx
-                ctrl.phase = "language"
-                ctrl.last_speech = LIVE_FILL_GREETING
+                ctrl.phase = "mode_choice"
+                ctrl.last_speech = MODE_INTRO_AND_MENU
                 return TurnResult(
-                    speech=LIVE_FILL_GREETING,
-                    phase="language",
+                    speech=MODE_INTRO_AND_MENU,
+                    phase="mode_choice",
                     turn_id=turn_id,
                     detail="identity_confirmed",
                 )
@@ -2483,6 +2608,99 @@ async def process_user_turn(
                 phase="identity",
                 turn_id=turn_id,
                 detail="identity_clarify",
+            )
+
+        if ctrl.phase == "mode_choice":
+            # Soft intent match + Claude fallback — do not require menu-exact wording.
+            mode = await classify_help_mode_async(text)
+            ctrl.last_user_fp = fp
+            ctrl.last_dedupe_ctx = dedupe_ctx
+            if mode == "live_agent":
+                return _route_live_agent(ctrl, call_id, turn_id=turn_id)
+            if mode == "guide":
+                ctrl.help_mode = "guide"
+                ctrl.guide_step = 0
+                ctrl.phase = "guide"
+                speech = guide_speech_for_step(0)
+                ctrl.last_speech = speech
+                return TurnResult(
+                    speech=speech,
+                    phase="guide",
+                    turn_id=turn_id,
+                    detail="mode_guide",
+                )
+            if mode == "ai_fill":
+                ctrl.help_mode = "ai_fill"
+                ctrl.phase = "language"
+                _schedule_ai_fill_browser(
+                    call_id, form_url or peek_outbound_form_url(call_id)
+                )
+                speech = AI_FILL_ACK + LIVE_FILL_GREETING
+                ctrl.last_speech = speech
+                return TurnResult(
+                    speech=speech,
+                    phase="language",
+                    turn_id=turn_id,
+                    detail="mode_ai_fill",
+                )
+            ctrl.last_speech = MODE_CLARIFY
+            return TurnResult(
+                speech=MODE_CLARIFY,
+                phase="mode_choice",
+                turn_id=turn_id,
+                detail="mode_clarify",
+            )
+
+        if ctrl.phase == "guide":
+            ctrl.last_user_fp = fp
+            ctrl.last_dedupe_ctx = dedupe_ctx
+            if guide_wants_live_agent(text):
+                return _route_live_agent(ctrl, call_id, turn_id=turn_id)
+            if guide_wants_ai_fill(text):
+                ctrl.help_mode = "ai_fill"
+                ctrl.phase = "language"
+                _schedule_ai_fill_browser(
+                    call_id, form_url or peek_outbound_form_url(call_id)
+                )
+                speech = AI_FILL_ACK + LIVE_FILL_GREETING
+                ctrl.last_speech = speech
+                return TurnResult(
+                    speech=speech,
+                    phase="language",
+                    turn_id=turn_id,
+                    detail="guide_to_ai_fill",
+                )
+            if guide_wants_advance(text):
+                ctrl.guide_step += 1
+                if ctrl.guide_step >= len(GUIDE_STEPS):
+                    ctrl.phase = "closing"
+                    ctrl.last_speech = GUIDE_DONE
+                    return TurnResult(
+                        speech=GUIDE_DONE,
+                        end_call=True,
+                        phase="closing",
+                        turn_id=turn_id,
+                        detail="guide_done",
+                    )
+                speech = guide_speech_for_step(ctrl.guide_step)
+                ctrl.last_speech = speech
+                return TurnResult(
+                    speech=speech,
+                    phase="guide",
+                    turn_id=turn_id,
+                    detail=f"guide_step_{ctrl.guide_step}",
+                )
+            # Unclear — repeat current coaching step.
+            speech = (
+                "Take your time on that step. "
+                + guide_speech_for_step(ctrl.guide_step)
+            )
+            ctrl.last_speech = speech
+            return TurnResult(
+                speech=speech,
+                phase="guide",
+                turn_id=turn_id,
+                detail="guide_repeat",
             )
 
         if ctrl.phase == "language":

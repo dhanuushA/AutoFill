@@ -49,6 +49,8 @@ class FormFillerCallIn(BaseModel):
     name: str = ""
     form_name: str = ""
     agent_id: str = ""
+    # Live-agent E.164 for same-call cold transfer when caller chooses that mode.
+    agent_number: str = ""
     form_url: str | None = None
 
 
@@ -119,49 +121,31 @@ async def form_filler_outbound(
             detail=result.get("error") or "Failed to place call.",
         )
     call_id = str(result.get("call_id") or "")
-    if call_id:
-        register_outbound_caller(call_id, payload.name)
     form_url = (payload.form_url or "").strip() or config.POINTCARE_URL
+    if call_id:
+        register_outbound_caller(
+            call_id,
+            payload.name,
+            agent_number=payload.agent_number or "",
+            form_url=form_url,
+        )
     base = _request_base_url(request)
     chrome_link = _chrome_session_url(base, call_id)
-    # Open Chrome and auto-click the welcome pages before/while the call connects.
+    # Defer Chrome until the caller chooses AI fill on the call.
+    # Welcome/dev helpers and application-test modes still open immediately.
     if call_id and form_url:
-        try:
-            started = await on_call_started(call_id, form_url)
-            # Rebuild open_url against the public base so Postman/ops can click it.
-            live = await get_session(call_id)
-            browser = await describe_live_browser(
-                live, call_id=call_id, open_base_url=base
-            )
-            # Never claim success when the browser snapshot says otherwise.
-            if not browser.get("opened"):
-                browser["opened"] = False
-                browser["error"] = (
-                    browser.get("error")
-                    or (started.get("error") if isinstance(started, dict) else "")
-                    or "Browser session did not open."
-                )
-            result["browser"] = browser
-            result["chrome_url"] = browser.get("open_url") or chrome_link
-        except Exception as exc:
-            logger.exception("Failed to open Pointcare for call_id=%s", call_id)
-            # Safe public error — no filesystem paths or secrets.
-            safe = "Browser startup failed. Check server logs for details."
-            err_text = str(exc)
-            if "Chrome was not found" in err_text or "CHROME_EXECUTABLE" in err_text:
-                safe = (
-                    "Google Chrome was not found on this host. "
-                    "Install google-chrome-stable or set CHROME_EXECUTABLE."
-                )
-            elif "remote debugging" in err_text.lower():
-                safe = "Chrome started but remote debugging did not become ready."
-            result["browser"] = {
-                "opened": False,
-                "error": safe,
-                "open_url": chrome_link,
-            }
-            result["chrome_url"] = chrome_link
-            background_tasks.add_task(on_call_started, call_id, form_url)
+        started = await on_call_started(call_id, form_url, open_browser=False)
+        result["browser"] = {
+            "opened": False,
+            "deferred": True,
+            "url": form_url,
+            "open_url": chrome_link,
+            "error": "",
+            "note": "Browser opens after the caller chooses AI form fill.",
+        }
+        if isinstance(started, dict) and started.get("error"):
+            result["browser"]["error"] = str(started.get("error") or "")[:200]
+        result["chrome_url"] = chrome_link
     return result
 
 
@@ -175,7 +159,7 @@ async def form_filler_welcome(
     if payload and (payload.form_url or "").strip():
         form_url = payload.form_url.strip()
     try:
-        session = await on_call_started(call_id, form_url)
+        session = await on_call_started(call_id, form_url, open_browser=True)
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     live = await get_session(call_id)

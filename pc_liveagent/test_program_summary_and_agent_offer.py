@@ -115,6 +115,142 @@ class ProgramSummaryAndAgentOfferTests(unittest.IsolatedAsyncioTestCase):
             await detect_application_screen(self._page), "app_citizenship"
         )
 
+    async def test_zero_eligible_selects_masshealth_commonhealth(self) -> None:
+        from pc_liveagent.app_stage import (
+            ensure_programs_ready_to_continue,
+            scrape_program_summary,
+        )
+
+        await self._page.set_content(
+            """
+            <h1>Great News!</h1>
+            <p>We found 0 eligible programs for all 2 household members.</p>
+            <section id="mh" class="program-card">
+              <div id="mh-box" role="checkbox" aria-checked="false"
+                   style="width:20px;height:20px;border:1px solid #333;"
+                   onclick="this.setAttribute('aria-checked','true');
+                            document.getElementById('who').style.display='block';
+                            document.getElementById('cta').disabled=false;
+                            document.getElementById('count').textContent=
+                              'Applying to 1 program for 2 members.';"></div>
+              <div>MassHealth CommonHealth (Medicaid)</div>
+              <div>John may be eligible for MassHealth CommonHealth</div>
+              <div id="who" style="display:none">
+                <div>Who is applying?</div>
+                <label><input id="m1" type="checkbox" /> Admin PointCare</label>
+                <label><input id="m2" type="checkbox" /> John David</label>
+              </div>
+            </section>
+            <section id="medicare" class="program-card">
+              <div id="medicare-box" role="checkbox" aria-checked="false"
+                   style="width:20px;height:20px;border:1px solid #333;"
+                   onclick="this.setAttribute('aria-checked',
+                     this.getAttribute('aria-checked')==='true'?'false':'true');"></div>
+              <div>Medicare</div>
+              <div>Not eligible at this time</div>
+            </section>
+            <section id="aca" class="program-card">
+              <div id="aca-box" role="checkbox" aria-checked="false"
+                   style="width:20px;height:20px;border:1px solid #333;"
+                   onclick="this.setAttribute('aria-checked',
+                     this.getAttribute('aria-checked')==='true'?'false':'true');"></div>
+              <div>Health Connector (ACA Marketplace)</div>
+              <div>Not eligible at this time</div>
+            </section>
+            <p id="count">Applying to 0 programs for 0 members.</p>
+            <button id="cta" disabled>Continue to Applications</button>
+            """
+        )
+
+        summary = await scrape_program_summary(self._page)
+        self.assertTrue(
+            any("MassHealth" in str(p.get("name") or "") for p in summary["programs"])
+        )
+        ready = await ensure_programs_ready_to_continue(self._page)
+        self.assertEqual(ready.get("reason"), "medicaid_fallback")
+        self.assertTrue(ready.get("selected"))
+        self.assertEqual(
+            await self._page.get_attribute("#mh-box", "aria-checked"), "true"
+        )
+        self.assertEqual(
+            await self._page.get_attribute("#medicare-box", "aria-checked"), "false"
+        )
+        self.assertEqual(
+            await self._page.get_attribute("#aca-box", "aria-checked"), "false"
+        )
+        self.assertTrue(await self._page.is_checked("#m1"))
+        self.assertTrue(await self._page.is_checked("#m2"))
+        self.assertFalse(await self._page.is_disabled("#cta"))
+
+    async def test_medicaid_fallback_unchecks_other_programs(self) -> None:
+        from pc_liveagent.app_stage import select_masshealth_commonhealth_program
+
+        await self._page.set_content(
+            """
+            <h1>Great News!</h1>
+            <p>We found 0 eligible programs for all 2 household members.</p>
+            <section id="mh" class="program-card">
+              <div id="mh-box" role="checkbox" aria-checked="false"
+                   style="width:20px;height:20px;"
+                   onclick="this.setAttribute('aria-checked','true');"></div>
+              <div>MassHealth CommonHealth (Medicaid)</div>
+              <div>John may be eligible for MassHealth CommonHealth</div>
+            </section>
+            <section class="program-card">
+              <div id="medicare-box" role="checkbox" aria-checked="true"
+                   style="width:20px;height:20px;"
+                   onclick="this.setAttribute('aria-checked',
+                     this.getAttribute('aria-checked')==='true'?'false':'true');"></div>
+              <div>Medicare</div>
+              <div>Not eligible at this time</div>
+            </section>
+            <section class="program-card">
+              <div id="aca-box" role="checkbox" aria-checked="true"
+                   style="width:20px;height:20px;"
+                   onclick="this.setAttribute('aria-checked',
+                     this.getAttribute('aria-checked')==='true'?'false':'true');"></div>
+              <div>Health Connector (ACA Marketplace)</div>
+              <div>Not eligible at this time</div>
+            </section>
+            <button>Continue to Applications</button>
+            """
+        )
+        result = await select_masshealth_commonhealth_program(self._page)
+        self.assertTrue(result.get("ok"))
+        self.assertEqual(
+            await self._page.get_attribute("#mh-box", "aria-checked"), "true"
+        )
+        self.assertEqual(
+            await self._page.get_attribute("#medicare-box", "aria-checked"), "false"
+        )
+        self.assertEqual(
+            await self._page.get_attribute("#aca-box", "aria-checked"), "false"
+        )
+        self.assertGreaterEqual(int(result.get("unchecked_others") or 0), 1)
+
+    async def test_eligible_programs_leave_selection_alone(self) -> None:
+        from pc_liveagent.app_stage import ensure_programs_ready_to_continue
+
+        await self._page.set_content(
+            """
+            <h1>Great News!</h1>
+            <p>We found 1 eligible program for all 2 household members.</p>
+            <section class="program-card">
+              <div id="mh-box" role="checkbox" aria-checked="true"></div>
+              <div>MassHealth CommonHealth (Medicaid)</div>
+              <div>John may be eligible for MassHealth CommonHealth</div>
+            </section>
+            <p>Applying to 1 program for 1 member.</p>
+            <button>Continue to Applications</button>
+            """
+        )
+        ready = await ensure_programs_ready_to_continue(self._page)
+        self.assertFalse(ready.get("selected"))
+        self.assertIn(ready.get("reason"), ("already_selected", "eligible_present"))
+        self.assertEqual(
+            await self._page.get_attribute("#mh-box", "aria-checked"), "true"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
