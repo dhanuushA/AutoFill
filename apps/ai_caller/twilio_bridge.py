@@ -364,7 +364,7 @@ def answer_twiml(session: Dict[str, Any]) -> str:
     service = str(session.get("service_name") or "care")
     gather_url = escape(_abs_url("/api/ai-call/twilio/warm-transfer/gather/", session_id))
     greeting = (
-        f"Hi {name}, this is a Bay Area Community Health care coordinator. "
+        f"Hi {name}, this is a AI Medicaid Assist care coordinator. "
         f"I have a team member ready to speak with you about {service}. "
         f"Do you have a moment?"
     )
@@ -833,7 +833,7 @@ def whisper_twiml(session: Dict[str, Any]) -> str:
     return (
         '<?xml version="1.0" encoding="UTF-8"?>'
         "<Response>"
-        f"{_say('Hi, this is a Bay Area Community Health care coordinator. I am connecting ' + name + ' about ' + service + '. I will introduce you both, then leave.')}"
+        f"{_say('Hi, this is a AI Medicaid Assist care coordinator. I am connecting ' + name + ' about ' + service + '. I will introduce you both, then leave.')}"
         "</Response>"
     )
 

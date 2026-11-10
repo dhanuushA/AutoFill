@@ -33,18 +33,33 @@ from .elig_meta import format_question, get_field_meta
 from .live_fill_prompt import LIVE_FILL_GREETING
 from .mode_router import (
     AI_FILL_ACK,
+    GUIDE_ASK_TEXT_LINK,
     GUIDE_DONE,
+    GUIDE_HAVE_LINK,
+    GUIDE_RESEND_LINK,
+    GUIDE_SENT_LINK,
+    GUIDE_SMS_FAILED,
+    GUIDE_START,
     GUIDE_STEPS,
+    LANGUAGE_ONLY_ASK,
     LIVE_AGENT_CONNECTING,
     LIVE_AGENT_NO_NUMBER,
     MODE_CLARIFY,
     MODE_INTRO_AND_MENU,
+    RENEWAL_ALREADY_DONE,
+    RENEWAL_STATUS_ASK,
+    RENEWAL_STATUS_CLARIFY,
+    VIDEO_SEND_FAILED,
+    VIDEO_SENT,
     classify_help_mode_async,
     guide_speech_for_step,
     guide_wants_advance,
     guide_wants_ai_fill,
     guide_wants_live_agent,
 )
+from .guide_prompt import render_guide_system_prompt
+from .pointcare_link_sms import send_pointcare_link_sms
+from .renewal_video_sms import send_renewal_video_sms
 from .call_trace import clear_call_trace, trace_event
 from .live_form import (
     ELIG_QUESTIONS,
@@ -66,6 +81,7 @@ from .live_form import (
     skip_current_optional,
     spoken_for_auth_screen,
     submit_field,
+    _next_elig_step,
 )
 
 # Steps where Playwright often takes seconds — ack then deliver next via interrupt.
@@ -109,7 +125,7 @@ ELIG_PROGRESS_ACK = "One moment."
 logger = logging.getLogger(__name__)
 
 CALL_PURPOSE = (
-    "I'm Kyle from Bay Area Community Health, calling to help you with "
+    "I'm Kyle from AI Medicaid Assist, calling to help you with "
     "Pointcare registration and check household eligibility."
 )
 WRONG_PERSON_CLOSING = (
@@ -131,6 +147,8 @@ def identity_opening(name: str = "") -> str:
 _caller_names: dict[str, str] = {}
 # Optional live-agent E.164 for cold transfer on this call.
 _caller_agent_numbers: dict[str, str] = {}
+# Outbound patient phone for Option A video SMS.
+_caller_phones: dict[str, str] = {}
 # PointCare URL for deferred browser open (AI-fill only).
 _caller_form_urls: dict[str, str] = {}
 _ai_fill_browser_tasks: dict[str, asyncio.Task] = {}
@@ -141,10 +159,12 @@ def register_outbound_caller(
     name: str = "",
     agent_number: str = "",
     form_url: str = "",
+    phone_number: str = "",
 ) -> None:
     cid = (call_id or "").strip()
     who = (name or "").strip()
     agent = (agent_number or "").strip()
+    phone = (phone_number or "").strip()
     if not cid:
         return
     if who:
@@ -156,6 +176,8 @@ def register_outbound_caller(
     elif cid in _caller_agent_numbers and not agent:
         # Keep prior agent number unless explicitly cleared via empty+pop elsewhere.
         pass
+    if phone:
+        _caller_phones[cid] = phone
     if (form_url or "").strip():
         register_outbound_form_url(cid, form_url)
 
@@ -174,6 +196,10 @@ def peek_outbound_caller(call_id: str) -> str:
 
 def peek_outbound_agent_number(call_id: str) -> str:
     return (_caller_agent_numbers.get((call_id or "").strip()) or "").strip()
+
+
+def peek_outbound_phone(call_id: str) -> str:
+    return (_caller_phones.get((call_id or "").strip()) or "").strip()
 
 
 def peek_outbound_form_url(call_id: str) -> str:
@@ -321,6 +347,192 @@ def _route_live_agent(
     )
 
 
+def _guide_wants_link_yes(utterance: str) -> bool:
+    return bool(_is_yes(utterance)) or bool(
+        re.search(
+            r"\b(i\s*have\s*(it|the\s*link)|already\s*have|got\s*(it|the\s*link)|"
+            r"open(ed)?\s*(it|the\s*link)|on\s*(the\s*)?(site|page|website))\b",
+            utterance or "",
+            re.I,
+        )
+    )
+
+
+def _guide_wants_link_no(utterance: str) -> bool:
+    return bool(_is_no(utterance)) or bool(
+        re.search(
+            r"\b(don'?t\s*have|do\s*not\s*have|no\s*link|need\s*(the\s*)?link|"
+            r"send\s*(me\s*)?(the\s*)?(link|text|sms)|text\s*(it|me|the\s*link))\b",
+            utterance or "",
+            re.I,
+        )
+    )
+
+
+def _guide_wants_resend(utterance: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(didn'?t\s*get|did\s*not\s*get|no\s*text|resend|send\s*again|"
+            r"send\s*it\s*again|not\s*received|haven'?t\s*received)\b",
+            utterance or "",
+            re.I,
+        )
+    )
+
+
+async def _coach_guide_turn(
+    ctrl: "CallController",
+    call_id: str,
+    utterance: str,
+    *,
+    turn_id: str = "",
+) -> TurnResult:
+    """Prompt-driven Option C coaching (Claude), with GUIDE_STEPS fallback."""
+    from . import config as _cfg
+
+    user_text = (utterance or "").strip()
+    if user_text:
+        ctrl.guide_history.append({"role": "user", "content": user_text[:500]})
+
+    speech = ""
+    end_call = False
+    detail = "guide_coach"
+
+    api_key = (getattr(_cfg, "ANTHROPIC_API_KEY", "") or "").strip()
+    if api_key:
+        try:
+            from anthropic import AsyncAnthropic
+
+            system = render_guide_system_prompt(
+                first_name=peek_outbound_caller(call_id)
+                or (ctrl.caller_name or "").strip(),
+                partner_link=getattr(_cfg, "POINTCARE_URL", "") or "",
+                callback_number=getattr(_cfg, "FORM_FILLER_CALLBACK_NUMBER", "")
+                or "",
+            )
+            messages = [
+                {"role": m["role"], "content": m["content"]}
+                for m in ctrl.guide_history[-16:]
+                if m.get("role") in {"user", "assistant"} and m.get("content")
+            ]
+            if not messages:
+                messages = [
+                    {
+                        "role": "user",
+                        "content": (
+                            "The PointCare link is open. Start Stage A with the "
+                            "first instruction only."
+                        ),
+                    }
+                ]
+            client = AsyncAnthropic(api_key=api_key)
+            model = (_cfg.ANTHROPIC_MODEL or "claude-haiku-5-5").strip()
+            timeout_s = max(
+                0.8, float(getattr(_cfg, "ANTHROPIC_TIMEOUT_S", 1.5) or 1.5) + 1.5
+            )
+            kwargs: dict[str, Any] = {
+                "model": model,
+                "max_tokens": 220,
+                "system": system,
+                "messages": messages,
+            }
+            try:
+                kwargs["output_config"] = {
+                    "effort": (getattr(_cfg, "ANTHROPIC_EFFORT", "low") or "low")
+                }
+                kwargs["thinking"] = {"type": "disabled"}
+                resp = await asyncio.wait_for(
+                    client.messages.create(**kwargs), timeout=timeout_s
+                )
+            except TypeError:
+                kwargs.pop("output_config", None)
+                kwargs.pop("thinking", None)
+                resp = await asyncio.wait_for(
+                    client.messages.create(**kwargs), timeout=timeout_s
+                )
+            except Exception as first_exc:
+                msg = str(first_exc).lower()
+                if "effort" in msg or "thinking" in msg or "output_config" in msg:
+                    kwargs.pop("output_config", None)
+                    kwargs.pop("thinking", None)
+                    resp = await asyncio.wait_for(
+                        client.messages.create(**kwargs), timeout=timeout_s
+                    )
+                else:
+                    raise
+            raw = ""
+            for block in getattr(resp, "content", None) or []:
+                raw += getattr(block, "text", "") or ""
+            speech = (raw or "").strip()
+            if "[[END_CALL]]" in speech:
+                end_call = True
+                speech = speech.replace("[[END_CALL]]", "").strip()
+            detail = "guide_coach_llm"
+        except Exception:
+            logger.info(
+                "guide_coach_llm_failed call_id=%s", call_id, exc_info=True
+            )
+            speech = ""
+
+    if not speech:
+        # Scripted fallback: advance on done / yes; otherwise repeat.
+        if user_text and guide_wants_advance(user_text):
+            ctrl.guide_step += 1
+        if ctrl.guide_step >= len(GUIDE_STEPS):
+            speech = GUIDE_DONE
+            end_call = True
+            detail = "guide_done"
+        else:
+            speech = guide_speech_for_step(ctrl.guide_step)
+            if user_text and not guide_wants_advance(user_text):
+                speech = "Take your time on that step. " + speech
+                detail = "guide_repeat"
+            else:
+                detail = f"guide_step_{ctrl.guide_step}"
+
+    ctrl.guide_history.append({"role": "assistant", "content": speech[:500]})
+    if len(ctrl.guide_history) > 24:
+        ctrl.guide_history = ctrl.guide_history[-24:]
+    ctrl.last_speech = speech
+    if end_call:
+        ctrl.phase = "closing"
+    return TurnResult(
+        speech=speech,
+        end_call=end_call,
+        phase=ctrl.phase,
+        turn_id=turn_id,
+        detail=detail,
+    )
+
+
+def _route_video(
+    ctrl: "CallController", call_id: str, *, turn_id: str = ""
+) -> TurnResult:
+    """Option A — text MEDICAL_RENEWAL_VIDEO_URL, then end the call."""
+    ctrl.help_mode = "video"
+    phone = peek_outbound_phone(call_id)
+    name = peek_outbound_caller(call_id) or (ctrl.caller_name or "").strip()
+    result = send_renewal_video_sms(phone_number=phone, name=name)
+    if not result.get("ok"):
+        ctrl.phase = "mode_choice"
+        ctrl.last_speech = VIDEO_SEND_FAILED
+        return TurnResult(
+            speech=VIDEO_SEND_FAILED,
+            phase="mode_choice",
+            turn_id=turn_id,
+            detail="mode_video_failed",
+        )
+    ctrl.phase = "closing"
+    ctrl.last_speech = VIDEO_SENT
+    return TurnResult(
+        speech=VIDEO_SENT,
+        end_call=True,
+        phase="closing",
+        turn_id=turn_id,
+        detail="mode_video",
+    )
+
+
 def _speakable_email(addr: str) -> str:
     """TTS-friendly reading of an address (at / dot), no secrets beyond the address."""
     value = (addr or "").strip().lower()
@@ -391,7 +603,7 @@ def _wants_email_go_back(text: str) -> bool:
 @dataclass
 class CallController:
     call_id: str
-    # identity|mode_choice|guide|language|sign_in|email|email_confirm|email_await_secure|google_email|eligibility|application|closing
+    # identity|renewal_status|mode_choice|guide|language|sign_in|email|email_confirm|email_await_secure|google_email|eligibility|application|closing
     phase: str = "identity"
     turn_seq: int = 0
     # Dedupe key includes phase/step so consecutive Yes/No across questions apply.
@@ -399,9 +611,20 @@ class CallController:
     last_dedupe_ctx: str = ""
     last_speech: str = LIVE_FILL_GREETING
     caller_name: str = ""
-    # Index into GUIDE_STEPS while phase == guide.
+    # Index into GUIDE_STEPS while phase == guide (fallback ladder).
     guide_step: int = 0
+    # Option C: link check → SMS → prompt-driven coaching.
+    guide_link_ready: bool = False
+    guide_awaiting_text_confirm: bool = False
+    guide_history: list[dict[str, str]] = field(default_factory=list)
     help_mode: str = ""
+    # Optimistic next eligibility step already spoken while Playwright catches up.
+    optimistic_elig_step: str = ""
+    optimistic_elig_speech: str = ""
+    # Answer spoken while a slow browser fill was still in flight (e.g. "John"
+    # during marital→spouse navigation). Applied once the next step is live.
+    pending_elig_utterance: str = ""
+    pending_elig_for_step: str = ""
     pending_op_id: str = ""
     committed: list[dict[str, Any]] = field(default_factory=list)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -487,6 +710,8 @@ async def drop_controller(call_id: str) -> None:
     cid = (call_id or "").strip()
     _caller_names.pop(cid, None)
     _caller_agent_numbers.pop(cid, None)
+    _caller_phones.pop(cid, None)
+    _caller_form_urls.pop(cid, None)
     async with _controllers_lock:
         _controllers.pop(call_id, None)
 
@@ -503,6 +728,8 @@ def _begin_elig_navigation(ctrl: CallController) -> int:
     ctrl.elig_nav_epoch += 1
     ctrl.elig_op_in_progress = False
     ctrl.pending_op_id = ""
+    ctrl.pending_elig_utterance = ""
+    ctrl.pending_elig_for_step = ""
     _cancel_elig_browser_task(ctrl.call_id)
     try:
         from .form_bridge import invalidate_transcript_answers
@@ -803,19 +1030,44 @@ async def _run_eligibility_browser_background(
 
         ctrl.last_elig_attempt_failed = False
         speech = spoken or format_question(next_step)
-        ctrl.last_speech = speech
+        already_spoken = (
+            (ctrl.optimistic_elig_step or "") == str(next_step)
+            and bool((ctrl.optimistic_elig_speech or "").strip())
+            and not result.get("await_field_correction")
+        )
+        # Never suppress live relationship options — optimistic text uses defaults
+        # (often Child chips) that can disagree with the spouse/partner page.
+        if already_spoken and str(next_step) in (
+            "child_rel",
+            "person_rel",
+            "spouse_role",
+        ):
+            browser_spoken = (spoken or "").strip()
+            optimistic = (ctrl.optimistic_elig_speech or "").strip()
+            if browser_spoken and browser_spoken != optimistic:
+                already_spoken = False
+        # Always deliver the section intro + first-name ask from the browser.
+        if str(next_step) in _MEMBER_FIRST_STEPS:
+            already_spoken = False
+            # Do not auto-apply a name spoken during form open before the intro.
+            if (ctrl.pending_elig_for_step or "") == str(next_step):
+                ctrl.pending_elig_utterance = ""
+                ctrl.pending_elig_for_step = ""
         if result.get("await_field_correction"):
             ctrl.pending_correction = {
                 "field": "",
                 "prompt": speech,
                 "need_field": True,
             }
+        ctrl.last_speech = speech
         logger.info(
-            "elig_browser_completed call_id=%s step=%s next=%s browser_verified=1 epoch=%s",
+            "elig_browser_completed call_id=%s step=%s next=%s browser_verified=1 "
+            "epoch=%s already_spoken=%s",
             call_id,
             step,
             next_step,
             epoch,
+            already_spoken,
         )
         trace_event(
             call_id,
@@ -825,10 +1077,34 @@ async def _run_eligibility_browser_background(
             turn_id=turn_id,
             epoch=epoch,
             screen=str(result.get("screen") or ""),
+            already_spoken=already_spoken,
         )
+        if already_spoken:
+            # Next question was already returned on the WebSocket turn.
+            ctrl.optimistic_elig_step = ""
+            ctrl.optimistic_elig_speech = ""
+            await _flush_pending_elig_utterance(
+                call_id,
+                ctrl,
+                next_step=str(next_step),
+                form_url=form_url,
+                epoch=epoch,
+            )
+            return
+        ctrl.optimistic_elig_step = ""
+        ctrl.optimistic_elig_speech = ""
         await _deliver_question_once(
             call_id, speech, key=f"next:{next_step}:{turn_id}"
         )
+        # First-name steps: ask once after intro; do not flush a premature name.
+        if str(next_step) not in _MEMBER_FIRST_STEPS:
+            await _flush_pending_elig_utterance(
+                call_id,
+                ctrl,
+                next_step=str(next_step),
+                form_url=form_url,
+                epoch=epoch,
+            )
     except asyncio.CancelledError:
         # Disconnect / superseded nav — never treat as a successful person save.
         logger.info(
@@ -900,6 +1176,144 @@ def _schedule_eligibility_browser(
             epoch=epoch,
         ),
         name=f"elig-browser-{call_id}-e{epoch}",
+    )
+
+
+_PENDING_NAME_STEPS = frozenset(
+    {
+        "spouse_first",
+        "spouse_last",
+        "child_first",
+        "child_last",
+        "person_first",
+        "person_last",
+    }
+)
+# First field of a new member form — needs the "Let's learn more…" intro and a
+# ready form. Never ask these optimistically (that dropped the intro and made
+# callers say the first name twice before Playwright finished opening the form).
+_MEMBER_FIRST_STEPS = frozenset(
+    {
+        "spouse_first",
+        "child_first",
+        "person_first",
+    }
+)
+
+
+def _stash_pending_elig_utterance(ctrl: CallController, text: str) -> bool:
+    """Keep a name-like answer spoken during a slow browser transition."""
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    intent = detect_control_intent(raw)
+    if intent.kind in ("repeat", "skip", "next", "redo", "change", "go_back"):
+        return False
+    target = (ctrl.optimistic_elig_step or "").strip()
+    if target not in _PENDING_NAME_STEPS:
+        return False
+    try:
+        name = sanitize_person_name(raw)
+    except Exception:
+        name = raw
+    name = (name or "").strip()
+    if len(name) < 2 or len(name.split()) > 4:
+        return False
+    # Ignore pure greetings / stalls that are not names.
+    if re.fullmatch(r"(hello|hi|hey|thanks|thank you)[.?!]?", name, re.I):
+        return False
+    ctrl.pending_elig_utterance = name
+    ctrl.pending_elig_for_step = target
+    logger.info(
+        "elig_pending_stashed call_id=%s target=%s answer=%r",
+        ctrl.call_id,
+        target,
+        name[:40],
+    )
+    return True
+
+
+async def _flush_pending_elig_utterance(
+    call_id: str,
+    ctrl: CallController,
+    *,
+    next_step: str,
+    form_url: str,
+    epoch: int,
+) -> None:
+    """Apply a stashed name answer once the browser has landed on that step."""
+    pending = (ctrl.pending_elig_utterance or "").strip()
+    target = (ctrl.pending_elig_for_step or "").strip()
+    if not pending or not target:
+        return
+    if next_step != target or next_step not in _PENDING_NAME_STEPS:
+        return
+    ctrl.pending_elig_utterance = ""
+    ctrl.pending_elig_for_step = ""
+    ctrl.elig_nav_epoch += 1
+    new_epoch = ctrl.elig_nav_epoch
+    turn_id = f"{call_id}:pending:{new_epoch}"
+    commit_key = f"pending:{next_step}:{pending.lower()}"
+    ctrl.elig_op_in_progress = True
+    ctrl.pending_op_id = turn_id
+    logger.info(
+        "elig_pending_flush call_id=%s step=%s answer=%r epoch=%s",
+        call_id,
+        next_step,
+        pending[:40],
+        new_epoch,
+    )
+    trace_event(
+        call_id,
+        "elig_pending_flush",
+        step=next_step,
+        turn_id=turn_id,
+        epoch=new_epoch,
+        answer=pending[:40],
+    )
+    # Predict and speak the following question immediately when possible.
+    predicted_next = ""
+    optimistic_speech = ""
+    try:
+        session = await get_session(call_id)
+        if session is not None:
+            saved = session.elig_step
+            session.elig_step = next_step
+            try:
+                predicted_next = str(_next_elig_step(session, pending) or "").strip()
+            finally:
+                session.elig_step = saved
+            if predicted_next and predicted_next != next_step:
+                optimistic_speech = (format_question(predicted_next) or "").strip()
+    except Exception:
+        logger.info(
+            "elig_pending_predict_failed call_id=%s step=%s",
+            call_id,
+            next_step,
+            exc_info=True,
+        )
+        predicted_next = ""
+        optimistic_speech = ""
+    if optimistic_speech:
+        ctrl.optimistic_elig_step = predicted_next
+        ctrl.optimistic_elig_speech = optimistic_speech
+        ctrl.last_speech = optimistic_speech
+        await _deliver_question_once(
+            call_id,
+            optimistic_speech,
+            key=f"pending-opt:{predicted_next}:{turn_id}",
+        )
+    else:
+        ctrl.optimistic_elig_step = ""
+        ctrl.optimistic_elig_speech = ""
+    _schedule_eligibility_browser(
+        call_id,
+        answer=pending,
+        step=next_step,
+        turn_id=turn_id,
+        form_url=form_url,
+        commit_key=commit_key,
+        epoch=new_epoch,
     )
 
 
@@ -1871,11 +2285,16 @@ async def _repeat_with_context(call_id: str, ctrl: CallController) -> str:
     phase = ctrl.phase or ""
     if phase == "identity":
         return identity_opening(ctrl.caller_name or peek_outbound_caller(call_id))
+    if phase == "renewal_status":
+        return RENEWAL_STATUS_ASK
     if phase == "mode_choice":
         return MODE_INTRO_AND_MENU
     if phase == "guide":
         return guide_speech_for_step(ctrl.guide_step)
     if phase == "language":
+        # Avoid repeating the Kyle intro after the caller already heard it.
+        if (ctrl.help_mode or "") == "ai_fill":
+            return AI_FILL_ACK + LANGUAGE_ONLY_ASK
         return LIVE_FILL_GREETING
     if phase == "sign_in":
         return f"{CALL_PURPOSE} {SIGN_IN_QUESTION}"
@@ -2590,11 +3009,11 @@ async def process_user_turn(
             if _is_yes(text):
                 ctrl.last_user_fp = fp
                 ctrl.last_dedupe_ctx = dedupe_ctx
-                ctrl.phase = "mode_choice"
-                ctrl.last_speech = MODE_INTRO_AND_MENU
+                ctrl.phase = "renewal_status"
+                ctrl.last_speech = RENEWAL_STATUS_ASK
                 return TurnResult(
-                    speech=MODE_INTRO_AND_MENU,
-                    phase="mode_choice",
+                    speech=RENEWAL_STATUS_ASK,
+                    phase="renewal_status",
                     turn_id=turn_id,
                     detail="identity_confirmed",
                 )
@@ -2610,18 +3029,71 @@ async def process_user_turn(
                 detail="identity_clarify",
             )
 
+        if ctrl.phase == "renewal_status":
+            ctrl.last_user_fp = fp
+            ctrl.last_dedupe_ctx = dedupe_ctx
+            renewal_done = _is_yes(text) or bool(
+                re.search(
+                    r"\b(already\s*(did|done|completed|finished|submitted)|"
+                    r"(i\s*)?(completed|finished|submitted)\s*(it|renewal|already)|"
+                    r"all\s*(set|done)|taken\s*care\s*of)\b",
+                    text or "",
+                    re.I,
+                )
+            )
+            renewal_not_done = _is_no(text) or bool(
+                re.search(
+                    r"\b(not\s*yet|haven'?t|have\s*not|still\s*need|"
+                    r"not\s*(done|completed|finished)|need\s*help|"
+                    r"didn'?t\s*(do|complete|finish)|nope)\b",
+                    text or "",
+                    re.I,
+                )
+            )
+            if renewal_done and not renewal_not_done:
+                ctrl.phase = "closing"
+                ctrl.last_speech = RENEWAL_ALREADY_DONE
+                return TurnResult(
+                    speech=RENEWAL_ALREADY_DONE,
+                    end_call=True,
+                    phase="closing",
+                    turn_id=turn_id,
+                    detail="renewal_already_done",
+                )
+            if renewal_not_done and not renewal_done:
+                ctrl.phase = "mode_choice"
+                ctrl.last_speech = MODE_INTRO_AND_MENU
+                return TurnResult(
+                    speech=MODE_INTRO_AND_MENU,
+                    phase="mode_choice",
+                    turn_id=turn_id,
+                    detail="renewal_not_done",
+                )
+            ctrl.last_speech = RENEWAL_STATUS_CLARIFY
+            return TurnResult(
+                speech=RENEWAL_STATUS_CLARIFY,
+                phase="renewal_status",
+                turn_id=turn_id,
+                detail="renewal_status_clarify",
+            )
+
         if ctrl.phase == "mode_choice":
             # Soft intent match + Claude fallback — do not require menu-exact wording.
             mode = await classify_help_mode_async(text)
             ctrl.last_user_fp = fp
             ctrl.last_dedupe_ctx = dedupe_ctx
+            if mode == "video":
+                return _route_video(ctrl, call_id, turn_id=turn_id)
             if mode == "live_agent":
                 return _route_live_agent(ctrl, call_id, turn_id=turn_id)
             if mode == "guide":
                 ctrl.help_mode = "guide"
                 ctrl.guide_step = 0
+                ctrl.guide_link_ready = False
+                ctrl.guide_awaiting_text_confirm = False
+                ctrl.guide_history = []
                 ctrl.phase = "guide"
-                speech = guide_speech_for_step(0)
+                speech = GUIDE_START
                 ctrl.last_speech = speech
                 return TurnResult(
                     speech=speech,
@@ -2635,7 +3107,7 @@ async def process_user_turn(
                 _schedule_ai_fill_browser(
                     call_id, form_url or peek_outbound_form_url(call_id)
                 )
-                speech = AI_FILL_ACK + LIVE_FILL_GREETING
+                speech = AI_FILL_ACK + LANGUAGE_ONLY_ASK
                 ctrl.last_speech = speech
                 return TurnResult(
                     speech=speech,
@@ -2662,7 +3134,7 @@ async def process_user_turn(
                 _schedule_ai_fill_browser(
                     call_id, form_url or peek_outbound_form_url(call_id)
                 )
-                speech = AI_FILL_ACK + LIVE_FILL_GREETING
+                speech = AI_FILL_ACK + LANGUAGE_ONLY_ASK
                 ctrl.last_speech = speech
                 return TurnResult(
                     speech=speech,
@@ -2670,47 +3142,189 @@ async def process_user_turn(
                     turn_id=turn_id,
                     detail="guide_to_ai_fill",
                 )
-            if guide_wants_advance(text):
-                ctrl.guide_step += 1
-                if ctrl.guide_step >= len(GUIDE_STEPS):
-                    ctrl.phase = "closing"
-                    ctrl.last_speech = GUIDE_DONE
+
+            # Link check / SMS before any website coaching.
+            if not ctrl.guide_link_ready:
+                phone = peek_outbound_phone(call_id)
+                name = (
+                    peek_outbound_caller(call_id)
+                    or (ctrl.caller_name or "").strip()
+                )
+                if ctrl.guide_awaiting_text_confirm:
+                    if _guide_wants_link_yes(text):
+                        result = send_pointcare_link_sms(
+                            phone_number=phone, name=name
+                        )
+                        if not result.get("ok"):
+                            ctrl.last_speech = GUIDE_SMS_FAILED
+                            return TurnResult(
+                                speech=GUIDE_SMS_FAILED,
+                                phase="guide",
+                                turn_id=turn_id,
+                                detail="guide_link_sms_failed",
+                            )
+                        ctrl.guide_awaiting_text_confirm = False
+                        ctrl.guide_link_ready = True
+                        ctrl.guide_step = 0
+                        speech = GUIDE_SENT_LINK
+                        ctrl.last_speech = speech
+                        ctrl.guide_history.append(
+                            {"role": "assistant", "content": speech}
+                        )
+                        return TurnResult(
+                            speech=speech,
+                            phase="guide",
+                            turn_id=turn_id,
+                            detail="guide_link_sent",
+                        )
+                    if _guide_wants_link_no(text):
+                        ctrl.guide_awaiting_text_confirm = False
+                        speech = (
+                            "Okay. Open the PointCare link you have, or call "
+                            f"{getattr(config, 'FORM_FILLER_CALLBACK_NUMBER', '1-833-234-7833')} "
+                            "for help."
+                        )
+                        ctrl.last_speech = speech
+                        return TurnResult(
+                            speech=speech,
+                            phase="guide",
+                            turn_id=turn_id,
+                            detail="guide_link_declined",
+                        )
+                    ctrl.last_speech = GUIDE_ASK_TEXT_LINK
                     return TurnResult(
-                        speech=GUIDE_DONE,
-                        end_call=True,
-                        phase="closing",
+                        speech=GUIDE_ASK_TEXT_LINK,
+                        phase="guide",
                         turn_id=turn_id,
-                        detail="guide_done",
+                        detail="guide_link_confirm_repeat",
                     )
-                speech = guide_speech_for_step(ctrl.guide_step)
-                ctrl.last_speech = speech
+
+                if _guide_wants_resend(text):
+                    result = send_pointcare_link_sms(
+                        phone_number=phone, name=name, resend=True
+                    )
+                    if not result.get("ok"):
+                        ctrl.last_speech = GUIDE_SMS_FAILED
+                        return TurnResult(
+                            speech=GUIDE_SMS_FAILED,
+                            phase="guide",
+                            turn_id=turn_id,
+                            detail="guide_link_sms_failed",
+                        )
+                    ctrl.guide_link_ready = True
+                    ctrl.guide_step = 0
+                    speech = GUIDE_RESEND_LINK
+                    ctrl.last_speech = speech
+                    ctrl.guide_history.append(
+                        {"role": "assistant", "content": speech}
+                    )
+                    return TurnResult(
+                        speech=speech,
+                        phase="guide",
+                        turn_id=turn_id,
+                        detail="guide_link_resent",
+                    )
+
+                if _guide_wants_link_yes(text):
+                    ctrl.guide_link_ready = True
+                    ctrl.guide_step = 0
+                    speech = GUIDE_HAVE_LINK
+                    ctrl.last_speech = speech
+                    ctrl.guide_history.append(
+                        {"role": "assistant", "content": speech}
+                    )
+                    return TurnResult(
+                        speech=speech,
+                        phase="guide",
+                        turn_id=turn_id,
+                        detail="guide_has_link",
+                    )
+
+                if _guide_wants_link_no(text):
+                    result = send_pointcare_link_sms(
+                        phone_number=phone, name=name
+                    )
+                    if not result.get("ok"):
+                        ctrl.last_speech = GUIDE_SMS_FAILED
+                        return TurnResult(
+                            speech=GUIDE_SMS_FAILED,
+                            phase="guide",
+                            turn_id=turn_id,
+                            detail="guide_link_sms_failed",
+                        )
+                    ctrl.guide_link_ready = True
+                    ctrl.guide_step = 0
+                    speech = GUIDE_SENT_LINK
+                    ctrl.last_speech = speech
+                    ctrl.guide_history.append(
+                        {"role": "assistant", "content": speech}
+                    )
+                    return TurnResult(
+                        speech=speech,
+                        phase="guide",
+                        turn_id=turn_id,
+                        detail="guide_link_sent",
+                    )
+
+                # Unsure — ask once whether to text the link.
+                ctrl.guide_awaiting_text_confirm = True
+                ctrl.last_speech = GUIDE_ASK_TEXT_LINK
                 return TurnResult(
-                    speech=speech,
+                    speech=GUIDE_ASK_TEXT_LINK,
                     phase="guide",
                     turn_id=turn_id,
-                    detail=f"guide_step_{ctrl.guide_step}",
+                    detail="guide_link_confirm",
                 )
-            # Unclear — repeat current coaching step.
-            speech = (
-                "Take your time on that step. "
-                + guide_speech_for_step(ctrl.guide_step)
-            )
-            ctrl.last_speech = speech
-            return TurnResult(
-                speech=speech,
-                phase="guide",
-                turn_id=turn_id,
-                detail="guide_repeat",
+
+            if _guide_wants_resend(text):
+                result = send_pointcare_link_sms(
+                    phone_number=peek_outbound_phone(call_id),
+                    name=peek_outbound_caller(call_id)
+                    or (ctrl.caller_name or "").strip(),
+                    resend=True,
+                )
+                if result.get("ok"):
+                    speech = GUIDE_RESEND_LINK
+                    ctrl.last_speech = speech
+                    return TurnResult(
+                        speech=speech,
+                        phase="guide",
+                        turn_id=turn_id,
+                        detail="guide_link_resent",
+                    )
+
+            if re.search(
+                r"\b(stop(\s*calling)?|hang\s*up|do\s*not\s*call|don'?t\s*call|"
+                r"remove\s*me|not\s*interested)\b",
+                text or "",
+                re.I,
+            ):
+                ctrl.phase = "closing"
+                ctrl.last_speech = GUIDE_DONE
+                return TurnResult(
+                    speech=GUIDE_DONE,
+                    end_call=True,
+                    phase="closing",
+                    turn_id=turn_id,
+                    detail="guide_stopped",
+                )
+
+            return await _coach_guide_turn(
+                ctrl, call_id, text, turn_id=turn_id
             )
 
         if ctrl.phase == "language":
             if not is_language_ack(text):
                 # Confusion / non-language replies: stay on language with context.
                 # Only clear continue-acks (English / yes / ok) advance to sign-in.
-                speech = (
-                    f"{CALL_PURPOSE} Is it okay to continue in English, or would "
-                    "you prefer another language?"
-                )
+                # Do not re-introduce Kyle when Option D already passed the intro.
+                if (ctrl.help_mode or "") == "ai_fill":
+                    speech = LANGUAGE_ONLY_ASK
+                else:
+                    speech = (
+                        f"{CALL_PURPOSE} Is it okay to continue in English, or would "
+                        "you prefer another language?"
+                    )
                 ctrl.last_speech = speech
                 return TurnResult(
                     speech=speech,
@@ -3092,6 +3706,9 @@ async def process_user_turn(
                 if early_intent.kind in ("repeat", "skip", "next", "redo", "change"):
                     pass  # Fall through — these do not mutate the form yet.
                 else:
+                    # Keep name answers spoken during slow nav (Married→spouse)
+                    # so they apply as soon as the next step is live.
+                    _stash_pending_elig_utterance(ctrl, text)
                     return TurnResult(
                         speech=ELIG_PROGRESS_ACK,
                         phase=ctrl.phase,
@@ -3808,13 +4425,62 @@ async def process_user_turn(
             if transcript_user_index is not None and transcript_user_index >= 0:
                 ctrl.consumed_transcript_user_index = transcript_user_index
 
-            # Slow browser steps: apply in background. Speak "One moment" only when
-            # the operation is still running after a short wait; otherwise the
-            # interrupt already delivered the next question (avoid a dead ack).
+            # Slow browser steps: apply in background. Prefer speaking the predicted
+            # next question immediately (e.g. Married → spouse first name) so the
+            # caller does not wait on Playwright. Fall back to a short ack only when
+            # the next step cannot be predicted.
             if step in _SLOW_ELIG_STEPS:
                 ctrl.elig_nav_epoch += 1
                 epoch = ctrl.elig_nav_epoch
                 ctrl.elig_op_in_progress = True
+                predicted_next = ""
+                optimistic_speech = ""
+                try:
+                    sess_pred = session_for_key or await get_session(call_id)
+                    if sess_pred is not None:
+                        # Always predict from the step we are answering now —
+                        # session.elig_step can lag behind during optimistic turns.
+                        saved_step = sess_pred.elig_step
+                        sess_pred.elig_step = step
+                        try:
+                            predicted_next = str(
+                                _next_elig_step(sess_pred, answer) or ""
+                            ).strip()
+                        finally:
+                            sess_pred.elig_step = saved_step
+                        if predicted_next and predicted_next != step:
+                            # Confirm + member-first steps need browser-backed
+                            # speech (section intro / detail readback). Asking
+                            # "What is their first name?" early dropped the
+                            # "Let's learn more…" intro and raced the form open.
+                            if predicted_next in (
+                                "spouse_confirm",
+                                "child_confirm",
+                                "person_confirm",
+                            ) or predicted_next in _MEMBER_FIRST_STEPS:
+                                optimistic_speech = ""
+                            else:
+                                optimistic_speech = (
+                                    format_question(predicted_next) or ""
+                                ).strip()
+                except Exception:
+                    logger.info(
+                        "elig_optimistic_predict_failed call_id=%s step=%s",
+                        call_id,
+                        step,
+                        exc_info=True,
+                    )
+                    predicted_next = ""
+                    optimistic_speech = ""
+
+                if optimistic_speech:
+                    ctrl.optimistic_elig_step = predicted_next
+                    ctrl.optimistic_elig_speech = optimistic_speech
+                    ctrl.last_speech = optimistic_speech
+                else:
+                    ctrl.optimistic_elig_step = ""
+                    ctrl.optimistic_elig_speech = ""
+
                 _schedule_eligibility_browser(
                     call_id,
                     answer=answer,
@@ -3828,7 +4494,7 @@ async def process_user_turn(
                 fast_done = False
                 if task is not None:
                     try:
-                        await asyncio.wait_for(asyncio.shield(task), timeout=0.45)
+                        await asyncio.wait_for(asyncio.shield(task), timeout=0.35)
                         fast_done = task.done() and not task.cancelled()
                     except (asyncio.TimeoutError, asyncio.CancelledError):
                         fast_done = False
@@ -3861,6 +4527,31 @@ async def process_user_turn(
                             turn_id=turn_id,
                             detail="elig_fast_complete",
                         )
+                if optimistic_speech:
+                    logger.info(
+                        "elig_optimistic_next call_id=%s step=%s next=%s turn_id=%s "
+                        "epoch=%s",
+                        call_id,
+                        step,
+                        predicted_next,
+                        turn_id,
+                        epoch,
+                    )
+                    trace_event(
+                        call_id,
+                        "elig_optimistic_next",
+                        turn_id=turn_id,
+                        step=step,
+                        next_step=predicted_next,
+                        epoch=epoch,
+                        phase=ctrl.phase,
+                    )
+                    return TurnResult(
+                        speech=optimistic_speech,
+                        phase=ctrl.phase,
+                        turn_id=turn_id,
+                        detail="elig_optimistic_next",
+                    )
                 ctrl.last_speech = ELIG_PROGRESS_ACK
                 logger.info(
                     "elig_ack_sent call_id=%s response_id=%s step=%s turn_id=%s epoch=%s "

@@ -262,9 +262,9 @@ class CallTurnTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Google", r.speech)
         self.assertEqual(r.phase, "sign_in")
 
-    async def test_identity_yes_continues_to_mode_choice(self) -> None:
+    async def test_identity_yes_asks_renewal_status(self) -> None:
         from pc_liveagent.call_turn import register_outbound_caller
-        from pc_liveagent.mode_router import MODE_INTRO_AND_MENU
+        from pc_liveagent.mode_router import RENEWAL_STATUS_ASK
 
         call_id = "turn-id-yes"
         await drop_controller(call_id)
@@ -274,17 +274,47 @@ class CallTurnTests(unittest.IsolatedAsyncioTestCase):
         ctrl.caller_name = "Sam Lee"
         ctrl.last_speech = "Hi, am I speaking with Sam Lee?"
         r = await process_user_turn(call_id, "Yes")
-        self.assertEqual(r.phase, "mode_choice")
+        self.assertEqual(r.phase, "renewal_status")
         self.assertEqual(r.detail, "identity_confirmed")
+        self.assertEqual(r.speech, RENEWAL_STATUS_ASK)
+        self.assertIn("already completed", r.speech.lower())
+        self.assertIn("medi-cal renewal", r.speech.lower())
+        self.assertFalse(r.end_call)
+
+    async def test_renewal_yes_thanks_and_ends(self) -> None:
+        from pc_liveagent.mode_router import RENEWAL_ALREADY_DONE
+
+        call_id = "turn-renewal-yes"
+        await drop_controller(call_id)
+        ctrl = await get_controller(call_id)
+        ctrl.phase = "renewal_status"
+        r = await process_user_turn(call_id, "Yes, I already finished it")
+        self.assertEqual(r.phase, "closing")
+        self.assertEqual(r.detail, "renewal_already_done")
+        self.assertTrue(r.end_call)
+        self.assertEqual(r.speech, RENEWAL_ALREADY_DONE)
+
+    async def test_renewal_no_reads_comfort_options(self) -> None:
+        from pc_liveagent.mode_router import MODE_INTRO_AND_MENU
+
+        call_id = "turn-renewal-no"
+        await drop_controller(call_id)
+        ctrl = await get_controller(call_id)
+        ctrl.phase = "renewal_status"
+        r = await process_user_turn(call_id, "No, not yet")
+        self.assertEqual(r.phase, "mode_choice")
+        self.assertEqual(r.detail, "renewal_not_done")
         self.assertEqual(r.speech, MODE_INTRO_AND_MENU)
         low = r.speech.lower()
-        self.assertIn("three options", low)
         self.assertIn("option a", low)
-        self.assertIn("live agent", low)
+        self.assertIn("video link", low)
         self.assertIn("option b", low)
-        self.assertIn("guide me through", low)
+        self.assertIn("live agent", low)
         self.assertIn("option c", low)
-        self.assertIn("which option do you want", low)
+        self.assertIn("guide me through", low)
+        self.assertIn("option d", low)
+        self.assertIn("which option are you comfortable with", low)
+        self.assertNotIn("a, b, c, or d", low)
         self.assertFalse(r.end_call)
 
     async def test_identity_no_ends_call(self) -> None:
@@ -328,6 +358,36 @@ class CallTurnTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.phase, "guide")
         self.assertEqual(r.detail, "mode_guide")
         self.assertIn("guide", r.speech.lower())
+        self.assertIn("pointcare link", r.speech.lower())
+        self.assertFalse(ctrl.guide_link_ready)
+
+    async def test_mode_guide_texts_pointcare_url_when_no_link(self) -> None:
+        from pc_liveagent.call_turn import register_outbound_caller
+
+        call_id = "turn-mode-guide-sms"
+        await drop_controller(call_id)
+        register_outbound_caller(
+            call_id,
+            "Sam Lee",
+            phone_number="+15551234567",
+        )
+        ctrl = await get_controller(call_id)
+        ctrl.phase = "guide"
+        ctrl.help_mode = "guide"
+        ctrl.guide_link_ready = False
+        with patch(
+            "pc_liveagent.call_turn.send_pointcare_link_sms",
+            return_value={"ok": True, "link": "https://my.pointcare.com/onboarding"},
+        ) as send_sms:
+            r = await process_user_turn(call_id, "No, I don't have the link")
+            send_sms.assert_called_once()
+            self.assertEqual(
+                send_sms.call_args.kwargs.get("phone_number"),
+                "+15551234567",
+            )
+        self.assertTrue(ctrl.guide_link_ready)
+        self.assertEqual(r.detail, "guide_link_sent")
+        self.assertIn("texted", r.speech.lower())
 
     async def test_mode_ai_fill_enters_language(self) -> None:
         call_id = "turn-mode-ai"
@@ -341,11 +401,22 @@ class CallTurnTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.phase, "language")
         self.assertEqual(r.detail, "mode_ai_fill")
         self.assertIn("english", r.speech.lower())
+        # Do not repeat the Kyle intro on Option D — only language ask.
+        self.assertNotIn("i'm kyle", r.speech.lower())
+        self.assertNotIn("ai medicaid assist", r.speech.lower())
 
     async def test_mode_mappings_cover_natural_phrases(self) -> None:
         from pc_liveagent.mode_router import classify_help_mode
 
-        # Live agent — incomplete / paraphrase (not menu-exact wording)
+        # Video — Option A
+        self.assertEqual(classify_help_mode("send me the video"), "video")
+        self.assertEqual(classify_help_mode("text me the video link"), "video")
+        self.assertEqual(classify_help_mode("the first one"), "video")
+        self.assertEqual(classify_help_mode("Option A works for me"), "video")
+        self.assertEqual(classify_help_mode("I'll go with option A"), "video")
+        self.assertEqual(classify_help_mode("option A"), "video")
+
+        # Live agent — Option B / paraphrase
         self.assertEqual(classify_help_mode("I want to talk to a real person"), "live_agent")
         self.assertEqual(classify_help_mode("can I get a human please"), "live_agent")
         self.assertEqual(classify_help_mode("put me through to someone"), "live_agent")
@@ -355,23 +426,23 @@ class CallTurnTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(classify_help_mode("uh a person"), "live_agent")
         self.assertEqual(classify_help_mode("the human one"), "live_agent")
         self.assertEqual(classify_help_mode("someone please"), "live_agent")
-        self.assertEqual(classify_help_mode("the first one"), "live_agent")
-        self.assertEqual(classify_help_mode("Option A works for me"), "live_agent")
-        self.assertEqual(classify_help_mode("I'll go with option A"), "live_agent")
-        self.assertEqual(classify_help_mode("option A"), "live_agent")
+        self.assertEqual(classify_help_mode("second option"), "live_agent")
+        self.assertEqual(classify_help_mode("Option B works for me"), "live_agent")
+        self.assertEqual(classify_help_mode("I'll go with option B"), "live_agent")
+        self.assertEqual(classify_help_mode("option B"), "live_agent")
 
-        # Guide — coaching / self-serve paraphrases
+        # Guide — Option C / coaching paraphrases
         self.assertEqual(classify_help_mode("walk me through step by step"), "guide")
         self.assertEqual(classify_help_mode("I'll fill it myself"), "guide")
         self.assertEqual(classify_help_mode("just tell me what to click"), "guide")
         self.assertEqual(classify_help_mode("help me do it on my screen"), "guide")
         self.assertEqual(classify_help_mode("coach me"), "guide")
-        self.assertEqual(classify_help_mode("second option"), "guide")
-        self.assertEqual(classify_help_mode("option two"), "guide")
-        self.assertEqual(classify_help_mode("I will go with option B"), "guide")
-        self.assertEqual(classify_help_mode("option B works for me"), "guide")
+        self.assertEqual(classify_help_mode("third option"), "guide")
+        self.assertEqual(classify_help_mode("option three"), "guide")
+        self.assertEqual(classify_help_mode("I will go with option C"), "guide")
+        self.assertEqual(classify_help_mode("option C works for me"), "guide")
 
-        # AI fill — "you do the work" paraphrases
+        # AI fill — Option D / "you do the work" paraphrases
         self.assertEqual(classify_help_mode("fill it on your own"), "ai_fill")
         self.assertEqual(classify_help_mode("form filler"), "ai_fill")
         self.assertEqual(classify_help_mode("you handle the form"), "ai_fill")
@@ -381,8 +452,8 @@ class CallTurnTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(classify_help_mode("the last one"), "ai_fill")
         self.assertEqual(classify_help_mode("go ahead and fill it"), "ai_fill")
         self.assertEqual(classify_help_mode("fill it up for me"), "ai_fill")
-        self.assertEqual(classify_help_mode("option C"), "ai_fill")
-        self.assertEqual(classify_help_mode("I'll go with option C"), "ai_fill")
+        self.assertEqual(classify_help_mode("option D"), "ai_fill")
+        self.assertEqual(classify_help_mode("I'll go with option D"), "ai_fill")
 
         self.assertIsNone(classify_help_mode("maybe later"))
         self.assertIsNone(classify_help_mode("huh"))
@@ -7325,7 +7396,8 @@ class SectionIntroTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("rivera", confirm.lower())
         self.assertIn("partner", confirm.lower())
         self.assertIn("senior", confirm.lower())
-        self.assertIn("yes or no", confirm.lower())
+        self.assertIn("yes to confirm", confirm.lower())
+        self.assertIn("no to change", confirm.lower())
 
         spouse.elig_step = "spouse_age"
         self.assertEqual(_next_elig_step(spouse, "65"), "spouse_confirm")
@@ -7530,7 +7602,7 @@ class MemberConfirmCorrectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.get("step"), "child_confirm")
         self.assertTrue(result.get("await_field_correction"))
         spoken = (result.get("spoken") or "").lower()
-        self.assertIn("which detail", spoken)
+        self.assertIn("what to change", spoken)
         self.assertNotIn("learn more about your child", spoken)
         self.assertEqual(session.filled.get("child_first"), "Jackie")
         self.assertEqual(session.filled.get("child_age"), "(13-15) Teen")
@@ -12149,6 +12221,44 @@ class StageECollectModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("SSDI", keywords)
         self.assertIn("Social Security Administration", keywords)
         self.assertIn("Social Security Disability Insurance", keywords)
+
+    def test_ensure_agent_never_creates_custom_llm_agent(self) -> None:
+        """Outbound calls must reuse FORM_FILLER_AGENT_ID — never POST /create-agent."""
+        from pc_liveagent import retell_call
+
+        create_calls: list[str] = []
+
+        def fake_request(method, path, json_body=None, params=None):
+            if path == "/create-agent":
+                create_calls.append(path)
+                return 201, {"agent_id": "agent_should_not_be_created"}, ""
+            if path.startswith("/get-agent/"):
+                return 404, {}, "not found"
+            if path in ("/v2/list-agents", "/list-agents"):
+                return 200, {"items": [], "has_more": False}, ""
+            return 200, {}, ""
+
+        with (
+            patch.object(retell_call.config, "USE_CUSTOM_LLM", True),
+            patch.object(
+                retell_call.config,
+                "retell_llm_websocket_url",
+                return_value="wss://example.test/llm-websocket",
+            ),
+            patch.object(retell_call, "_request", side_effect=fake_request),
+            patch.object(
+                retell_call,
+                "_create_custom_llm_agent",
+                side_effect=AssertionError("must not create agents"),
+            ),
+        ):
+            agent_id, err, version = retell_call._ensure_agent("agent_missing")
+
+        self.assertEqual(agent_id, "")
+        self.assertIsNone(version)
+        self.assertIn("FORM_FILLER_AGENT_ID", err)
+        self.assertIn("never create", err.lower())
+        self.assertEqual(create_calls, [])
 
     def test_looks_like_truncated_ssa_ssdi(self) -> None:
         from pc_liveagent.income_stage import _looks_like_truncated_ssa_ssdi

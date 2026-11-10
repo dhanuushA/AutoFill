@@ -303,6 +303,24 @@ LIVE_AGENT_NUMBER = (
 RETELL_VOICE = os.environ.get("RETELL_VOICE", "").strip() or "retell-Cimo"
 RETELL_MODEL = os.environ.get("RETELL_MODEL", "").strip()
 
+# Option A — how-to video SMS (same .env key as Django Medi-Cal flow).
+MEDICAL_RENEWAL_VIDEO_URL = os.environ.get("MEDICAL_RENEWAL_VIDEO_URL", "").strip()
+MEDICAL_RENEWAL_TOLL_FREE_NUMBER = os.environ.get(
+    "MEDICAL_RENEWAL_TOLL_FREE_NUMBER", ""
+).strip()
+MEDICAL_RENEWAL_SMS_COLLECT_NUMBER = os.environ.get(
+    "MEDICAL_RENEWAL_SMS_COLLECT_NUMBER", ""
+).strip()
+TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
+TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
+TWILIO_PHONE_NUMBER = os.environ.get("TWILIO_PHONE_NUMBER", "").strip()
+TWILIO_CARECALL_FROM_NUMBER = os.environ.get("TWILIO_CARECALL_FROM_NUMBER", "").strip()
+FORM_FILLER_CALLBACK_NUMBER = (
+    os.environ.get("FORM_FILLER_CALLBACK_NUMBER", "").strip()
+    or os.environ.get("CALLBACK_NUMBER", "").strip()
+    or "1-833-234-7833"
+)
+
 # Custom LLM WebSocket (primary Collect Mode path). When enabled, the Pointcare
 # Eligibility agent uses response_engine type custom-llm instead of retell-llm.
 USE_CUSTOM_LLM = os.environ.get("USE_CUSTOM_LLM", "true").lower() in ("true", "1", "yes")

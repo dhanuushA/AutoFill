@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Medi-Cal Renewal & Retention call flow (BACH).
+Medi-Cal Renewal & Retention call flow (AI Medicaid Assist).
 
 Business logic lives in Retell LLM states + edges.
 Backend custom functions persist structured variables.
@@ -9,8 +9,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-DEFAULT_AGENT_NAME = "Lauren"
-ORG_NAME = "Bay Area Community Health"
+DEFAULT_AGENT_NAME = "Kyle"
+ORG_NAME = "AI Medicaid Assist"
 
 NODE_OPENING = "opening_identity"
 NODE_LANGUAGE = "language_preference"
@@ -67,7 +67,7 @@ def begin_message(patient_name: str) -> str:
 def general_prompt(*, agent_name: str = DEFAULT_AGENT_NAME) -> str:
     agent = (agent_name or "").strip() or DEFAULT_AGENT_NAME
     return f"""
-You are {agent}, a friendly enrollment specialist from {ORG_NAME} (BACH).
+You are {agent} from {ORG_NAME}.
 You are on an outbound Medi-Cal renewal & retention call with {{{{patient_name}}}}.
 
 BRANCHING FLOW (follow edges exactly — do not invent skips):
@@ -75,10 +75,10 @@ BRANCHING FLOW (follow edges exactly — do not invent skips):
 04 YES → 04a changes_check
   - no changes → 09 benefits (skip household/work/support/docs)
   - changes → 05 household_income → 09 benefits (skip work/support/docs)
-04 NO → 04b renewal_followup_offer (THREE options — ask exactly once):
-  - video texted → send_renewal_video_sms → briefly confirm → 05 household_income → …
-  - Pointcare registration on this call → pointcare_registration (guide them; do NOT transfer yet)
-  - live enrollment agent → agent_transfer
+04 NO → 04b renewal_followup_offer (THREE labeled options — ask exactly once):
+  - Option A video texted → send_renewal_video_sms → briefly confirm → 05 household_income → …
+  - Option B Pointcare registration on this call → pointcare_registration (guide them; do NOT transfer yet)
+  - Option C live enrollment agent → agent_transfer
 09 benefits → 10 appointment
 10 appointment:
   - IF flow_path is renewal_no AND benefits=yes AND appointment scheduled → 14 transfer
@@ -255,9 +255,9 @@ def build_tools(function_url: str) -> Dict[str, Any]:
             "url": function_url,
             "method": "POST",
             "description": (
-                "Text the Medi-Cal renewal follow-up video link to the patient's phone. "
-                "Use ONLY after they choose the video option in renewal_followup_offer "
-                "(not Pointcare, not live agent). "
+                "Text the Medi-Cal renewal how-to video link to the patient's phone. "
+                "Use ONLY after they choose Option A (video) in renewal_followup_offer "
+                "(not Option B Pointcare, not Option C live agent). "
                 "After success: briefly confirm the video was texted, then immediately "
                 "transition_to_household_income and continue the remaining questions. "
                 "Do NOT say goodbye. Do NOT call end_call."
@@ -272,7 +272,7 @@ def build_tools(function_url: str) -> Dict[str, Any]:
             "type": "transfer_call",
             "name": "transfer_to_bach_agent",
             "description": (
-                "Transfer the patient to a live BACH enrollment agent at {{agent_number}}. "
+                "Transfer the patient to a live enrollment agent at {{agent_number}}. "
                 "Use after phone/Enrollment help is chosen, or after the Appointment early-transfer rule. "
                 "If transfer fails, offer one retry or a callback — do not keep talking about saving."
             ),
@@ -301,7 +301,7 @@ def build_states(function_url: str) -> List[Dict[str, Any]]:
 The begin message already asked: "Hello, may I speak with {{{{patient_name}}}}?"
 After they confirm (yeah / yes / speaking / that's me / hello):
 IMMEDIATELY call transition_to_language_preference with patient_verified=true.
-Do NOT speak the Lauren / Medi-Cal intro here.
+Do NOT speak the Kyle / Medi-Cal intro here.
 Do NOT ask about renewal, address, phone, or email here.
 FORBIDDEN here: language question is the NEXT state — do not skip it.
 If wrong person/refuse/voicemail: callback_end or end_call as appropriate.
@@ -343,9 +343,9 @@ FORBIDDEN: Medi-Cal intro, renewal, contact questions, goodbye.
         {
             "name": NODE_PURPOSE,
             "state_prompt": f"""
-## Node 02 Purpose + Lauren intro
+## Node 02 Purpose + Kyle intro
 When you ENTER this state, speak promptly (no silence). Say EXACTLY this (use the patient's first name when known):
-"Hi {{{{patient_name}}}}, I'm {DEFAULT_AGENT_NAME}, an enrollment specialist with {ORG_NAME}. I see that your Medi-Cal coverage is coming up for renewal soon, and we want to make sure everything is updated so your coverage continues without any gap. Is now a good time to go through a few quick questions?"
+"Hi {{{{patient_name}}}}, I'm {DEFAULT_AGENT_NAME} from {ORG_NAME}. I see that your Medi-Cal coverage is coming up for renewal soon, and we want to make sure everything is updated so your coverage continues without any gap. Is now a good time to go through a few quick questions?"
 STOP and WAIT for their answer.
 FORBIDDEN here:
 - Do NOT ask the language question again.
@@ -437,7 +437,8 @@ FORBIDDEN: goodbye, ending after Yes/No, skipping straight to household after No
                 _edge(
                     NODE_RENEWAL_OFFER,
                     (
-                        f"Renewal NO / not completed → offer video, Pointcare, or live agent. "
+                        f"Renewal NO / not completed → offer Option A video, "
+                        f"Option B Pointcare, or Option C live agent. "
                         f"Set flow_path={FLOW_PATH_NO}."
                     ),
                     _json_props(
@@ -461,26 +462,26 @@ FORBIDDEN: goodbye, ending after Yes/No, skipping straight to household after No
             "state_prompt": f"""
 ## Node 04b Renewal follow-up offer (renewal NO path only)
 When you ENTER this state, ask ONCE and WAIT — say EXACTLY:
-"I can text you a short Medi-Cal renewal video, or guide you through Pointcare registration on this call, or connect you with a live enrollment agent. Which would you prefer?"
+"There are three options. Option A — I'll text you a video link showing how to do it. Option B — I'll guide you through PointCare registration on this call. Option C — I'll connect you with a live enrollment agent. Which option do you want — A, B, or C?"
 
 On first clear answer:
-- VIDEO / text me / send the video / SMS / link →
+- Option A / VIDEO / text me / send the video / SMS / how-to link / how to do it →
   1) Immediately call send_renewal_video_sms
   2) After it succeeds, say briefly: "I've just texted you the video. Let's keep going with a few quick questions."
   3) Immediately transition_to_household_income with flow_path="{FLOW_PATH_NO}" and assistance_type="renewal_video"
   Do NOT say goodbye. Do NOT call end_call.
-- POINTCARE / registration / guide me / website / set up account →
+- Option B / POINTCARE / registration / guide me / website / set up account →
   immediately transition_to_pointcare_registration with flow_path="{FLOW_PATH_NO}" and assistance_type="pointcare"
-- LIVE AGENT / enrollment agent / transfer / talk to a person / connect me →
+- Option C / LIVE AGENT / enrollment agent / transfer / talk to a person / connect me →
   immediately transition_to_agent_transfer with flow_path="{FLOW_PATH_NO}" and assistance_type="live_agent"
 
-FORBIDDEN: two-option wording ("continue with questions"); ending after video; inventing goodbye here.
+FORBIDDEN: two-option wording ("continue with questions"); unlabeled options; ending after video; inventing goodbye here.
 """.strip(),
             "edges": [
                 _edge(
                     NODE_HOUSEHOLD_INCOME,
                     (
-                        f"Video SMS sent — continue remaining questions. "
+                        f"Option A — video SMS sent — continue remaining questions. "
                         f"Set flow_path={FLOW_PATH_NO}."
                     ),
                     _json_props(
@@ -500,7 +501,7 @@ FORBIDDEN: two-option wording ("continue with questions"); ending after video; i
                 _edge(
                     NODE_POINTCARE,
                     (
-                        f"Patient chose Pointcare registration guidance on this call. "
+                        f"Option B — Pointcare registration guidance on this call. "
                         f"Set flow_path={FLOW_PATH_NO}."
                     ),
                     _json_props(
@@ -520,7 +521,7 @@ FORBIDDEN: two-option wording ("continue with questions"); ending after video; i
                 _edge(
                     NODE_TRANSFER,
                     (
-                        f"Patient chose a live enrollment agent. Transfer next. "
+                        f"Option C — live enrollment agent. Transfer next. "
                         f"Set flow_path={FLOW_PATH_NO}."
                     ),
                     _json_props(
@@ -912,7 +913,7 @@ Do not speak a long goodbye here — Closing handles that.
             "state_prompt": """
 ## Node 13 Closing (no-transfer path only)
 Say one short thank-you, then immediately call end_call.
-Example: "Thanks for your time today. Bay Area Community Health is here if you need us. Have a great day!"
+Example: "Thanks for your time today. AI Medicaid Assist is here if you need us. Have a great day!"
 Do not offer transfer here.
 """.strip(),
             "edges": [],

@@ -4,7 +4,9 @@ from pc_liveagent.live_form import (
     ELIG_QUESTIONS,
     LiveFormSession,
     _age_choice,
+    _classify_member_detail_screen,
     _fuzzy_choice_label,
+    _is_partnered,
     _map_age_label,
     _next_elig_step,
     _screen_first_step,
@@ -21,7 +23,42 @@ class EligibilityStateTests(unittest.TestCase):
     def test_marital_branching(self) -> None:
         self.assertEqual(_next_elig_step(self.session("marital"), "married"), "spouse_first")
         self.assertEqual(
+            _next_elig_step(self.session("marital"), "common law marriage"),
+            "spouse_first",
+        )
+        self.assertTrue(_is_partnered("Common law marriage."))
+        self.assertEqual(
             _next_elig_step(self.session("marital"), "never married"), "children"
+        )
+
+    def test_spouse_partner_page_not_person_form(self) -> None:
+        """call_ec4d: spouse/partner UI was misread as person_form → Child chips."""
+        body = (
+            "Tell us about your spouse or partner. First Name Last Name "
+            "Relationship to me Age"
+        )
+        labels = {"spouse", "partner", "(21-63) adult", "(65+) senior"}
+        self.assertEqual(
+            _classify_member_detail_screen(body=body, labels=labels),
+            "spouse_form",
+        )
+        # Even without chips yet, heading + name fields must stay spouse.
+        self.assertEqual(
+            _classify_member_detail_screen(
+                body=body, labels={"(21-63) adult", "(65+) senior"}
+            ),
+            "spouse_form",
+        )
+
+    def test_person_form_with_child_chips_stays_person(self) -> None:
+        body = (
+            "Tell us about this household member. First Name Last Name "
+            "Relationship to me"
+        )
+        labels = {"child", "stepchild", "grandchild", "foster child", "other"}
+        self.assertEqual(
+            _classify_member_detail_screen(body=body, labels=labels),
+            "person_form",
         )
 
     def test_consecutive_no_answers_advance_different_steps(self) -> None:

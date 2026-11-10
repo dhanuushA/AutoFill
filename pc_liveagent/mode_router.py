@@ -1,6 +1,7 @@
 """Same-call help-mode router after identity confirm.
 
 Modes (single Retell Custom LLM call — no second dial):
+  video      → text MEDICAL_RENEWAL_VIDEO_URL how-to link
   live_agent → cold transfer via response.transfer_number
   guide      → verbal PointCare coaching (ai_pointcare-style)
   ai_fill    → existing Collect Mode (language → sign-in → fill)
@@ -17,27 +18,62 @@ import re
 import time
 from typing import Any, Literal
 
-HelpMode = Literal["live_agent", "guide", "ai_fill"]
+from .guide_prompt import (
+    GUIDE_ASK_TEXT_LINK,
+    GUIDE_HAVE_LINK,
+    GUIDE_LINK_CHECK,
+    GUIDE_OPENING,
+    GUIDE_RESEND_LINK,
+    GUIDE_SENT_LINK,
+)
+
+HelpMode = Literal["video", "live_agent", "guide", "ai_fill"]
 
 logger = logging.getLogger(__name__)
 
+RENEWAL_STATUS_ASK = (
+    "Thanks for confirming. I'm Kyle from AI Medicaid Assist. "
+    "Have you already completed your Medi-Cal renewal?"
+)
+
+RENEWAL_STATUS_CLARIFY = (
+    "Just to confirm — have you already completed your Medi-Cal renewal? "
+    "Please say yes or no."
+)
+
+RENEWAL_ALREADY_DONE = (
+    "Okay, great — thank you for taking care of that. "
+    "We appreciate your time. Have a wonderful day. Goodbye."
+)
+
 MODE_INTRO_AND_MENU = (
-    "Thanks for confirming. I'm Kyle from Bay Area Community Health, "
-    "calling to help with your PointCare registration and forms. "
-    "There are three options. "
-    "Option A — connect with a live agent. "
-    "Option B — guide me through, while you fill it on your screen. "
-    "Option C — AI fills the form for you when you answer questions. "
-    "Which option do you want — A, B, or C?"
+    "No problem — I can help you with that. There are four options. "
+    "Option A — I'll text you a video link showing how to do it. "
+    "Option B — connect with a live agent. "
+    "Option C — guide me through, while you fill it on your screen. "
+    "Option D — AI fills the form for you when you answer questions. "
+    "Which option are you comfortable with?"
 )
 
 MODE_CLARIFY = (
-    "No problem — I want to get this right. "
-    "There are three options. "
-    "Option A is connect with a live agent. "
-    "Option B is guide me through. "
-    "Option C is AI fills the form for you when you answer. "
-    "Which option do you want — A, B, or C?"
+    "No problem — I want to get this right. There are four options. "
+    "Option A — I'll text you a video link showing how to do it. "
+    "Option B — connect with a live agent. "
+    "Option C — guide me through, while you fill it on your screen. "
+    "Option D — AI fills the form for you when you answer questions. "
+    "Which option are you comfortable with?"
+)
+
+VIDEO_SENT = (
+    "I've just texted you the video link. "
+    "You can watch it whenever you're ready. "
+    "Thank you for your time. Goodbye."
+)
+
+VIDEO_SEND_FAILED = (
+    "I wasn't able to text that video link just now. "
+    "I can connect you with a live agent, guide you through on your screen, "
+    "or fill the form for you. Which of those are you most comfortable with?"
 )
 
 LIVE_AGENT_CONNECTING = (
@@ -50,37 +86,40 @@ LIVE_AGENT_NO_NUMBER = (
     "Which would you like?"
 )
 
-GUIDE_START = (
-    "Okay — I'll guide you through PointCare on your screen. "
-    "Please open the PointCare page if you don't have it open yet, "
-    "and say ready when you're there."
-)
+GUIDE_START = GUIDE_OPENING
 
 AI_FILL_ACK = (
     "Okay — I'll fill PointCare for you while we talk. "
 )
 
+# Language ask only — do not repeat the Kyle intro (already spoken at call start).
+LANGUAGE_ONLY_ASK = (
+    "Is it okay to continue in English, or would you prefer another language?"
+)
+
+# Fallback script if Claude coaching is unavailable (Stage A onward).
 GUIDE_STEPS: tuple[str, ...] = (
-    GUIDE_START,
-    "Great. On the sign-in screen, choose email, Google, or Apple — "
-    "whichever you prefer — and tell me which one you picked.",
-    "Okay. Continue with that sign-in on your screen. "
-    "If email asks for a confirmation or code, enter it yourself — "
-    "please don't read passwords or codes out loud. Say done when you're signed in.",
-    "Next, create your password privately on the screen. "
-    "Say done when the password step is finished.",
-    "Now enter your phone number if asked, and complete any SMS code on your screen. "
-    "Say done when that step is finished.",
-    "Let's fill your profile one piece at a time — name, date of birth, address, "
-    "phone, and email. Update what's needed, then say done.",
-    "You'll see a consent form. PointCare may monitor coverage, respond on your behalf, "
-    "submit renewals, and contact you about care. Review it, sign on your screen, "
-    "and say done when you've signed.",
-    "Optional fields like SSN or Medicaid ID can be skipped if you prefer. "
-    "Finish or skip those, then say done.",
-    "Take a quick look that your profile looks right. "
-    "If everything looks good, say all set. "
-    "If you want a live agent instead, just say so.",
+    "Tap the yellow button at the bottom that says Get Started.",
+    "Tap Continue.",
+    "This screen is about what frustrates you most about coverage. "
+    "Tap whichever fits, then tap Continue.",
+    "Tap Create My Profile.",
+    "On Sign in or Create an Account, tap Continue with Google, Continue with Apple, "
+    "or type any email and tap Continue. Tell me when the next page is open.",
+    "Continue privately on your screen. Don't read passwords or codes out loud. "
+    "Say done when you're signed in.",
+    "Fill in your first name.",
+    "Now fill in your last name.",
+    "Now fill in your date of birth: month, then day, then the four-digit year.",
+    "Start typing your street address, then pick it from the list that pops up.",
+    "Type your phone number, all 10 digits. Say done when that box is filled.",
+    "Check the email, then tap Next.",
+    "Review the consent page, tap Add Signature, sign, and tap Save. Say done when signed.",
+    "On coverage lookup, type SSN or Medicaid ID yourself or tap Skip. "
+    "Tell me when the next page is open.",
+    "Tap the yellow button that says Check Household Eligibility.",
+    "Continue one screen at a time. Say done after each page until you reach "
+    "You're All Set, then say yes if you want to submit.",
 )
 
 GUIDE_DONE = (
@@ -88,7 +127,20 @@ GUIDE_DONE = (
     "Thank you for your time. Goodbye."
 )
 
+GUIDE_SMS_FAILED = (
+    "I wasn't able to text the PointCare link just now. "
+    "You can open the PointCare page on your phone if you have it, "
+    "or I can connect you with a live agent. What would you like to do?"
+)
+
 # Soft signal weights — utterance can match several; highest score wins.
+_VIDEO_SIGNALS: tuple[tuple[re.Pattern[str], int], ...] = (
+    (re.compile(r"\b(video(\s*link)?|how[\s-]*to\s*video|send\s*(me\s*)?(the\s*)?(video|link)|text\s*(me\s*)?(the\s*)?(video|link))\b", re.I), 9),
+    (re.compile(r"\b(sms|text\s*me|send\s*it|watch\s*(the\s*)?video|video\s*showing)\b", re.I), 7),
+    (re.compile(r"\b(option\s*(a|1|one)|first\s*(one|option)|number\s*(one|1)|#\s*1)\b", re.I), 9),
+    (re.compile(r"\b(go\s*with\s*option\s*(a|1|one)|option\s*a\s*works)\b", re.I), 9),
+)
+
 _LIVE_SIGNALS: tuple[tuple[re.Pattern[str], int], ...] = (
     (re.compile(r"\b(live\s*agent|live\s*person|real\s*person|real\s*human)\b", re.I), 8),
     (re.compile(r"\b(human\s*agent|human\s*being|actual\s*person|actual\s*human)\b", re.I), 8),
@@ -103,7 +155,7 @@ _LIVE_SIGNALS: tuple[tuple[re.Pattern[str], int], ...] = (
     (re.compile(r"\b(someone|somebody)\s*(please|now)?\b", re.I), 5),
     (re.compile(r"\b(not\s*(the\s*)?ai|don'?t\s*want\s*(the\s*)?ai|no\s*ai|hate\s*bots|not\s*a\s*robot)\b", re.I), 6),
     (re.compile(r"\b(i\s*want\s*(a\s*)?(person|human)|give\s*me\s*(a\s*)?(person|human))\b", re.I), 7),
-    (re.compile(r"\b(go\s*with\s*option\s*(a|1|one)|option\s*a\s*works)\b", re.I), 9),
+    (re.compile(r"\b(go\s*with\s*option\s*(b|2|two)|option\s*b\s*works)\b", re.I), 9),
 )
 
 _GUIDE_SIGNALS: tuple[tuple[re.Pattern[str], int], ...] = (
@@ -116,8 +168,8 @@ _GUIDE_SIGNALS: tuple[tuple[re.Pattern[str], int], ...] = (
     (re.compile(r"\b(on\s*my\s*(own\s*)?screen|i('ll|\s+will)\s*type|i\s*can\s*type)\b", re.I), 6),
     (re.compile(r"\b(registration\s*help|pointcare\s*registration|help\s*me\s*register)\b", re.I), 6),
     (re.compile(r"\b(you\s*tell\s*me|just\s*tell\s*me|instruct\s*me|directions)\b", re.I), 5),
-    (re.compile(r"\b(second\s*(one|option)|option\s*(b|2|two)|number\s*(two|2)|#\s*2)\b", re.I), 9),
-    (re.compile(r"\b(go\s*with\s*option\s*(b|2|two)|option\s*b\s*works)\b", re.I), 9),
+    (re.compile(r"\b(third\s*(one|option)|option\s*(c|3|three)|number\s*(three|3)|#\s*3)\b", re.I), 9),
+    (re.compile(r"\b(go\s*with\s*option\s*(c|3|three)|option\s*c\s*works)\b", re.I), 9),
 )
 
 _AI_SIGNALS: tuple[tuple[re.Pattern[str], int], ...] = (
@@ -132,13 +184,12 @@ _AI_SIGNALS: tuple[tuple[re.Pattern[str], int], ...] = (
     (re.compile(r"\b(just\s*ask\s*me(\s*questions)?|i('ll|\s+will)\s*answer(\s*questions)?)\b", re.I), 6),
     (re.compile(r"\b(you\s*fill\s*(while|and)\s*i\s*answer|answer\s*questions)\b", re.I), 6),
     (re.compile(r"\b(fill\s*it\s*while\s*i\s*(talk|answer|speak)|while\s*i\s*(talk|answer))\b", re.I), 7),
-    (re.compile(r"\b(third\s*(one|option)|option\s*(c|3|three)|number\s*(three|3)|#\s*3|last\s*(one|option))\b", re.I), 9),
-    (re.compile(r"\b(go\s*with\s*option\s*(c|3|three)|option\s*c\s*works)\b", re.I), 9),
+    (re.compile(r"\b(fourth\s*(one|option)|option\s*(d|4|four)|number\s*(four|4)|#\s*4|last\s*(one|option))\b", re.I), 9),
+    (re.compile(r"\b(go\s*with\s*option\s*(d|4|four)|option\s*d\s*works)\b", re.I), 9),
 )
 
-# Menu order spoken to the caller: A live, B guide, C ai_fill
-# Require "option/letter/choice" before A/B/C so "I want a person" is not Option A.
-_ORDINAL_LIVE = re.compile(
+# Menu order spoken to the caller: A video, B live, C guide, D ai_fill
+_ORDINAL_VIDEO = re.compile(
     r"\b("
     r"option\s*(a|1|one)(\s*works(\s*for\s*me)?)?|"
     r"(go\s*with|pick|choose|take|select|i('ll|\s+will)\s*(go\s*with|take|do))\s+option\s*(a|1|one)|"
@@ -147,7 +198,7 @@ _ORDINAL_LIVE = re.compile(
     r")\b",
     re.I,
 )
-_ORDINAL_GUIDE = re.compile(
+_ORDINAL_LIVE = re.compile(
     r"\b("
     r"option\s*(b|2|two)(\s*works(\s*for\s*me)?)?|"
     r"(go\s*with|pick|choose|take|select|i('ll|\s+will)\s*(go\s*with|take|do))\s+option\s*(b|2|two)|"
@@ -156,13 +207,22 @@ _ORDINAL_GUIDE = re.compile(
     r")\b",
     re.I,
 )
-_ORDINAL_AI = re.compile(
+_ORDINAL_GUIDE = re.compile(
     r"\b("
     r"option\s*(c|3|three)(\s*works(\s*for\s*me)?)?|"
     r"(go\s*with|pick|choose|take|select|i('ll|\s+will)\s*(go\s*with|take|do))\s+option\s*(c|3|three)|"
     r"(letter|choice)\s*(c|3|three)|"
-    r"third(\s*one)?|third\s*option|number\s*(three|3)|#\s*3|"
-    r"the\s*third|last(\s*one)?|last\s*option"
+    r"third(\s*one)?|third\s*option|number\s*(three|3)|#\s*3|the\s*third"
+    r")\b",
+    re.I,
+)
+_ORDINAL_AI = re.compile(
+    r"\b("
+    r"option\s*(d|4|four)(\s*works(\s*for\s*me)?)?|"
+    r"(go\s*with|pick|choose|take|select|i('ll|\s+will)\s*(go\s*with|take|do))\s+option\s*(d|4|four)|"
+    r"(letter|choice)\s*(d|4|four)|"
+    r"fourth(\s*one)?|fourth\s*option|number\s*(four|4)|#\s*4|"
+    r"the\s*fourth|last(\s*one)?|last\s*option"
     r")\b",
     re.I,
 )
@@ -186,7 +246,7 @@ def _normalize_choice_text(utterance: str) -> str:
 
 
 def classify_help_mode(utterance: str) -> HelpMode | None:
-    """Map natural / messy speech to live_agent | guide | ai_fill.
+    """Map natural / messy speech to video | live_agent | guide | ai_fill.
 
     Does not require menu-exact wording. Returns None when still ambiguous.
     """
@@ -194,14 +254,17 @@ def classify_help_mode(utterance: str) -> HelpMode | None:
     if not text or text in {"huh", "what", "sorry", "pardon", "hm", "hmm", "uh"}:
         return None
 
-    # Bare ordinals / option letters relative to the spoken menu.
-    if _ORDINAL_AI.search(text) and not _ORDINAL_LIVE.search(text) and not _ORDINAL_GUIDE.search(text):
-        return "ai_fill"
-    if _ORDINAL_GUIDE.search(text) and not _ORDINAL_LIVE.search(text) and not _ORDINAL_AI.search(text):
-        return "guide"
-    if _ORDINAL_LIVE.search(text) and not _ORDINAL_GUIDE.search(text) and not _ORDINAL_AI.search(text):
-        return "live_agent"
+    hits = {
+        "video": bool(_ORDINAL_VIDEO.search(text)),
+        "live_agent": bool(_ORDINAL_LIVE.search(text)),
+        "guide": bool(_ORDINAL_GUIDE.search(text)),
+        "ai_fill": bool(_ORDINAL_AI.search(text)),
+    }
+    ordinal_hits = [name for name, matched in hits.items() if matched]
+    if len(ordinal_hits) == 1:
+        return ordinal_hits[0]  # type: ignore[return-value]
 
+    video = _score_signals(text, _VIDEO_SIGNALS)
     live = _score_signals(text, _LIVE_SIGNALS)
     guide = _score_signals(text, _GUIDE_SIGNALS)
     ai = _score_signals(text, _AI_SIGNALS)
@@ -222,10 +285,10 @@ def classify_help_mode(utterance: str) -> HelpMode | None:
 
     # "Just do it" / "go ahead and fill" without myself → AI
     if re.search(r"\b(just\s*(do|fill)|go\s*ahead\s*and\s*fill|take\s*care\s*of\s*it)\b", text):
-        if not re.search(r"\b(myself|my\s*self|person|human|agent)\b", text):
+        if not re.search(r"\b(myself|my\s*self|person|human|agent|video)\b", text):
             ai = max(ai, 6)
 
-    scores = {"live_agent": live, "guide": guide, "ai_fill": ai}
+    scores = {"video": video, "live_agent": live, "guide": guide, "ai_fill": ai}
     ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
     best_name, best = ranked[0]
     second = ranked[1][1]
@@ -260,24 +323,28 @@ async def classify_help_mode_async(utterance: str) -> HelpMode | None:
 
     started = time.perf_counter()
     system = (
-        "You classify a caller's spoken choice after this menu: "
-        "Option A = live_agent (connect with a live agent), "
-        "Option B = guide (guide me through while they fill on their screen), "
-        "Option C = ai_fill (AI fills the form while they answer questions). "
+        "You classify a caller's spoken choice after this help menu: "
+        "video = text a how-to video link; "
+        "live_agent = connect with a live agent; "
+        "guide = guide them through while they fill on their screen; "
+        "ai_fill = AI fills the form while they answer questions. "
         "Reply with ONLY JSON: "
-        '{"mode":"live_agent"|"guide"|"ai_fill"|null,"confidence":0-1}. '
-        "Accept option letters, numbers, and paraphrases. "
-        "'Option A works for me'→live_agent; 'I will go with option B'→guide; "
-        "'option C'→ai_fill; 'uh a person'→live_agent; "
-        "'just tell me what to click'→guide; 'you handle the form'→ai_fill. "
-        "If truly unclear, mode=null."
+        '{"mode":"video"|"live_agent"|"guide"|"ai_fill"|null,"confidence":0-1}. '
+        "Accept option letters (A/B/C/D), numbers, option names, and full sentences. "
+        "'Option A' or 'send the video'→video; "
+        "'Option B' or 'a live agent'→live_agent; "
+        "'Option C' or 'guide me through'→guide; "
+        "'Option D' or 'AI fills the form'→ai_fill; "
+        "'uh a person'→live_agent; 'just tell me what to click'→guide; "
+        "'you handle the form'→ai_fill. If truly unclear, mode=null."
     )
     user = json.dumps(
         {
             "menu": [
-                "Option A / live_agent — connect with a live agent",
-                "Option B / guide — guide me through",
-                "Option C / ai_fill — AI fills the form when you answer",
+                "video — text a how-to video link",
+                "live_agent — connect with a live agent",
+                "guide — guide me through on my screen",
+                "ai_fill — AI fills the form when I answer",
             ],
             "utterance": text[:300],
         },
@@ -329,7 +396,7 @@ async def classify_help_mode_async(utterance: str) -> HelpMode | None:
         mode = (data.get("mode") or "").strip()
         conf = float(data.get("confidence") or 0)
         latency = (time.perf_counter() - started) * 1000
-        if mode in {"live_agent", "guide", "ai_fill"} and conf >= min_conf:
+        if mode in {"video", "live_agent", "guide", "ai_fill"} and conf >= min_conf:
             logger.info(
                 "mode_classify_claude mode=%s conf=%.2f latency_ms=%.0f utter=%r",
                 mode,
@@ -366,7 +433,7 @@ def guide_wants_advance(utterance: str) -> bool:
     if not text:
         return False
     # Switching modes is not an advance.
-    if classify_help_mode(utterance) in {"live_agent", "ai_fill"}:
+    if classify_help_mode(utterance) in {"video", "live_agent", "ai_fill"}:
         return False
     if re.search(
         r"\b("

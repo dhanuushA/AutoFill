@@ -31,7 +31,7 @@ from apps.ai_pointcare.models import RenewalCallSession
 
 logger = logging.getLogger(__name__)
 
-_AGENT_NAME = "BACH Medi-Cal Renewal State Flow"
+_AGENT_NAME = "AI Medicaid Assist Medi-Cal Renewal State Flow"
 _CARE_AGENT_NAMES = {_AGENT_NAME_PATIENT, _AGENT_NAME_GUARDIAN}
 _AGENT_SETTINGS: Dict[str, Any] = {
     "language": "en-US",

@@ -37,7 +37,7 @@ def _sample_conversation(**extra) -> SmsConversation:
         patient_name="Vijith Vijayan",
         service_name="dental",
         transcript=(
-            "Agent: Hi, this is Bay Area Community Health. Am I texting with Vijith?\n"
+            "Agent: Hi, this is AI Medicaid Assist. Am I texting with Vijith?\n"
             "Patient: YES\n"
             "Agent: I'll connect you with a team member now — you'll receive a call shortly."
         ),

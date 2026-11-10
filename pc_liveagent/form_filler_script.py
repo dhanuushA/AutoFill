@@ -29,7 +29,7 @@ def pointcare_agent_settings() -> dict[str, Any]:
         "call_screening_option": {
             "agent_identity": "Kyle",
             "call_purpose": (
-                "calling from Bay Area Community Health to assist with "
+                "calling from AI Medicaid Assist to assist with "
                 "Pointcare registration"
             ),
         },
@@ -43,8 +43,8 @@ def pointcare_agent_settings() -> dict[str, Any]:
             "action": {
                 "type": "static_text",
                 "text": (
-                    "Hi, this is Kyle, an AI agent calling from Bay Area "
-                    "Community Health to assist with Pointcare registration. "
+                    "Hi, this is Kyle from AI Medicaid Assist, calling to "
+                    "assist with Pointcare registration. "
                     "Please call {{callback_number}} when you have a moment."
                 ),
             },

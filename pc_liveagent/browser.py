@@ -516,7 +516,8 @@ def _launch_chrome(user_data_dir: Path, profile_directory: str, start_url: str =
         "--start-maximized",
         "--disable-session-crashed-bubble",
         "--hide-crash-restore-bubble",
-        "--disable-blink-features=AutomationControlled",
+        # Do not pass --disable-blink-features=AutomationControlled — Chrome
+        # treats it as unsupported and shows a persistent yellow infobar.
         "--disable-features=FedCm,AutofillServerCommunication",
     ]
     if sys.platform != "win32":

@@ -86,7 +86,7 @@ def agent_answer_twiml(conversation: SmsConversation) -> str:
 
     if not patient_phone:
         speak = (
-            f"Hello. This is an automated transfer from Bay Area Community Health. "
+            f"Hello. This is an automated transfer from AI Medicaid Assist. "
             f"{patient} needs help with {service}, but their phone number is missing. "
             f"Goodbye."
         )
@@ -97,7 +97,7 @@ def agent_answer_twiml(conversation: SmsConversation) -> str:
         )
 
     whisper = (
-        f"Hello. Transfer from Bay Area Community Health. "
+        f"Hello. Transfer from AI Medicaid Assist. "
         f"Connecting you now with {patient} about {service}. Please hold."
     )
     action = ""
@@ -339,7 +339,7 @@ def _notify_patient_unreachable(conversation: SmsConversation) -> None:
         return
     body = (
         "We're sorry — our team wasn't available just now. "
-        "Someone from Bay Area Community Health will follow up with you soon."
+        "Someone from AI Medicaid Assist will follow up with you soon."
     )
     _sid, err = send_twilio_sms(phone, body, conversation.from_number)
     if err:
@@ -358,7 +358,7 @@ def _notify_patient_missed_bridge(conversation: SmsConversation) -> None:
         return
     body = (
         "We tried to call you to connect you with our team, but couldn't reach you. "
-        "Someone from Bay Area Community Health will follow up soon."
+        "Someone from AI Medicaid Assist will follow up soon."
     )
     _sid, err = send_twilio_sms(phone, body, conversation.from_number)
     if err:

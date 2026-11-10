@@ -19,6 +19,5 @@ start "" "C:\Program Files\Google\Chrome\Application\chrome.exe" ^
   --user-data-dir="%AGENT_DIR%" ^
   --profile-directory=Default ^
   --no-first-run --no-default-browser-check --start-maximized ^
-  --disable-blink-features=AutomationControlled ^
   --disable-features=FedCm,AutofillServerCommunication ^
   "%START_URL%"

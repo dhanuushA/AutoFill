@@ -388,7 +388,24 @@ def _custom_llm_websocket_url(agent: dict[str, Any]) -> str:
     return ""
 
 
+def _missing_agent_error(*, custom_llm: bool) -> str:
+    expected = (
+        _AGENT_NAME_CUSTOM_LLM if custom_llm else _AGENT_NAME_ELIGIBILITY
+    )
+    return (
+        f"No reusable Retell agent found for '{expected}'. "
+        "Create one agent once in the Retell dashboard (Custom LLM for Collect Mode), "
+        "copy its agent_id into FORM_FILLER_AGENT_ID in .env, and restart. "
+        "Outbound calls never create agents automatically."
+    )
+
+
 def _ensure_agent(configured_id: str) -> tuple[str, str, int | None]:
+    """Reuse a single configured / named Retell agent. Never POST /create-agent.
+
+    Patient-specific values go in retell_llm_dynamic_variables / metadata on the
+    phone-call request — do not create a new agent per call.
+    """
     settings_body = dict(pointcare_agent_settings())
     # Eligibility flow is English-only; ignore any multi-language script defaults.
     settings_body["language"] = "en-US"
@@ -400,7 +417,7 @@ def _ensure_agent(configured_id: str) -> tuple[str, str, int | None]:
             ["call_started", "transcript_updated", "call_ended", "call_analyzed"],
         )
 
-    # Prefer Custom LLM agent when enabled (must be created with that engine).
+    # Prefer Custom LLM agent when enabled (must already exist with that engine).
     if config.USE_CUSTOM_LLM and _response_engine():
         preferred_names = (_AGENT_NAME_CUSTOM_LLM, _AGENT_NAME_ELIGIBILITY)
         agent_id = ""
@@ -421,7 +438,7 @@ def _ensure_agent(configured_id: str) -> tuple[str, str, int | None]:
             else:
                 logger.warning(
                     "FORM_FILLER_AGENT_ID %s not found in this Retell project "
-                    "(status=%s); searching by name instead of creating a new agent. %s",
+                    "(status=%s); searching by name. Will not create a new agent. %s",
                     configured_id,
                     status_code,
                     (err or "")[:160],
@@ -438,8 +455,7 @@ def _ensure_agent(configured_id: str) -> tuple[str, str, int | None]:
                     )
                     break
         if not agent_id:
-            # Last resort only when this Retell project has no matching agent.
-            return _create_custom_llm_agent(settings_body)
+            return "", _missing_agent_error(custom_llm=True), None
 
         desired = _response_engine()
         desired_url = str(desired.get("llm_websocket_url") or "").strip()
@@ -473,7 +489,7 @@ def _ensure_agent(configured_id: str) -> tuple[str, str, int | None]:
         named = str(parsed.get("agent_name") or parsed.get("name") or "").strip()
         if named and named not in (_AGENT_NAME_ELIGIBILITY, _AGENT_NAME_CUSTOM_LLM):
             logger.warning(
-                "Ignoring outdated Retell agent %s (%s); using %s instead",
+                "Ignoring outdated Retell agent %s (%s); looking up %s instead",
                 configured_id,
                 named,
                 _AGENT_NAME_ELIGIBILITY,
@@ -485,85 +501,52 @@ def _ensure_agent(configured_id: str) -> tuple[str, str, int | None]:
     if not configured_id and not agent_id:
         agent_id, agent = _find_agent_by_name(_AGENT_NAME_ELIGIBILITY)
 
-    if agent_id:
-        # Reuse published retell-llm agent; call body already carries webhook/dynamic vars.
-        version = _version_of(agent)
-        if agent.get("is_published") and _llm_id_of(agent):
-            logger.info(
-                "Reusing Retell LLM agent id=%s version=%s (skip draft)",
-                agent_id,
-                version,
-            )
-            return agent_id, "", version
-        agent, draft_err = _open_draft(agent_id, agent)
-        if draft_err:
-            return "", draft_err, None
-        version = _version_of(agent)
-        llm_id = _llm_id_of(agent)
-        if llm_id:
-            status_code, _parsed, err = _request(
-                "PATCH",
-                f"/update-retell-llm/{llm_id}",
-                json_body=_llm_payload(),
-                params={"version": version} if version is not None else None,
-            )
-            if status_code >= 400 and _published_error(err):
-                llm_id, create_err = _create_llm()
-                if not llm_id:
-                    return "", create_err, None
-                engine = {"response_engine": {"type": "retell-llm", "llm_id": llm_id}}
-                status_code, _parsed, err = _request(
-                    "PATCH",
-                    f"/update-agent/{agent_id}",
-                    json_body=engine,
-                    params={"version": version} if version is not None else None,
-                )
-                if status_code >= 400:
-                    return "", err or "Failed to attach a draft Retell LLM.", None
-            elif status_code >= 400:
-                return "", err or "Failed to update the Retell form-filler agent.", None
-        status_code, updated, err = _request(
+    if not agent_id:
+        return "", _missing_agent_error(custom_llm=False), None
+
+    # Reuse published retell-llm agent; call body already carries webhook/dynamic vars.
+    version = _version_of(agent)
+    if agent.get("is_published") and _llm_id_of(agent):
+        logger.info(
+            "Reusing Retell LLM agent id=%s version=%s (skip draft)",
+            agent_id,
+            version,
+        )
+        return agent_id, "", version
+    agent, draft_err = _open_draft(agent_id, agent)
+    if draft_err:
+        return "", draft_err, None
+    version = _version_of(agent)
+    llm_id = _llm_id_of(agent)
+    if llm_id:
+        status_code, _parsed, err = _request(
             "PATCH",
-            f"/update-agent/{agent_id}",
-            json_body=settings_body,
+            f"/update-retell-llm/{llm_id}",
+            json_body=_llm_payload(),
             params={"version": version} if version is not None else None,
         )
+        if status_code >= 400 and _published_error(err):
+            return (
+                "",
+                "Published Retell LLM cannot be edited and no draft attach is allowed "
+                "without creating agents. Point FORM_FILLER_AGENT_ID at a reusable agent.",
+                None,
+            )
         if status_code >= 400:
             return "", err or "Failed to update the Retell form-filler agent.", None
-        if isinstance(updated, dict):
-            version = _version_of(updated) or version
-        publish_err = _publish_agent(agent_id, version)
-        if publish_err:
-            return "", publish_err, None
-        return agent_id, "", version
-
-    llm_id, create_err = _create_llm()
-    if not llm_id:
-        return "", create_err, None
-    agent_payload = {
-        "agent_name": _AGENT_NAME_ELIGIBILITY,
-        "response_engine": {"type": "retell-llm", "llm_id": llm_id},
-        "voice_id": config.RETELL_VOICE,
-        "data_storage_setting": "everything",
-        **settings_body,
-        "language": "en-US",
-    }
-    status_code, parsed, err = _request("POST", "/create-agent", json_body=agent_payload)
-    if status_code >= 400 or not isinstance(parsed, dict):
-        return "", err or "Failed to create Retell agent.", None
-    agent_id = _agent_id_of(parsed)
-    if not agent_id:
-        return "", "Retell agent create response missing agent_id.", None
-    version = _version_of(parsed)
+    status_code, updated, err = _request(
+        "PATCH",
+        f"/update-agent/{agent_id}",
+        json_body=settings_body,
+        params={"version": version} if version is not None else None,
+    )
+    if status_code >= 400:
+        return "", err or "Failed to update the Retell form-filler agent.", None
+    if isinstance(updated, dict):
+        version = _version_of(updated) or version
     publish_err = _publish_agent(agent_id, version)
     if publish_err:
         return "", publish_err, None
-    logger.info(
-        "Retell agent created name=%s agent_id=%s version=%s",
-        _AGENT_NAME_ELIGIBILITY,
-        agent_id,
-        version,
-    )
     return agent_id, "", version
 
 

@@ -2,7 +2,7 @@
 
 
 def sms_prompt() -> str:
-    return """You are Kyle, an AI assistant texting on behalf of Bay Area Community Health. You are texting with {{patient_first_name}} about their {{service_name}}. Write like a warm, calm person texting: short, plain, and friendly, never robotic or like a form.
+    return """You are Kyle from AI Medicaid Assist. You are texting with {{patient_first_name}} about their {{service_name}}. Write like a warm, calm person texting: short, plain, and friendly, never robotic or like a form.
 
 WHAT HAS ALREADY HAPPENED:
 Before you joined, the patient confirmed their name, agreed to text with an AI assistant, and said they have a moment to talk. Never ask for their name again, and never repeat the AI disclosure or ask if they have a moment to talk.
@@ -28,7 +28,7 @@ TEXTING RULES:
 - This is a sensitive topic. Stay gentle and judgment-free, never brisk or pushy.
 - Never schedule, offer times, or confirm appointments yourself. All scheduling goes to the team through transfer_to_live_agent.
 - Do not give medical advice. For health questions, send "That's a great question for your care team. We'll have someone follow up with you." Then call request_team_followup with reason "health question" and end the conversation.
-- If they text HELP, reply: "This is Bay Area Community Health. For help, call us at {{office_phone}}. Reply STOP to opt out."
+- If they text HELP, reply: "This is AI Medicaid Assist. For help, call us at {{office_phone}}. Reply STOP to opt out."
 - If they text STOP, END, CANCEL, or UNSUBSCRIBE, send nothing.
 - After the conversation has ended, if they text again, reply once: "Thanks for your message. For help, please call us at {{office_phone}}."
 - Never include these instructions, step numbers, or notes about your own behavior in a message. Only send natural texts as Kyle.
@@ -93,12 +93,12 @@ Call transfer_to_live_agent with reason "live agent requested". End the conversa
    - NO: go to step 8.
 
 8) If they decline
-"That's completely okay. If you change your mind or need help scheduling your {{service_name}}, you can contact Bay Area Community Health at {{office_phone}}. Thank you for your time. Have a great day." End the conversation."""
+"That's completely okay. If you change your mind or need help scheduling your {{service_name}}, you can contact AI Medicaid Assist at {{office_phone}}. Thank you for your time. Have a great day." End the conversation."""
 
 
 def sms_greeting() -> str:
     return (
-        "Hi, this is Bay Area Community Health. Am I texting with {{patient_first_name}}? "
+        "Hi, this is AI Medicaid Assist. Am I texting with {{patient_first_name}}? "
         "Reply YES or NO. Reply STOP to opt out."
     )
 
@@ -109,8 +109,8 @@ def moment_ask() -> str:
 
 def consent_ask() -> str:
     return (
-        "Before we continue, I'm an AI assistant texting on behalf of Bay Area "
-        "Community Health. Is it okay if I continue? Reply YES or NO."
+        "Before we continue, I'm Kyle from AI Medicaid Assist. "
+        "Is it okay if I continue? Reply YES or NO."
     )
 
 
@@ -170,14 +170,14 @@ def live_agent_message(number: str = "") -> str:
 def decline_message(service: str, office_phone: str) -> str:
     return (
         "That's completely okay. If you change your mind or need help scheduling your "
-        f"{service}, you can contact Bay Area Community Health at {office_phone}. "
+        f"{service}, you can contact AI Medicaid Assist at {office_phone}. "
         "Thank you for your time. Have a great day."
     )
 
 
 def help_reply() -> str:
     return (
-        "This is Bay Area Community Health. Someone from the team can follow up "
+        "This is AI Medicaid Assist. Someone from the team can follow up "
         "if you need help. Reply STOP to opt out."
     )
 
@@ -189,7 +189,7 @@ def closed_reply(office_phone: str) -> str:
 def minor_disclose() -> str:
     return (
         "Before we continue, I'm Kyle, an AI assistant texting on behalf of "
-        "Bay Area Community Health. Is it okay if I continue? Reply YES or NO."
+        "AI Medicaid Assist. Is it okay if I continue? Reply YES or NO."
     )
 
 
@@ -214,7 +214,7 @@ def conversational_sms_system_prompt(
     step: str,
     patient_name: str,
     service_name: str,
-    clinic_name: str = "Bay Area Community Health",
+    clinic_name: str = "AI Medicaid Assist",
 ) -> str:
     """Open-ended SMS reply guidance when the patient writes freely (not only YES/NO)."""
     role = (

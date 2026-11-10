@@ -285,10 +285,10 @@ def handle_retell_function(name: str, args: Dict[str, Any], call: Dict[str, Any]
             "saved": True,
             "video_sent": True,
             "message": (
-                "Video SMS sent successfully. Confirm briefly that you texted the video, "
-                "then immediately transition_to_household_income and continue the remaining "
-                "questions. Do NOT offer Pointcare or transfer again unless asked. "
-                "Do NOT say goodbye. Do NOT call end_call."
+                "Option A complete — video SMS sent successfully. Confirm briefly that you "
+                "texted the video, then immediately transition_to_household_income and "
+                "continue the remaining questions. Do NOT offer Option B or Option C again "
+                "unless asked. Do NOT say goodbye. Do NOT call end_call."
             ),
         }
 

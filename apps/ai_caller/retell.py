@@ -314,7 +314,7 @@ def _agent_call_settings() -> Dict[str, Any]:
         "interruption_sensitivity": _interruption_sensitivity(),
         "responsiveness": _responsiveness(),
         "call_screening_option": {
-            "agent_identity": "Kyle from Bay Area Community Health",
+            "agent_identity": "Kyle from AI Medicaid Assist",
             "call_purpose": (
                 "calling {{patient_name}} about their {{service_name}} with Dr. {{name}}"
             ),
@@ -329,7 +329,7 @@ def _agent_call_settings() -> Dict[str, Any]:
             "action": {
                 "type": "static_text",
                 "text": (
-                    "Hi, this is Kyle calling from Bay Area Community Health "
+                    "Hi, this is Kyle calling from AI Medicaid Assist "
                     "for {{patient_name}}. Just reaching out about your "
                     "{{service_name}} with Dr. {{name}} — nothing urgent. "
                     "Whenever you have a moment, please give us a call back "
@@ -444,7 +444,7 @@ def _transfer_tool() -> Dict[str, Any]:
         "type": "transfer_call",
         "name": "transfer_to_live_agent",
         "description": (
-            "Transfer to a live Bay Area Community Health team member ONLY when the "
+            "Transfer to a live AI Medicaid Assist team member ONLY when the "
             "patient has said yes to booking or rescheduling an appointment, when "
             "they want a live agent to update address, phone, email, or insurance, "
             "or when they declined to talk to an AI and then agreed to be connected."
@@ -460,7 +460,7 @@ def _transfer_tool() -> Dict[str, Any]:
 def _minor_transfer_tool() -> Dict[str, Any]:
     tool = _transfer_tool()
     tool["description"] = (
-        "Transfer to a live Bay Area Community Health team member only after the "
+        "Transfer to a live AI Medicaid Assist team member only after the "
         "caller has agreed to be connected because the offered appointment date or "
         "time does not work, when they want a live agent to update address, phone, "
         "email, or insurance, or when they declined to talk to an AI and then agreed "
@@ -729,14 +729,14 @@ def place_retell_care_call(
 def _guardian_call_settings() -> Dict[str, Any]:
     payload = _agent_call_settings()
     payload["call_screening_option"] = {
-        "agent_identity": "Kyle from Bay Area Community Health",
+        "agent_identity": "Kyle from AI Medicaid Assist",
         "call_purpose": (
             "calling {{guardian_name}} about scheduling care for {{patient_name}}"
         ),
     }
     payload["voicemail_option"]["action"]["text"] = (
         "Hello, this message is for {{guardian_name}}. My name is Kyle, and I'm calling "
-        "from Bay Area Community Health about scheduling an appointment for {{patient_name}}. "
+        "from AI Medicaid Assist about scheduling an appointment for {{patient_name}}. "
         "Please give us a call back at your earliest convenience. Thank you, and have a great day."
     )
     return payload

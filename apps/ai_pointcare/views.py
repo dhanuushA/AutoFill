@@ -80,6 +80,9 @@ def _failure(message, code=400, errors=None):
 class PlaceMediCalCallView(APIView):
     """Place a Retell Medi-Cal renewal state-machine call."""
 
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
     def post(self, request):
         serializer = PlaceMediCalCallSerializer(data=request.data)
         if not serializer.is_valid():

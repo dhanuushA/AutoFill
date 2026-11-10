@@ -7,6 +7,7 @@ from pathlib import Path
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import config
@@ -37,6 +38,11 @@ app = FastAPI(title="PointCare Live FormFiller")
 
 _FRONTEND_DIR = Path(__file__).resolve().parent / "frontend"
 _FRONTEND_INDEX = _FRONTEND_DIR / "index.html"
+app.mount(
+    "/static",
+    StaticFiles(directory=str(_FRONTEND_DIR)),
+    name="frontend_static",
+)
 
 
 @app.on_event("shutdown")
@@ -128,6 +134,7 @@ async def form_filler_outbound(
             payload.name,
             agent_number=payload.agent_number or "",
             form_url=form_url,
+            phone_number=payload.phone_number or "",
         )
     base = _request_base_url(request)
     chrome_link = _chrome_session_url(base, call_id)

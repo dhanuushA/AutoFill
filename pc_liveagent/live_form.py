@@ -187,7 +187,8 @@ ELIG_QUESTIONS: dict[str, str] = {
     "spouse_role": "Are they your spouse or your partner?",
     "spouse_age": "What is their age?",
     "spouse_confirm": (
-        "Please confirm those details. Say Yes to continue, or No to change them."
+        "Please confirm the first name, last name, age, and relationship. "
+        "Say Yes to confirm, or No to change."
     ),
     "children": (
         "Do you live with and mainly support any children under 19 who live with you "
@@ -203,7 +204,8 @@ ELIG_QUESTIONS: dict[str, str] = {
     ),
     "child_age": "What is the child's age?",
     "child_confirm": (
-        "Please confirm those details. Say Yes to continue, or No to change them."
+        "Please confirm the first name, last name, age, and relationship. "
+        "Say Yes to confirm, or No to change."
     ),
     "child_more": "Is there another child to add? Please say Yes or No.",
     "student": (
@@ -233,7 +235,8 @@ ELIG_QUESTIONS: dict[str, str] = {
     ),
     "person_age": "What is their age?",
     "person_confirm": (
-        "Please confirm those details. Say Yes to continue, or No to change them."
+        "Please confirm the first name, last name, age, and relationship. "
+        "Say Yes to confirm, or No to change."
     ),
     "income_when": (
         "For household income, which period do you know best — Annual, Monthly, or "
@@ -496,7 +499,7 @@ def _spoken_age_range(label: str) -> str:
 
 
 def _member_confirm_speech(session: LiveFormSession, kind: str) -> str:
-    """Read back first name, last name, relationship, and age before Continue."""
+    """Read back first name, last name, age, and relationship before Continue."""
     if kind == "spouse":
         first = (session.filled.get("spouse_first") or "").strip() or "unknown"
         last = (session.filled.get("spouse_last") or "").strip() or "unknown"
@@ -531,13 +534,14 @@ def _member_confirm_speech(session: LiveFormSession, kind: str) -> str:
     age = _spoken_age_range(age_raw) if age_raw else "unknown"
     return (
         f"Just to confirm for {who}: first name {first}, last name {last}, "
-        f"relationship {rel}, age {age}. Is that correct? Please say Yes or No."
+        f"age {age}, relationship {rel}. "
+        f"Say Yes to confirm, or No to change."
     )
 
 
 def _confirm_which_field_speech() -> str:
     return (
-        "Okay. Which detail should I change — first name, last name, "
+        "Okay. Please tell me what to change — first name, last name, "
         "relationship, or age?"
     )
 
@@ -3363,6 +3367,14 @@ async def submit_field(
                             and recovered == "special"
                         )
                     ):
+                        # Partnered marital opening the spouse/partner UI must not
+                        # become person_first just because the classifier lagged.
+                        if (
+                            session.elig_step == "marital"
+                            and recovered == "person_first"
+                            and _is_partnered(text)
+                        ):
+                            recovered = "spouse_first"
                         session.elig_step = recovered
                         return _elig_ok(
                             call_id,
@@ -3430,6 +3442,86 @@ def _step_group(step: str) -> str:
     return step
 
 
+def _classify_member_detail_screen(
+    *,
+    body: str,
+    labels: set[str],
+    url_screen: str = "",
+) -> str | None:
+    """Classify spouse/child/person detail forms from body text + choice labels.
+
+    Returns None when the page is not a member-detail form. Spouse/partner pages
+    must not become person_form just because they show a "Relationship to me"
+    label (that bug caused Common Law Marriage to stall, then ask Child options
+    while the UI stayed on spouse/partner).
+    """
+    body_l = re.sub(r"\s+", " ", (body or "").lower())
+    label_set = {item.lower() for item in labels}
+    has_yes_no = "yes" in label_set and "no" in label_set
+    child_rel_chips = bool(
+        label_set & {"child", "stepchild", "grandchild", "foster child"}
+    )
+    spouse_chips = bool(label_set & {"spouse", "partner"})
+    age_chips = any(
+        re.search(r"\(\d", item) or "young adult" in item or "youth" in item
+        for item in label_set
+    )
+    child_form_heading = bool(
+        re.search(
+            r"tell us about (your |the |this )?child\b|"
+            r"\babout your child\b|"
+            r"\bchild'?s (first|last) name\b",
+            body_l,
+        )
+    )
+    spouse_form_heading = bool(
+        re.search(
+            r"tell us about your spouse(?: or partner)?|"
+            r"tell us about (your |the |this )?partner\b|"
+            r"\babout your spouse\b|"
+            r"\babout your partner\b|"
+            r"\bspouse or partner\b|"
+            r"\bspouse'?s (first|last) name\b|"
+            r"\bpartner'?s (first|last) name\b",
+            body_l,
+        )
+    )
+    dependent_age_bands = any(
+        re.search(
+            r"\((0\s*[-–]\s*1|0\s*[-–]\s*5|1\s*[-–]\s*5|6\s*[-–]\s*18|6\s*[-–]\s*20|"
+            r"13\s*[-–]\s*15|16\s*[-–]\s*18)\)|\bbaby\b|\byouth\b|\btoddler\b|\bteen\b",
+            item,
+        )
+        for item in label_set
+    )
+    member_name_form = (
+        "first name" in body_l and "last name" in body_l and not has_yes_no
+    )
+    if child_rel_chips or spouse_chips or age_chips or member_name_form:
+        if child_form_heading:
+            return "child_form"
+        if spouse_chips and not child_form_heading:
+            return "spouse_form"
+        if spouse_form_heading and not child_rel_chips and not dependent_age_bands:
+            return "spouse_form"
+        if (
+            url_screen == "spouse_form"
+            and not child_rel_chips
+            and not child_form_heading
+        ):
+            return "spouse_form"
+        return "person_form"
+    if child_form_heading and "first name" in body_l:
+        return "child_form"
+    if "tell us about" in body_l and "first name" in body_l and "relationship" in body_l:
+        if spouse_form_heading or spouse_chips:
+            return "spouse_form"
+        return "person_form"
+    if spouse_form_heading:
+        return "spouse_form"
+    return None
+
+
 async def _eligibility_screen(page: Page) -> str:
     url = (page.url or "").lower()
     # Prefer stable Pointcare route segments when available.
@@ -3463,67 +3555,13 @@ async def _eligibility_screen(page: Page) -> str:
         body = ""
     labels = {item.lower() for item in await _visible_choice_labels(page)}
     has_yes_no = "yes" in labels and "no" in labels
-    relationship_chips = bool(
-        labels & {"child", "stepchild", "grandchild", "foster child"}
+    # Person/child/spouse detail forms must win over Yes/No question text that may
+    # remain in headings after navigation (this caused student Yes to hang forever).
+    member_screen = _classify_member_detail_screen(
+        body=body, labels=labels, url_screen=screen
     )
-    age_chips = any(
-        re.search(r"\(\d", item) or "young adult" in item or "youth" in item
-        for item in labels
-    )
-
-    # Person/child detail forms must win over Yes/No question text that may remain
-    # in headings after navigation (this caused student Yes to hang forever).
-    # A bare "Child" relationship chip must NOT force child_form — person forms
-    # for disabled/relatives also offer Child as a relationship option.
-    child_form_heading = bool(
-        re.search(
-            r"tell us about (your |the |this )?child\b|"
-            r"\babout your child\b|"
-            r"\bchild'?s (first|last) name\b",
-            body,
-        )
-    )
-    spouse_form_heading = bool(
-        re.search(
-            r"tell us about your spouse(?: or partner)?|"
-            r"\babout your spouse\b|"
-            r"\bspouse'?s (first|last) name\b|"
-            r"\bpartner'?s (first|last) name\b",
-            body,
-        )
-    )
-    # After "Other" is chosen, relationship chips disappear and a free-text
-    # "Relationship to me" box appears. Dependent age bands still mean person/child.
-    dependent_age_bands = any(
-        re.search(
-            r"\((0\s*[-–]\s*1|0\s*[-–]\s*5|1\s*[-–]\s*5|6\s*[-–]\s*18|6\s*[-–]\s*20|"
-            r"13\s*[-–]\s*15|16\s*[-–]\s*18)\)|\bbaby\b|\byouth\b|\btoddler\b|\bteen\b",
-            item,
-        )
-        for item in labels
-    )
-    relationship_to_me = "relationship to me" in body
-    if relationship_chips or age_chips or (
-        "first name" in body and "last name" in body and not has_yes_no
-    ):
-        if child_form_heading:
-            return "child_form"
-        # Never treat dependent/other-person forms as spouse just because the page
-        # mentions spouse elsewhere, or because Other hid the relationship chips.
-        if (
-            spouse_form_heading
-            and not relationship_chips
-            and not dependent_age_bands
-            and not relationship_to_me
-        ):
-            return "spouse_form"
-        return "person_form"
-    if child_form_heading and "first name" in body:
-        return "child_form"
-    if "tell us about" in body and "first name" in body and "relationship" in body:
-        return "person_form"
-    if spouse_form_heading:
-        return "spouse_form"
+    if member_screen:
+        return member_screen
 
     if needle and screen in (
         "marital",
@@ -9750,7 +9788,20 @@ async def _submit_eligibility_answer(
     if step == "marital":
         await _click_exact_choice(page, answer)
         if _is_partnered(answer):
-            await _wait_for_screen(page, ("spouse_form",), timeout_s=18)
+            try:
+                await _wait_for_screen(page, ("spouse_form",), timeout_s=18)
+            except RuntimeError:
+                # Classifier can briefly report person_form on the spouse/partner
+                # page. Partnered marital must stay on the spouse_* path — never
+                # recover into generic person_* / Child relationship options.
+                landed = await _eligibility_screen(page)
+                if landed != "person_form":
+                    raise
+                logger.warning(
+                    "Partnered marital landed on person_form; "
+                    "continuing as spouse_form call_id=%s",
+                    call_id,
+                )
             await _clear_new_person_name_fields(page, session, kind="spouse")
             next_step = "spouse_first"
         else:

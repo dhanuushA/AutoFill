@@ -55,7 +55,7 @@ _SLOT_1 = "August 28th at 3 PM"
 _SLOT_2 = "August 31st at 5 PM"
 
 _CHAT_AGENT_NAME = "GridSocial Care SMS"
-_CLINIC_NAME = "Bay Area Community Health"
+_CLINIC_NAME = "AI Medicaid Assist"
 _TWILIO_API = "https://api.twilio.com/2010-04-01"
 _SMS_LIMIT = 1500
 
@@ -725,7 +725,7 @@ def _minor_who(variables: Dict[str, str]) -> str:
 
 def _minor_greeting(variables: Dict[str, str]) -> str:
     return (
-        "Hi, this is Kyle from Bay Area Community Health. "
+        "Hi, I'm Kyle from AI Medicaid Assist. "
         f"Are you {_minor_who(variables)}? Reply YES or NO. Reply STOP to opt out."
     )
 
