@@ -55,8 +55,8 @@ APP_QUESTIONS: dict[str, str] = {
         "What month was that person born?"
     ),
     "app_address_review": (
-        "I'll confirm each person's home and mailing address. "
-        "Say Yes if that looks correct, or tell me whose address to change."
+        "I'll confirm each person's home and mailing address, starting with "
+        "the first household member."
     ),
     "app_marital_review": (
         "I'll confirm each person's current marital status. "
@@ -3852,7 +3852,7 @@ def _split_listed_names(text: str) -> list[str]:
     raw = re.sub(r"\s+and\s+", ", ", raw, flags=re.I)
     names: list[str] = []
     for part in raw.split(","):
-        label = part.strip(" .?")
+        label = part.strip(" .,;:!?")
         if not label or len(label.split()) > 4:
             continue
         if re.search(
@@ -3870,10 +3870,11 @@ async def _citizenship_household_names(page: Page, session: Any) -> list[str]:
     """Names for the citizenship question, from the live page, then saved household data."""
     members = await _scrape_immigration_members(page)
     from_cards = [
-        str(row.get("name") or "").strip()
+        _clean_member_display_name(str(row.get("name") or ""))
         for row in members
         if str(row.get("name") or "").strip()
     ]
+    from_cards = [n for n in from_cards if n and n.lower() != "that person"]
     if from_cards:
         return from_cards
     heading = ""
@@ -3894,11 +3895,11 @@ async def _citizenship_household_names(page: Page, session: Any) -> list[str]:
     if listed:
         return listed
     saved = [
-        part.strip()
+        _clean_member_display_name(part)
         for part in str((getattr(session, "filled", None) or {}).get("household_names") or "").split("|")
         if part.strip()
     ]
-    return saved
+    return [n for n in saved if n and n.lower() != "that person"]
 
 
 def _join_member_names(names: list[str]) -> str:
@@ -4328,8 +4329,9 @@ _IMMIGRATION_MEMBER_JS = r"""
     }
     return '';
   };
+  const cleanName = (s) => norm(s).replace(/^[,\s.;:!?]+|[,\s.;:!?]+$/g, '').trim();
   const isNameLine = (line) => {
-    const t = norm(line);
+    const t = cleanName(line);
     if (!t || isMemberStatus(t)) return false;
     if (/citizen|immigration|national|prefer not|satisfactory|everyone listed|some or all/i.test(t)) {
       return false;
@@ -4342,7 +4344,8 @@ _IMMIGRATION_MEMBER_JS = r"""
     const found = [];
     for (const line of lines) {
       if (!isNameLine(line)) continue;
-      if (!found.some((item) => item.toLowerCase() === line.toLowerCase())) found.push(line);
+      const cleaned = cleanName(line);
+      if (!found.some((item) => item.toLowerCase() === cleaned.toLowerCase())) found.push(cleaned);
     }
     return found;
   };
@@ -4406,7 +4409,17 @@ _IMMIGRATION_LOCATE_JS = r"""
   const MARK = 'data-pc-imm-click';
   document.querySelectorAll('[' + MARK + ']').forEach((el) => el.removeAttribute(MARK));
   const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
-  const nameKey = (s) => norm(s).toLowerCase().replace(/\.+$/, '').trim();
+  const nameKey = (s) => {
+    let t = norm(s).toLowerCase()
+      .replace(/\s*\(you\)\s*/g, ' ')
+      .replace(/^[,\s.;:!?]+|[,\s.;:!?]+$/g, '')
+      .replace(/\.+$/, '')
+      .trim();
+    const parts = t.split(/\s+/).filter(Boolean);
+    // Applicant card "Admin P." must match spoken/cleaned "Admin".
+    if (parts.length && parts[0] === 'admin') return 'admin';
+    return t;
+  };
   const statusKey = (s) => {
     let t = norm(s).toLowerCase()
       .replace(/\s*\(.*?\)\s*/g, ' ')
@@ -4453,8 +4466,9 @@ _IMMIGRATION_LOCATE_JS = r"""
     }
     return '';
   };
+  const cleanName = (s) => norm(s).replace(/^[,\s.;:!?]+|[,\s.;:!?]+$/g, '').trim();
   const isNameLine = (line) => {
-    const t = norm(line);
+    const t = cleanName(line);
     if (!t || isMemberStatus(t)) return false;
     if (/citizen|immigration|national|prefer not|satisfactory|everyone listed|some or all/i.test(t)) {
       return false;
@@ -4467,7 +4481,8 @@ _IMMIGRATION_LOCATE_JS = r"""
     const found = [];
     for (const line of lines) {
       if (!isNameLine(line)) continue;
-      if (!found.some((item) => item.toLowerCase() === line.toLowerCase())) found.push(line);
+      const cleaned = cleanName(line);
+      if (!found.some((item) => item.toLowerCase() === cleaned.toLowerCase())) found.push(cleaned);
     }
     return found;
   };
@@ -11012,6 +11027,10 @@ _INITIAL_ASR_ALIASES: dict[str, str] = {
     "en": "n",
     "oh": "o",
     "pee": "p",
+    "pea": "p",
+    "piece": "p",
+    "peace": "p",
+    "ps": "p",
     "cue": "q",
     "queue": "q",
     "are": "r",
@@ -11036,6 +11055,7 @@ def _strip_dob_command_words(spoken: str) -> str:
         r"change|correct|fix|edit|update|please|"
         r"date of birth|date|birth|birthday|dob|"
         r"home address|mailing address|home|mailing|address|"
+        r"coverage|insurance|plan|plans|"
         r"data|details|detail|info|information|card|"
         r"for|of|the|to|whose|who|person|member|both"
         r")\b",
@@ -11058,9 +11078,19 @@ def _strip_member_speech_fillers(spoken: str) -> str:
     text = (spoken or "").strip()
     if not text:
         return ""
+    # Bare acknowledgements are not member names ("Okay." on address Q4).
+    if re.fullmatch(r"(?:ok|okay|alright|sure|thanks|thank you)[.!]?", text, re.I):
+        return ""
     # Leading soft fillers: "ok,", "um", "well so"
     text = re.sub(
         r"^(?:(?:ok|okay|alright|um+|uh+|ah+|well|so|please)[,.]?\s+)+",
+        "",
+        text,
+        flags=re.I,
+    )
+    # "Start with Agent P" / "Begin with Vijay"
+    text = re.sub(
+        r"^(?:(?:please\s+)?(?:start|begin|go)\s+with\s+)+",
         "",
         text,
         flags=re.I,
@@ -11121,8 +11151,8 @@ def _extract_spoken_member_labels(spoken: str) -> list[str]:
         return []
     # Yes/No and other non-name replies must not look like member labels.
     if re.fullmatch(
-        r"(?:yes|no|yep|nope|yeah|nah|correct|incorrect|both|home|mailing|"
-        r"cancel|continue|next|skip|none)",
+        r"(?:yes|no|yep|nope|yeah|nah|ok|okay|alright|sure|correct|incorrect|"
+        r"both|home|mailing|cancel|continue|next|skip|none)",
         cleaned,
         flags=re.I,
     ):
@@ -11135,8 +11165,8 @@ def _extract_spoken_member_labels(spoken: str) -> list[str]:
         if not label:
             continue
         if re.fullmatch(
-            r"(?:Yes|No|Yep|Nope|Yeah|Nah|Correct|Incorrect|Both|Home|Mailing|"
-            r"Cancel|Continue|Next|Skip|None)",
+            r"(?:Yes|No|Yep|Nope|Yeah|Nah|Ok|Okay|Alright|Sure|Correct|Incorrect|"
+            r"Both|Home|Mailing|Cancel|Continue|Next|Skip|None)",
             label,
         ):
             continue
@@ -11145,11 +11175,30 @@ def _extract_spoken_member_labels(spoken: str) -> list[str]:
     return out
 
 
+# ASR often swaps these single-letter initials (Agent P heard as Agent B).
+# Keep this narrow — Agent D must never soft-match Agent T.
+_INITIAL_CONFUSIONS: tuple[frozenset[str], ...] = (
+    frozenset({"b", "p"}),
+)
+
+
+def _initials_confusable(spoken: str, expected: str) -> bool:
+    a = (spoken or "").strip().lower()[:1]
+    b = (expected or "").strip().lower()[:1]
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    return any(a in group and b in group for group in _INITIAL_CONFUSIONS)
+
+
 def _candidate_member_labels(q_norm: str, available: list[str]) -> list[str]:
     """Return unambiguous label matches for one normalized spoken query.
 
-    Priority: exact → first-name+initial → unique first-name. Same first name
-    with a different initial (Agent D vs Agent T) never matches.
+    Priority: exact → first-name+initial → unique first-name. When several people
+    share a first name, a mismatched initial (Agent D vs Agent T) never matches.
+    When only one person has that first name, ASR-confusable initials
+    (\"Agent B\" / \"Agent piece\" for Agent P) still match.
     """
     from .live_form import _normalize_member_label
 
@@ -11158,6 +11207,7 @@ def _candidate_member_labels(q_norm: str, available: list[str]) -> list[str]:
     q_parts = q_norm.split()
     exact: list[str] = []
     initial: list[str] = []
+    confusable: list[str] = []
     first_only: list[str] = []
     containment: list[str] = []
     for name in available:
@@ -11169,9 +11219,12 @@ def _candidate_member_labels(q_norm: str, available: list[str]) -> list[str]:
             exact.append(name)
             continue
         if len(q_parts) >= 2 and len(n_parts) >= 2 and q_parts[0] == n_parts[0]:
-            # Same first name: require matching initial; never fall through.
+            # Same first name: prefer matching initial; allow ASR confusions
+            # only when this first name is unique among available labels.
             if q_parts[1][:1] == n_parts[1][:1]:
                 initial.append(name)
+            elif _initials_confusable(q_parts[1], n_parts[1]):
+                confusable.append(name)
             continue
         if len(q_parts) == 1:
             if n_parts[:1] == q_parts:
@@ -11186,6 +11239,9 @@ def _candidate_member_labels(q_norm: str, available: list[str]) -> list[str]:
         uniq = list(dict.fromkeys(group))
         if uniq:
             return uniq
+    uniq_conf = list(dict.fromkeys(confusable))
+    if len(uniq_conf) == 1:
+        return uniq_conf
     return []
 
 
@@ -11566,10 +11622,42 @@ def _unidentified_screen_error(
     }
 
 
+def _immigration_identity_name(name: str) -> str:
+    """Card identity for immigration targeting — keep Admin P., strip chrome only.
+
+    Speech uses ``_clean_member_display_name`` (Admin), but locate/confirm must
+    keep the Pointcare card text or radios never match.
+    """
+    label = re.sub(r"\s+", " ", (name or "").strip())
+    label = re.sub(r"\s*\(\s*you\s*\)\s*", " ", label, flags=re.I)
+    label = re.sub(
+        r"\s+\b(add|edit|pencil|save|next|continue|back|cancel|exit|previous)\b\.?",
+        "",
+        label,
+        flags=re.I,
+    )
+    label = re.sub(r"\s+", " ", label).strip(" ,;:!?")
+    if not label or re.fullmatch(
+        r"(back|next|continue|cancel|save|edit|add|exit|previous|done|close|"
+        r"that person)",
+        label,
+        flags=re.I,
+    ):
+        return ""
+    return label
+
+
 def _immigration_member_name_key(name: str) -> str:
     """Normalize a household card name for immigration matching only."""
     text = re.sub(r"\s+", " ", (name or "").strip().lower())
-    return text.rstrip(".").strip()
+    text = re.sub(r"\s*\(you\)\s*", " ", text, flags=re.I).strip()
+    # Trailing ASR/list punctuation must not block Q1 status matching.
+    text = text.strip(" .,;:!?")
+    # Applicant card is "Admin P." — speech/clean may store just "Admin".
+    parts = text.split()
+    if parts and parts[0] == "admin":
+        return "admin"
+    return text
 
 
 def _immigration_status_key(label: str) -> str:
@@ -11667,7 +11755,22 @@ def _immigration_confirmed(session: Any) -> dict[str, str]:
 
 def _mark_immigration_confirmed(session: Any, name: str, status: str) -> None:
     data = _immigration_confirmed(session)
-    data[name] = status
+    # Prefer card identity (Admin P.) over speech-only clean (Admin) so locate
+    # JS and unmet checks can still find the radio group.
+    identity = _immigration_identity_name(name)
+    if not identity:
+        identity = _clean_member_display_name(name)
+    if not identity or identity.lower() == "that person":
+        # Last resort: keep raw text so a successful radio click is not dropped.
+        identity = re.sub(r"\s+", " ", (name or "").strip()).strip(" .,;:!?")
+    if not identity:
+        return
+    # Collapse prior Admin / Admin P. keys onto one identity entry.
+    key = _immigration_member_name_key(identity)
+    for existing in list(data.keys()):
+        if _immigration_member_name_key(existing) == key and existing != identity:
+            data.pop(existing, None)
+    data[identity] = status
     session.filled["app_immigration_confirmed"] = json.dumps(data)
 
 
@@ -11678,11 +11781,15 @@ def _parse_immigration_assignment(
 ) -> tuple[str, str, str | None]:
     """Return ``(member, status, clarify)``. A clarify means nothing was clicked."""
     status = _map_immigration_status((spoken or "").lower())
-    names = [
-        str(row.get("name") or "").strip()
-        for row in members
-        if str(row.get("name") or "").strip()
-    ]
+    names = []
+    for row in members:
+        raw = str(row.get("name") or "").strip()
+        if not raw:
+            continue
+        # Keep card identity (Admin P.) for click targeting — not speech-only Admin.
+        identity = _immigration_identity_name(raw) or raw.strip(" .,;:!?")
+        if identity:
+            names.append(identity)
     if not status:
         return (
             "",
@@ -11705,7 +11812,12 @@ def _parse_immigration_assignment(
         target = (current or "").strip()
         if not target:
             return "", "", "Please say which household member that status is for."
-        same = [name for name in names if name.lower() == target.lower()]
+        want = _immigration_member_name_key(target)
+        same = [
+            name
+            for name in names
+            if _immigration_member_name_key(name) == want
+        ]
         if len(same) > 1:
             return (
                 "",
@@ -11713,11 +11825,22 @@ def _parse_immigration_assignment(
                 f"I see more than one person named {target}. "
                 "Please say the full name exactly as shown on the card.",
             )
-        return target, status, None
+        # Prefer the live card identity (Admin P.) over speech-only current.
+        return (same[0] if same else target), status, None
     hits, clarify = _match_named_members(residue, names)
     if clarify:
         return "", "", clarify
     if len(hits) != 1:
+        # Fallback: Admin ↔ Admin P. via immigration name keys.
+        want = _immigration_member_name_key(residue)
+        keyed = [
+            name
+            for name in names
+            if want and _immigration_member_name_key(name) == want
+        ]
+        keyed = list(dict.fromkeys(keyed))
+        if len(keyed) == 1:
+            return keyed[0], status, None
         return (
             "",
             "",
@@ -14512,9 +14635,29 @@ def _start_member_home_review(session: Any, card: dict[str, Any]) -> str:
 async def _prepare_address_review_speech(
     session: Any, page: Page
 ) -> tuple[str, str]:
-    """Walk members top-to-bottom: home check → mailing check → next member."""
+    """Walk members top-to-bottom: home check → mailing check → next member.
+
+    Never ask a vague \"say Yes or tell me whose address\" opener — always read
+    the first (or current) member's home address and ask if it is correct.
+    """
     cards = await _scrape_address_cards(page)
     names = [str(card.get("name") or "").strip() for card in cards if card.get("name")]
+    # First paint after DOB can lag; retry a few times so we read the first
+    # member's address instead of a generic opener.
+    if not names:
+        for _ in range(4):
+            try:
+                await page.wait_for_timeout(500)
+            except Exception:
+                pass
+            cards = await _scrape_address_cards(page)
+            names = [
+                str(card.get("name") or "").strip()
+                for card in cards
+                if card.get("name")
+            ]
+            if names:
+                break
     current = str(session.filled.get("app_address_current") or "").strip()
     phase = _address_phase(session)
 
@@ -14601,7 +14744,10 @@ async def _prepare_address_review_speech(
         _set_pending_question(session, "app_address_review", speech)
         return "app_address_review", speech
 
-    speech = app_question_for_step("app_address_review", session)
+    speech = (
+        "I'm still loading the address cards. One moment, then I'll read the "
+        "first member's home address for you to confirm."
+    )
     _set_pending_question(session, "app_address_review", speech)
     return "app_address_review", speech
 
@@ -15192,6 +15338,31 @@ async def _handle_address_field_phase(
         )
 
     if affirmed:
+        # "A home/mailing address is still needed. Say Yes to enter one…"
+        # must open enter — never treat that Yes as "keep".
+        needs_enter = (
+            (field == "home" and bool(card.get("needs_home")))
+            or (
+                field == "mailing"
+                and bool(card.get("needs_mailing"))
+                and not bool(card.get("mailing_same"))
+                and not bool(card.get("no_mailing"))
+                and not _address_home_mailing_match(card)
+            )
+        )
+        if needs_enter:
+            enter = "home_enter" if field == "home" else "mailing_enter"
+            _set_address_phase(session, enter)
+            session.filled["app_address_field"] = field
+            await _open_member_address_editor(page, target)
+            return _app_ok(
+                call_id,
+                session,
+                text,
+                step,
+                "address enter from missing check",
+                spoken_override=_address_enter_speech(target, field),
+            )
         if field == "home":
             session.filled["app_address_field"] = "mailing"
             _clear_address_pending(session)
@@ -15292,10 +15463,14 @@ async def _handle_address_step(
 
     looks_ok = bool(re.search(r"\blooks? (good|correct|fine)\b", lowered))
     leave_as_is = _address_leave_as_is(text)
+    soft_ack = bool(
+        re.fullmatch(r"(?:ok|okay|alright|sure|thanks|thank you)[.!]?", lowered)
+    )
     wants_next = bool(
         _is_yes(text)
         or looks_ok
         or leave_as_is
+        or soft_ack
         or re.search(r"\b(continue|next)\b", lowered)
     )
     # Bare "No" / "incorrect" / "Address. Name" starts correction; not Next.
@@ -15611,14 +15786,26 @@ async def _handle_address_step(
         return started
 
     if wants_next and missing:
-        shown = ", ".join(missing[:4])
+        # Pin the first incomplete member so "No mailing address" applies to them
+        # without a follow-up "whose card?" question.
+        focus = missing[0]
+        focus_card = _card_by_name(cards, focus) or {"name": focus}
+        session.filled["app_address_current"] = focus
+        session.filled["app_address_correcting"] = focus
+        if focus_card.get("needs_home"):
+            session.filled["app_address_field"] = "home"
+            _set_address_phase(session, "home_enter")
+            ask = _address_enter_speech(focus, "home")
+        else:
+            session.filled["app_address_field"] = "mailing"
+            _set_address_phase(session, "mailing_enter")
+            ask = _address_enter_speech(focus, "mailing")
+        shown = _clean_member_display_name(focus)
         return _address_error(
             call_id,
             step,
             "address_incomplete",
-            "Pointcare still needs an address for "
-            f"{shown}. Say the street address, or say "
-            "No Home Address or No Mailing Address if that applies.",
+            f"Pointcare still needs an address for {shown}. {ask}",
             session,
         )
 
@@ -15767,16 +15954,36 @@ async def _handle_address_step(
 def _immigration_unmet(members: list[dict[str, Any]], confirmed: dict[str, str]) -> list[str]:
     """Members whose visible radio does not match a caller-confirmed status."""
     confirmed_by_name = {
-        str(key).strip().lower(): value for key, value in confirmed.items()
+        _immigration_member_name_key(str(key)): value
+        for key, value in confirmed.items()
+        if str(key or "").strip()
     }
     unmet: list[str] = []
     for row in members:
-        name = str(row.get("name") or "").strip()
-        if not name:
+        raw = str(row.get("name") or "").strip()
+        if not raw:
             continue
-        expected = confirmed_by_name.get(name.lower(), "")
-        live = str(row.get("selected") or "")
-        if not expected or not _same_immigration_status(live, expected):
+        identity = _immigration_identity_name(raw) or raw.strip(" .,;:!?")
+        name = identity
+        expected = confirmed_by_name.get(_immigration_member_name_key(name), "")
+        live = str(row.get("selected") or "").strip()
+        if not expected:
+            # No session confirm yet — a live radio still counts as done so we
+            # do not re-ask forever when scrape already shows a selection.
+            if live and _immigration_status_key(live) in {
+                "u.s. citizen",
+                "u.s. national",
+                "satisfactory immigration status",
+                "prefer not to answer",
+            }:
+                continue
+            unmet.append(name)
+            continue
+        if not live:
+            # Scrape missed the selected radio; trust the confirmed status so
+            # Next is not blocked after a successful set.
+            continue
+        if not _same_immigration_status(live, expected):
             unmet.append(name)
     return unmet
 
@@ -15869,6 +16076,29 @@ async def _complete_immigration_step(
     status = str(next_info.get("status") or "next_not_found")
     if status != "next_enabled":
         validation = await _visible_form_validation(page)
+        # Re-scrape: Next hidden/disabled usually means a member still needs a
+        # status (often from a trailing-comma name mismatch). Ask for them.
+        members_again = await _scrape_immigration_members(page)
+        unmet_again = _immigration_unmet(
+            members_again, _immigration_confirmed(session)
+        )
+        if unmet_again:
+            current = unmet_again[0]
+            session.filled["app_immigration_current"] = current
+            session.filled.pop("app_immigration_phase", None)
+            speech = _immigration_status_question_for(
+                current, session=session, force_options=False
+            )
+            return {
+                "ok": False,
+                "call_id": call_id,
+                "field_id": "application_answer",
+                "spoken": "ASK: " + speech,
+                "error": "immigration_status_incomplete",
+                "message": status,
+                "step": "app_immigration",
+                "phase": "application",
+            }
         if status == "next_disabled":
             speech = (
                 "Next is still disabled after every person's status was verified "
@@ -16858,6 +17088,48 @@ async def submit_application_answer(
                 next_step = await _advance_after_answer(
                     page, session, leave_step="app_insurance"
                 )
+                # DOB (Q3) can paint slowly after insurance Next — retry detect
+                # and always prepare the next spoken question so the caller is
+                # not left in silence until they ask "what's next?".
+                if not next_step or next_step in (
+                    "app_insurance",
+                    "app_insurance_members",
+                    "app_insurance_coverage_type",
+                ):
+                    for _ in range(6):
+                        try:
+                            await page.wait_for_timeout(400)
+                        except Exception:
+                            pass
+                        live = await detect_application_screen(page)
+                        if live and live.startswith("app_") and live not in (
+                            "app_insurance",
+                            "app_insurance_members",
+                            "app_insurance_coverage_type",
+                        ):
+                            next_step = live
+                            break
+                if next_step and next_step.startswith("app_"):
+                    try:
+                        next_step, spoken_override = await _prepare_resume_speech(
+                            session, page, next_step
+                        )
+                    except Exception:
+                        logger.exception(
+                            "insurance_to_next_prepare_failed call_id=%s next=%s",
+                            call_id,
+                            next_step,
+                        )
+                        spoken_override = app_question_for_step(next_step, session)
+                    _set_pending_question(session, next_step, spoken_override or "")
+                    return _app_ok(
+                        call_id,
+                        session,
+                        text,
+                        next_step,
+                        "insurance complete advanced",
+                        spoken_override=spoken_override,
+                    )
             else:
                 members = await _scrape_coverage_members(page)
                 available = [
@@ -18369,6 +18641,15 @@ async def submit_application_answer(
         and step != "app_dob_review"
     ):
         next_step, spoken_override = await _prepare_dob_collect_speech(
+            session, page
+        )
+    # Entering address review: always read the first member's home address.
+    if (
+        next_step == "app_address_review"
+        and spoken_override is None
+        and step != "app_address_review"
+    ):
+        next_step, spoken_override = await _prepare_address_review_speech(
             session, page
         )
     if (

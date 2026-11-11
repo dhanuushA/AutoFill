@@ -184,7 +184,7 @@ ELIG_QUESTIONS: dict[str, str] = {
     ),
     "spouse_first": "What is their first name?",
     "spouse_last": "What is their last name?",
-    "spouse_role": "Are they your spouse or your partner?",
+    "spouse_role": "What is their relationship to you — spouse or partner?",
     "spouse_age": "What is their age?",
     "spouse_confirm": (
         "Please confirm the first name, last name, age, and relationship. "
@@ -238,6 +238,7 @@ ELIG_QUESTIONS: dict[str, str] = {
         "Please confirm the first name, last name, age, and relationship. "
         "Say Yes to confirm, or No to change."
     ),
+    "person_more": "Is there another household member to add? Please say Yes or No.",
     "income_when": (
         "For household income, which period do you know best — Annual, Monthly, or "
         "Bi-weekly?"
@@ -280,6 +281,7 @@ YES_NO_ELIG_STEPS = frozenset(
         "child_confirm",
         "person_confirm",
         "child_more",
+        "person_more",
         "special_more",
         "programs",
         "proceed_application",
@@ -407,7 +409,12 @@ def _next_elig_step(session: LiveFormSession, answer: str) -> str:
     if step == "disabled":
         return _person_or("relatives", session, yes, kind="disabled")
     if step == "relatives":
-        return _person_or("support", session, yes, kind="relative")
+        # Yes → person form (after_person=support). No → Pointcare usually skips
+        # support and lands on income_when; predicting support reopened wrong
+        # optimistic/pending speech whenever those guards were thin.
+        if yes:
+            return _person_or("support", session, True, kind="relative")
+        return "income_when"
     if step == "support":
         return _person_or("income_when", session, yes, kind="support")
     if step == "person_first":
@@ -419,7 +426,10 @@ def _next_elig_step(session: LiveFormSession, answer: str) -> str:
     if step == "person_age":
         return "person_confirm"
     if step == "person_confirm":
-        return (session.after_person or "income_when") if yes else "person_confirm"
+        # Yes → ask Add Another (person_more); No stays on confirm for edits.
+        return "person_more" if yes else "person_confirm"
+    if step == "person_more":
+        return "person_first" if yes else (session.after_person or "income_when")
     if step == "income_when":
         return "income_range"
     if step == "income_range":
@@ -467,8 +477,18 @@ def _set_person_kind_from_gate(session: LiveFormSession, gate_step: str) -> None
         session.filled["person_kind"] = kind
 
 
-def _person_section_intro(session: LiveFormSession) -> str:
+def _person_section_intro(session: LiveFormSession, *, next_member: bool = False) -> str:
     kind = (session.filled.get("person_kind") or "").strip().lower()
+    if next_member:
+        if kind == "disabled":
+            return "Let's learn more about the next disabled individual you support. "
+        if kind == "relative":
+            return "Let's learn more about the next relative you support. "
+        if kind == "student":
+            return "Let's learn more about the next student you support. "
+        if kind == "support":
+            return "Let's learn more about the next person who supports you. "
+        return "Let's learn more about the next household member. "
     if kind == "disabled":
         return "Let's learn more about the disabled individual you support. "
     if kind == "relative":
@@ -478,6 +498,23 @@ def _person_section_intro(session: LiveFormSession) -> str:
     if kind == "support":
         return "Let's learn more about the person who supports you. "
     return "Let's learn more about this household member. "
+
+
+def _person_more_question(session: LiveFormSession) -> str:
+    kind = (session.filled.get("person_kind") or "").strip().lower()
+    if kind == "student":
+        return "Is there another student to add? Please say Yes or No."
+    if kind == "disabled":
+        return "Is there another disabled person to add? Please say Yes or No."
+    if kind == "relative":
+        return "Is there another relative to add? Please say Yes or No."
+    if kind == "support":
+        return (
+            "Is there another person who supports you to add? Please say Yes or No."
+        )
+    return ELIG_QUESTIONS.get("person_more") or (
+        "Is there another household member to add? Please say Yes or No."
+    )
 
 
 def _spoken_age_range(label: str) -> str:
@@ -3316,9 +3353,13 @@ async def submit_field(
                     "REL_CLARIFY:",
                     "CHILD_FORM:",
                     "CHILD_MORE_CLARIFY:",
+                    "PERSON_FORM:",
+                    "PERSON_MORE_CLARIFY:",
                     "SPECIAL_CLARIFY:",
                     "SPECIAL_PERSON_CLARIFY:",
                     "SPECIAL_MORE_CLARIFY:",
+                    "PREGNANCY_CLARIFY:",
+                    "PREGNANCY_BLOCKED:",
                 )
             ):
                 clarify = err_text.split(":", 1)[1].strip()
@@ -3786,34 +3827,53 @@ def _relationship_option_labels(labels: list[str] | None) -> list[str]:
     return out
 
 
-def _default_relationship_options(step: str) -> list[str]:
+def _default_relationship_options(
+    step: str, *, person_kind: str = ""
+) -> list[str]:
     """Authoritative fallback options when the live control is not readable yet."""
     from .elig_meta import get_field_meta
 
+    if step == "spouse_role":
+        return ["Spouse", "Partner"]
+    # person_rel is only used on student/disabled/relative/support forms — never
+    # the under-19 child form (that uses child_rel). Always prefer adult kinship
+    # chips so Parent/Sibling resolve even when live peek or person_kind is missing.
+    if step == "person_rel":
+        return [
+            "Parent",
+            "Grandparent",
+            "Sibling",
+            "Child",
+            "Stepchild",
+            "Grandchild",
+            "Foster Child",
+            "Other",
+        ]
     meta = get_field_meta(step)
     if meta.options_hint:
         return list(meta.options_hint)
-    if step == "spouse_role":
-        return ["Spouse", "Partner"]
     return ["Child", "Stepchild", "Grandchild", "Foster Child", "Other"]
 
 
 def relationship_question_speech(
-    step: str, options: list[str] | None = None
+    step: str,
+    options: list[str] | None = None,
+    *,
+    person_kind: str = "",
 ) -> str:
     """Initial relationship question that always reads the applicable options.
 
     Prefer live/visible labels; fall back to field metadata. Never invent Other
     when the live option list is present without it. Never lists name/age chrome.
+    Spouse/partner is a short binary ask — do not say \"the options are\".
     """
     live = _relationship_option_labels(options) if options is not None else []
-    opts = live if live else _default_relationship_options(step)
+    opts = live if live else _default_relationship_options(
+        step, person_kind=person_kind
+    )
     joined = _join_spoken_choices(opts[:8]) or "the options on the form"
     if step == "spouse_role":
-        return (
-            f"Are they your spouse or your partner? The options are {joined}. "
-            "Which one applies?"
-        )
+        return "What is their relationship to you — spouse or partner?"
     return (
         f"What is their relationship to you? The options are {joined}. "
         "Which best describes their relationship to you?"
@@ -3835,7 +3895,10 @@ def build_options_help_speech(step: str, options: list[str] | None = None) -> st
             "you selected — for example forty thousand, or a range like forty "
             "to fifty thousand. I won't read every dollar range aloud."
         )
-    if step in ("child_rel", "person_rel", "spouse_role") or (
+    if step == "spouse_role":
+        # List options when the caller asks — the initial ask stays the short binary.
+        return "The options are Spouse or Partner. Which one is it?"
+    if step in ("child_rel", "person_rel") or (
         meta.answer_type == "choice" and "rel" in step
     ):
         # Re-read options clearly without the generic "required field" chrome.
@@ -3889,7 +3952,12 @@ def _spoken_question_for_step(session: LiveFormSession, step: str) -> str:
         cached = (session.filled.get(f"{step}_options_speech") or "").strip()
         if cached:
             return cached
-        return relationship_question_speech(step)
+        kind = (
+            str(session.filled.get("person_kind") or "").strip()
+            if step == "person_rel"
+            else ""
+        )
+        return relationship_question_speech(step, person_kind=kind)
     base = (ELIG_QUESTIONS.get(step) or "").strip()
     if not base:
         return "Could you say that again?"
@@ -3903,6 +3971,8 @@ def _spoken_question_for_step(session: LiveFormSession, step: str) -> str:
         return _member_confirm_speech(session, "child")
     if step == "person_confirm":
         return _member_confirm_speech(session, "person")
+    if step == "person_more":
+        return _person_more_question(session)
     if step == "spouse_first" and not session.filled.get("spouse_section_intro"):
         session.filled["spouse_section_intro"] = "1"
         return "Let's learn more about your spouse or partner. " + base
@@ -3914,9 +3984,12 @@ def _spoken_question_for_step(session: LiveFormSession, step: str) -> str:
             if inst == "1":
                 return "Let's learn more about your child. " + base
             return "Let's learn more about the next child. " + base
-    if step == "person_first" and not session.filled.get("person_section_intro"):
-        session.filled["person_section_intro"] = "1"
-        return _person_section_intro(session) + base
+    if step == "person_first":
+        inst = _ensure_person_instance(session)
+        key = f"person_section_intro_{inst}"
+        if not session.filled.get(key):
+            session.filled[key] = "1"
+            return _person_section_intro(session, next_member=inst != "1") + base
     return base
 
 
@@ -3925,7 +3998,14 @@ async def _relationship_speech_for_page(
 ) -> str:
     """Build relationship speech from live chips when visible; cache on session."""
     rel_opts = await _visible_relationship_option_labels(page)
-    speech = relationship_question_speech(step, rel_opts or None)
+    kind = (
+        str(session.filled.get("person_kind") or "").strip()
+        if step == "person_rel"
+        else ""
+    )
+    speech = relationship_question_speech(
+        step, rel_opts or None, person_kind=kind
+    )
     session.filled[f"{step}_options_speech"] = speech
     return speech
 
@@ -3971,6 +4051,7 @@ def _elig_ok(
     *,
     spoken_override: str | None = None,
     await_field_correction: bool = False,
+    await_other_rel: bool = False,
 ) -> dict[str, Any]:
     session.elig_step = next_step
     if spoken_override is not None:
@@ -3994,17 +4075,23 @@ def _elig_ok(
     }
     if await_field_correction:
         out["await_field_correction"] = True
+    if await_other_rel:
+        out["await_other_rel"] = True
     return out
 
 
 def _remember_household_name(session: LiveFormSession, name: str) -> None:
+    from .answer_parse import sanitize_person_name
+
+    cleaned = sanitize_person_name(name) or (name or "").strip()
+    cleaned = cleaned.strip(" ,.;:!?")
     names = [
-        item.strip()
+        item.strip(" ,.;:!?")
         for item in session.filled.get("household_names", "").split("|")
-        if item.strip()
+        if item.strip(" ,.;:!?")
     ]
-    if name.strip() and name.strip().lower() not in {item.lower() for item in names}:
-        names.append(name.strip())
+    if cleaned and cleaned.lower() not in {item.lower() for item in names}:
+        names.append(cleaned)
     session.filled["household_names"] = "|".join(names)
 
 
@@ -4032,7 +4119,42 @@ def _bump_child_instance(session: LiveFormSession) -> str:
         "child_first",
         "child_last",
         "child_rel",
+        "child_rel_other",
         "child_age",
+        "child_rel_options_speech",
+        "rel_other_awaiting",
+    ):
+        session.filled.pop(key, None)
+    return nxt
+
+
+def _person_instance_id(session: LiveFormSession | None) -> str:
+    if session is None:
+        return "1"
+    raw = (session.filled.get("person_instance") or "1").strip()
+    return raw if raw.isdigit() and int(raw) >= 1 else "1"
+
+
+def _ensure_person_instance(session: LiveFormSession) -> str:
+    inst = _person_instance_id(session)
+    session.filled["person_instance"] = inst
+    return inst
+
+
+def _bump_person_instance(session: LiveFormSession) -> str:
+    """Start a new person-form instance after Add Another succeeds."""
+    current = int(_person_instance_id(session))
+    nxt = str(current + 1)
+    session.filled["person_instance"] = nxt
+    for key in (
+        "person_first",
+        "person_last",
+        "person_rel",
+        "person_rel_other",
+        "person_age",
+        "person_rel_options_speech",
+        "person_section_intro",
+        "rel_other_awaiting",
     ):
         session.filled.pop(key, None)
     return nxt
@@ -4626,11 +4748,14 @@ async def _strict_fill(page: Page, label: str, value: str) -> None:
         await loc.fill(cleaned, timeout=6000)
         actual = (await loc.input_value()).strip()
         if re.search(r"name", label or "", re.I):
-            if actual.lower().rstrip(".!?") != cleaned.lower().rstrip(".!?"):
+            def _name_cmp(value: str) -> str:
+                return value.lower().rstrip(".!?,;:")
+
+            if _name_cmp(actual) != _name_cmp(cleaned):
                 await loc.fill("", timeout=3000)
                 await loc.press_sequentially(cleaned, delay=20)
                 actual = (await loc.input_value()).strip()
-                if actual.lower().rstrip(".!?") != cleaned.lower().rstrip(".!?"):
+                if _name_cmp(actual) != _name_cmp(cleaned):
                     raise RuntimeError(
                         f"Name field {label!r} shows {actual!r}, expected {cleaned!r}"
                     )
@@ -6761,11 +6886,11 @@ def _split_member_queries(answer: str) -> list[str]:
 def _normalize_member_label(text: str) -> str:
     cleaned = _spoken_member_query(text or "")
     cleaned = re.sub(r"\s+", " ", cleaned)
-    # "John. D" / "John D." / "Murali M." → comparable token string
+    # "John. D" / "John D." / "Murali M." / "John," → comparable token string
     cleaned = re.sub(r"\.(?=\s|$)", "", cleaned)
     cleaned = cleaned.replace(".", " ")
     cleaned = re.sub(r"\s+", " ", cleaned)
-    return cleaned.lower().strip()
+    return cleaned.lower().strip(" .,;:!?")
 
 
 def _resolve_kinship_to_member(
@@ -9084,25 +9209,30 @@ _PREGNANCY_ADD_DETAILS_JS = """({ memberName }) => {
     .map((el) => ({ el, score: scoreButton(el) }))
     .sort((a, b) => b.score - a.score);
   const chosen = ranked[0];
-  if (member && chosen.score < 20) {
+  // One Add details on the page: use it. Multiple: require a member/pregnant match.
+  if (member && ranked.length > 1 && chosen.score < 20) {
     return { clicked: false, reason: 'member_add_details_missing', score: chosen.score };
   }
   chosen.el.click();
-  return { clicked: true, score: chosen.score };
+  return { clicked: true, score: chosen.score, buttons: ranked.length };
 }"""
 
 
-_PREGNANCY_DETAILS_JS = """({ action, memberName }) => {
+_PREGNANCY_DETAILS_JS = """({ action, memberName, value }) => {
   const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
   const soft = (s) => norm(s).toLowerCase().replace(/\\.(?=\\s|$)/g, '');
+  // Size-only visibility — do not require pointer-events (disabled minus often
+  // sets pointer-events:none and that previously emptied the +/- candidate list).
   const visible = (el) => {
     if (!el || !el.getBoundingClientRect) return false;
     const r = el.getBoundingClientRect();
     const style = getComputedStyle(el);
     return r.width > 0 && r.height > 0
-      && style.display !== 'none' && style.visibility !== 'hidden'
-      && style.pointerEvents !== 'none';
+      && style.display !== 'none' && style.visibility !== 'hidden';
   };
+  const isFooterCta = (text) => /^(done|cancel|close|save|next|ok|okay)$/i.test(text)
+    || /\\b(done|cancel|close)\\b/.test(text);
+  const isGlyphClose = (text) => /^[×✕✖x]$/i.test(text || '');
   const member = soft(memberName || '');
   const modalCandidates = [
     ...document.querySelectorAll('[role=dialog], [aria-modal=true], section, form, div')
@@ -9125,31 +9255,37 @@ _PREGNANCY_DETAILS_JS = """({ action, memberName }) => {
   const modal = modalCandidates[0] || null;
   if (!modal) return { open: false, count: null, reason: 'modal_missing' };
   const modalText = soft(modal.innerText || '');
-  if (member && !modalText.includes(member) && action === 'read') {
-    // Prefer member-matched modal; still allow when Pointcare omits the name.
-  }
+  const modalRect = modal.getBoundingClientRect();
 
-  const labelNode = [...modal.querySelectorAll('label, span, div, p, h1, h2, h3')]
-    .find((el) => {
+  // Prefer the tightest exact label node (startsWith matched the whole modal body).
+  const labelNodes = [...modal.querySelectorAll('label, span, div, p, h1, h2, h3')]
+    .filter((el) => {
       if (!visible(el)) return false;
       const t = soft(el.innerText || el.textContent || '');
-      return t === 'number of babies expected' || t.startsWith('number of babies expected');
+      return t === 'number of babies expected'
+        || (t.startsWith('number of babies expected')
+          && !/estimated due date|\\bdone\\b/.test(t));
+    })
+    .sort((a, b) => {
+      const ar = a.getBoundingClientRect();
+      const br = b.getBoundingClientRect();
+      return (ar.width * ar.height) - (br.width * br.height);
     });
+  const labelNode = labelNodes[0] || null;
   let stepperRoot = labelNode;
   if (labelNode) {
     let cur = labelNode.parentElement;
-    for (let depth = 0; depth < 8 && cur; depth++) {
-      const buttons = [...cur.querySelectorAll('button, [role=button]')].filter(visible);
-      if (buttons.length >= 2) {
+    for (let depth = 0; depth < 8 && cur && cur !== modal; depth++) {
+      const hit = [...cur.querySelectorAll('button, [role=button]')].filter(visible);
+      if (hit.length >= 1 && hit.length <= 6) {
         stepperRoot = cur;
-        break;
+        if (hit.length >= 2) break;
       }
       cur = cur.parentElement;
     }
   }
   stepperRoot = stepperRoot || modal;
 
-  const buttons = [...stepperRoot.querySelectorAll('button, [role=button]')].filter(visible);
   const buttonMeta = (el) => {
     const text = soft(
       (el.getAttribute('aria-label') || '') + ' '
@@ -9159,23 +9295,100 @@ _PREGNANCY_DETAILS_JS = """({ action, memberName }) => {
     const disabled = !!(el.disabled || el.getAttribute('aria-disabled') === 'true');
     return { text, disabled, el };
   };
-  const labeledMinus = buttons.find((el) => {
+  const isTopRightClose = (el) => {
+    const r = el.getBoundingClientRect();
+    // Circular X in the pregnancy modal header — never a baby stepper control.
+    return r.width <= 56 && r.height <= 56
+      && r.top < modalRect.top + 88
+      && r.right > modalRect.right - 88;
+  };
+  const isStepperExcluded = (el) => {
+    const { text } = buttonMeta(el);
+    if (isFooterCta(text) || isGlyphClose(text)) return true;
+    if (isTopRightClose(el)) return true;
+    return false;
+  };
+
+  // Include icon wrappers that are not always <button> (live Pointcare stepper).
+  // Pointcare often draws +/- as SVG paths inside a small circular div — no "+" text,
+  // sometimes no role=button. Collect buttons, glyph text, AND small round hit-targets.
+  const rawControls = [...stepperRoot.querySelectorAll(
+    'button, [role=button], [aria-label], [title]'
+  )].filter(visible);
+  const glyphNodes = [...stepperRoot.querySelectorAll('span, div, i, svg, path, img')]
+    .filter((el) => {
+      if (!visible(el) && el.tagName !== 'PATH') return false;
+      const t = soft(
+        (el.getAttribute('aria-label') || '') + ' '
+        + (el.getAttribute('title') || '') + ' '
+        + (el.innerText || el.textContent || '')
+      );
+      return /(^|\\s)(plus|increase|increment|add|minus|decrease|decrement)(\\s|$)/.test(t)
+        || /^[＋+−–—-]$/.test(t)
+        || /^[＋+]$/.test(norm(el.textContent || ''));
+    });
+  // Circular icon shells (MUI-style) near the babies row — size-gated so Done/Close skip.
+  const iconShells = [...stepperRoot.querySelectorAll('button, [role=button], span, div, a')]
+    .filter((el) => {
+      if (!visible(el)) return false;
+      const r = el.getBoundingClientRect();
+      if (r.width < 16 || r.width > 56 || r.height < 16 || r.height > 56) return false;
+      if (Math.abs(r.width - r.height) > 14) return false; // roughly circular / square
+      const style = getComputedStyle(el);
+      const clickable = el.matches('button, [role=button], a')
+        || style.cursor === 'pointer'
+        || typeof el.onclick === 'function';
+      return clickable;
+    });
+  const controls = [];
+  const seen = new Set();
+  const pushControl = (el) => {
+    if (!el || seen.has(el) || isStepperExcluded(el)) return;
+    // Prefer the nearest button/role=button ancestor when the glyph itself is not clickable.
+    let target = el;
+    if (!(el.matches && el.matches('button, [role=button]'))) {
+      const clickable = el.closest && el.closest('button, [role=button]');
+      if (clickable && stepperRoot.contains(clickable)) target = clickable;
+      else {
+        let cur = el.parentElement;
+        for (let d = 0; d < 4 && cur && cur !== stepperRoot; d++) {
+          const r = cur.getBoundingClientRect();
+          if (r.width > 0 && r.width <= 64 && r.height > 0 && r.height <= 64) {
+            target = cur;
+            break;
+          }
+          cur = cur.parentElement;
+        }
+      }
+    }
+    if (!target || seen.has(target) || isStepperExcluded(target)) return;
+    if (!visible(target)) return;
+    seen.add(target);
+    controls.push(target);
+  };
+  rawControls.forEach(pushControl);
+  glyphNodes.forEach(pushControl);
+  iconShells.forEach(pushControl);
+
+  const labeledMinus = controls.find((el) => {
     const { text } = buttonMeta(el);
     return /(^|\\s)(minus|decrease|subtract|decrement)(\\s|$)/.test(text)
       || /^[−–—-]$/.test(text);
   });
-  const labeledPlus = buttons.find((el) => {
+  const labeledPlus = controls.find((el) => {
     const { text } = buttonMeta(el);
-    return /(^|\\s)(plus|increase|increment)(\\s|$)/.test(text)
-      || /^\\+$/.test(text);
+    return /(^|\\s)(plus|increase|increment|add)(\\s|$)/.test(text)
+      || /^[＋+]$/.test(text);
+  });
+
+  const findCountInput = (root) => [...root.querySelectorAll('input')].find((el) => {
+    if (!visible(el)) return false;
+    const type = (el.getAttribute('type') || 'text').toLowerCase();
+    return type === 'number' || type === 'text' || type === 'tel' || !type;
   });
 
   const readCountFrom = (root) => {
-    const input = [...root.querySelectorAll('input')].find((el) => {
-      if (!visible(el)) return false;
-      const type = (el.getAttribute('type') || 'text').toLowerCase();
-      return type === 'number' || type === 'text' || !type;
-    });
+    const input = findCountInput(root);
     if (input) {
       const raw = norm(input.value || input.getAttribute('aria-valuenow') || '');
       if (/^\\d+$/.test(raw)) return Number(raw);
@@ -9214,26 +9427,161 @@ _PREGNANCY_DETAILS_JS = """({ action, memberName }) => {
   };
   const count = readCountFrom(stepperRoot);
 
-  // Icon-only steppers: pick the left/right buttons around the numeric value.
+  // Anchor to the visible count (or label) so plus is the icon RIGHT of "0"/"1",
+  // not the modal's top-right Close — live bug: plus_missing after CTA guard.
+  let countEl = findCountInput(stepperRoot);
+  if (!countEl) {
+    countEl = [...stepperRoot.querySelectorAll('span, p, output, div, strong')]
+      .filter((el) => {
+        if (!visible(el)) return false;
+        const own = norm(
+          [...el.childNodes]
+            .filter((n) => n.nodeType === 3)
+            .map((n) => n.textContent || '')
+            .join('')
+        );
+        const full = norm(el.innerText || el.textContent || '');
+        return /^\\d+$/.test(own || full);
+      })
+      .sort((a, b) => {
+        const ar = a.getBoundingClientRect();
+        const br = b.getBoundingClientRect();
+        return (ar.width * ar.height) - (br.width * br.height);
+      })[0] || null;
+  }
+  const anchor = countEl || labelNode || stepperRoot;
+  const anchorRect = anchor.getBoundingClientRect();
+  const anchorMidY = (anchorRect.top + anchorRect.bottom) / 2;
+  const anchorMidX = (anchorRect.left + anchorRect.right) / 2;
+
+  const rowControls = controls
+    .map((el) => {
+      const r = el.getBoundingClientRect();
+      return {
+        el,
+        x: r.left,
+        midY: (r.top + r.bottom) / 2,
+        midX: (r.left + r.right) / 2,
+      };
+    })
+    .filter((item) => Math.abs(item.midY - anchorMidY) <= 48)
+    .sort((a, b) => a.x - b.x);
+
   let plus = labeledPlus || null;
   let minus = labeledMinus || null;
-  if ((!plus || !minus) && buttons.length >= 2) {
-    const sorted = buttons
-      .map((el) => ({ el, x: el.getBoundingClientRect().left }))
+  if (!plus || !minus) {
+    const pool = rowControls.length ? rowControls : controls
+      .map((el) => {
+        const r = el.getBoundingClientRect();
+        return { el, x: r.left, midX: (r.left + r.right) / 2, midY: (r.top + r.bottom) / 2 };
+      })
       .sort((a, b) => a.x - b.x);
-    if (!minus) minus = sorted[0].el;
-    if (!plus) plus = sorted[sorted.length - 1].el;
+    if (!minus) {
+      const left = pool.filter((item) => item.midX < anchorMidX - 2);
+      minus = (left.length ? left[0] : pool[0] || null)?.el || null;
+    }
+    if (!plus) {
+      // Prefer the first control to the RIGHT of the count value (the + icon).
+      const right = pool.filter((item) => item.midX > anchorMidX + 2);
+      plus = (right.length ? right[0] : pool[pool.length - 1] || null)?.el || null;
+    }
+    if (plus && isStepperExcluded(plus)) plus = labeledPlus || null;
+    if (minus && isStepperExcluded(minus)) minus = labeledMinus || null;
+    // Same element resolved for both — keep only the side that matches the action later.
+    if (plus && minus && plus === minus) {
+      if (plus.getBoundingClientRect().left >= anchorMidX) minus = labeledMinus || null;
+      else plus = labeledPlus || null;
+    }
   }
 
+  // Last DOM fallback: probe pixels just RIGHT of the count digit (the circular +).
+  // Live Pointcare draws "+" as an SVG path with no accessible name → plus_missing.
+  const resolveHitTarget = (x, y) => {
+    const hit = document.elementFromPoint(x, y);
+    if (!hit || !modal.contains(hit)) return null;
+    let cur = hit;
+    for (let d = 0; d < 6 && cur; d++) {
+      if (isStepperExcluded(cur)) return null;
+      if (cur === countEl || cur === labelNode) {
+        cur = cur.parentElement;
+        continue;
+      }
+      const r = cur.getBoundingClientRect();
+      const style = getComputedStyle(cur);
+      const isBtn = cur.matches && cur.matches('button, [role=button], a');
+      const small = r.width >= 12 && r.width <= 64 && r.height >= 12 && r.height <= 64;
+      if ((isBtn || style.cursor === 'pointer' || small) && !isStepperExcluded(cur)) {
+        return cur;
+      }
+      cur = cur.parentElement;
+    }
+    return hit && !isStepperExcluded(hit) ? hit : null;
+  };
+  if (!plus && countEl) {
+    const cr = countEl.getBoundingClientRect();
+    const y = cr.top + cr.height / 2;
+    for (const dx of [14, 18, 22, 26, 30, 34, 40, 48]) {
+      const candidate = resolveHitTarget(cr.right + dx, y);
+      if (candidate && !isStepperExcluded(candidate)) {
+        plus = candidate;
+        break;
+      }
+    }
+  }
+
+  const clickEl = (el) => {
+    try { el.focus({ preventScroll: true }); } catch (e) {}
+    const opts = { bubbles: true, cancelable: true, view: window };
+    try { el.dispatchEvent(new PointerEvent('pointerdown', opts)); } catch (e) {}
+    el.dispatchEvent(new MouseEvent('mousedown', opts));
+    try { el.dispatchEvent(new PointerEvent('pointerup', opts)); } catch (e) {}
+    el.dispatchEvent(new MouseEvent('mouseup', opts));
+    el.click();
+  };
+
+  if (action === 'set') {
+    const wanted = Number(value);
+    if (!Number.isFinite(wanted) || wanted < 1 || wanted > 20) {
+      return { open: true, count, clicked: false, reason: 'invalid_value' };
+    }
+    const input = findCountInput(stepperRoot) || findCountInput(modal);
+    if (input) {
+      input.focus();
+      input.value = String(wanted);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      input.blur();
+      const after = readCountFrom(stepperRoot);
+      return {
+        open: true,
+        count: after,
+        clicked: after === wanted,
+        control: 'set',
+        reason: after === wanted ? '' : 'set_unverified',
+      };
+    }
+    return { open: true, count, clicked: false, reason: 'input_missing' };
+  }
   if (action === 'plus' || action === 'minus') {
     const target = action === 'plus' ? plus : minus;
     if (!target) {
-      return { open: true, count, clicked: false, reason: action + '_missing' };
+      return {
+        open: true,
+        count,
+        clicked: false,
+        reason: action + '_missing',
+        controlCount: controls.length,
+        rowCount: rowControls.length,
+      };
     }
     if (target.disabled || target.getAttribute('aria-disabled') === 'true') {
       return { open: true, count, clicked: false, reason: action + '_disabled' };
     }
-    target.click();
+    // Final safety: never click Done/Cancel/Close even if scoring failed.
+    if (isStepperExcluded(target)) {
+      return { open: true, count, clicked: false, reason: action + '_resolved_cta' };
+    }
+    clickEl(target);
     return { open: true, count, clicked: true, control: action };
   }
   if (action === 'done') {
@@ -9311,6 +9659,159 @@ async def _pregnancy_details_state(
     return state if isinstance(state, dict) else {}
 
 
+async def _click_pregnancy_babies_plus_by_offset(
+    page: Page, *, member_name: str = ""
+) -> bool:
+    """Click the circular + to the right of the babies count when DOM lookup fails.
+
+    Tries elementFromPoint at several offsets from the digit, clicks that node in-page,
+    then falls back to Playwright mouse clicks at those coordinates.
+    """
+    result = await page.evaluate(
+        """({ memberName }) => {
+          const soft = (s) => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+          const visible = (el) => {
+            if (!el || !el.getBoundingClientRect) return false;
+            const r = el.getBoundingClientRect();
+            const style = getComputedStyle(el);
+            return r.width > 0 && r.height > 0
+              && style.display !== 'none' && style.visibility !== 'hidden';
+          };
+          const isExcluded = (el, modalRect) => {
+            if (!el) return true;
+            const text = soft(
+              (el.getAttribute('aria-label') || '') + ' '
+              + (el.getAttribute('title') || '') + ' '
+              + (el.innerText || el.textContent || '')
+            );
+            if (/^(done|cancel|close|save|next|ok|okay)$/i.test(text)
+                || /\\b(done|cancel|close)\\b/.test(text)
+                || /^[×✕✖x]$/i.test(text)) return true;
+            const r = el.getBoundingClientRect();
+            if (r.width <= 56 && r.height <= 56
+                && r.top < modalRect.top + 88
+                && r.right > modalRect.right - 88) return true;
+            return false;
+          };
+          const member = soft(memberName || '');
+          const modal = [...document.querySelectorAll(
+            '[role=dialog], [aria-modal=true], section, form, div'
+          )].filter((el) => {
+            if (!visible(el)) return false;
+            const text = soft(el.innerText || '');
+            return text.includes('pregnancy details')
+              && text.includes('number of babies expected')
+              && text.length < 2200;
+          }).sort((a, b) => {
+            const at = soft(a.innerText || '');
+            const bt = soft(b.innerText || '');
+            const aMember = member && at.includes(member) ? 0 : 1;
+            const bMember = member && bt.includes(member) ? 0 : 1;
+            if (aMember !== bMember) return aMember - bMember;
+            const ar = a.getBoundingClientRect();
+            const br = b.getBoundingClientRect();
+            return (ar.width * ar.height) - (br.width * br.height);
+          })[0];
+          if (!modal) return { clicked: false, reason: 'modal_missing' };
+          const modalRect = modal.getBoundingClientRect();
+          const countEl = [...modal.querySelectorAll('span, p, output, div, strong, input')]
+            .filter((el) => {
+              if (!visible(el)) return false;
+              if (el.tagName === 'INPUT') {
+                return /^\\d+$/.test(String(el.value || '').trim());
+              }
+              const own = [...el.childNodes]
+                .filter((n) => n.nodeType === 3)
+                .map((n) => (n.textContent || '').trim())
+                .join('');
+              const full = soft(el.innerText || el.textContent || '');
+              return /^\\d+$/.test(own || full);
+            })
+            .sort((a, b) => {
+              const ar = a.getBoundingClientRect();
+              const br = b.getBoundingClientRect();
+              return (ar.width * ar.height) - (br.width * br.height);
+            })[0];
+          if (!countEl) return { clicked: false, reason: 'count_missing' };
+          const r = countEl.getBoundingClientRect();
+          const y = r.top + r.height / 2;
+          const offsets = [14, 18, 22, 26, 30, 34, 40, 48];
+          const points = offsets.map((dx) => ({ x: r.right + dx, y }));
+          const clickEl = (el) => {
+            try { el.focus({ preventScroll: true }); } catch (e) {}
+            const opts = { bubbles: true, cancelable: true, view: window };
+            try { el.dispatchEvent(new PointerEvent('pointerdown', opts)); } catch (e) {}
+            el.dispatchEvent(new MouseEvent('mousedown', opts));
+            try { el.dispatchEvent(new PointerEvent('pointerup', opts)); } catch (e) {}
+            el.dispatchEvent(new MouseEvent('mouseup', opts));
+            el.click();
+          };
+          for (const p of points) {
+            const hit = document.elementFromPoint(p.x, p.y);
+            if (!hit || !modal.contains(hit)) continue;
+            let target = hit;
+            for (let d = 0; d < 6 && target; d++) {
+              if (isExcluded(target, modalRect)) break;
+              const tr = target.getBoundingClientRect();
+              const style = getComputedStyle(target);
+              const isBtn = target.matches && target.matches('button, [role=button], a');
+              const small = tr.width >= 12 && tr.width <= 64
+                && tr.height >= 12 && tr.height <= 64;
+              if ((isBtn || style.cursor === 'pointer' || small)
+                  && !isExcluded(target, modalRect)
+                  && target !== countEl) {
+                clickEl(target);
+                return {
+                  clicked: true,
+                  via: 'elementFromPoint',
+                  x: p.x,
+                  y: p.y,
+                  points,
+                };
+              }
+              target = target.parentElement;
+            }
+          }
+          // Return candidate mouse points so Python can click even if hit-testing failed.
+          return {
+            clicked: false,
+            reason: 'hit_miss',
+            x: points[1].x,
+            y: points[1].y,
+            points,
+          };
+        }""",
+        {"memberName": member_name or ""},
+    )
+    if isinstance(result, dict) and result.get("clicked"):
+        return True
+    points: list[tuple[float, float]] = []
+    if isinstance(result, dict):
+        raw_points = result.get("points")
+        if isinstance(raw_points, list):
+            for item in raw_points:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    points.append((float(item.get("x")), float(item.get("y"))))
+                except (TypeError, ValueError):
+                    continue
+        if not points:
+            try:
+                points.append((float(result.get("x")), float(result.get("y"))))
+            except (TypeError, ValueError):
+                pass
+    for x, y in points:
+        if x <= 0 or y <= 0:
+            continue
+        try:
+            await page.mouse.click(x, y)
+            return True
+        except Exception:
+            continue
+    return False
+
+
 async def _set_pregnancy_babies_count(
     page: Page, answer: str, *, member_name: str = ""
 ) -> int:
@@ -9326,13 +9827,42 @@ async def _set_pregnancy_babies_count(
     )
     current = state.get("count")
     if not isinstance(current, int):
+        # Prefer typing the value when the stepper count is not readable yet.
+        set_result = await page.evaluate(
+            _PREGNANCY_DETAILS_JS,
+            {
+                "action": "set",
+                "memberName": member_name or "",
+                "value": requested,
+            },
+        )
+        if isinstance(set_result, dict) and set_result.get("clicked"):
+            return requested
         raise RuntimeError(
             "PREGNANCY_CLARIFY: I couldn't read the current number of babies. "
             "Please leave Pregnancy Details open and say the number again."
         )
     if current == requested:
         return requested
-    for _ in range(abs(requested - current)):
+
+    # Fast path: set the input directly when Pointcare exposes one.
+    set_result = await page.evaluate(
+        _PREGNANCY_DETAILS_JS,
+        {
+            "action": "set",
+            "memberName": member_name or "",
+            "value": requested,
+        },
+    )
+    if isinstance(set_result, dict) and set_result.get("clicked"):
+        verified = await _pregnancy_details_state(page, member_name=member_name)
+        if verified.get("count") == requested:
+            return requested
+
+    # Stepper path: click +/-, never Done. Re-read after every click.
+    for _ in range(max(abs(requested - current), 1) + 2):
+        if current == requested:
+            break
         action = "plus" if current < requested else "minus"
         result = await page.evaluate(
             _PREGNANCY_DETAILS_JS,
@@ -9340,26 +9870,77 @@ async def _set_pregnancy_babies_count(
         )
         if not isinstance(result, dict) or not result.get("clicked"):
             reason = (result or {}).get("reason") if isinstance(result, dict) else ""
-            raise RuntimeError(
-                f"PREGNANCY_CLARIFY: I couldn't use the {action} control for "
-                f"Number of babies expected ({reason or 'missing'})."
+            # Fall back to direct set once more if +/- resolved to a CTA / missing.
+            retry_set = await page.evaluate(
+                _PREGNANCY_DETAILS_JS,
+                {
+                    "action": "set",
+                    "memberName": member_name or "",
+                    "value": requested,
+                },
             )
+            if isinstance(retry_set, dict) and retry_set.get("clicked"):
+                verified = await _pregnancy_details_state(
+                    page, member_name=member_name
+                )
+                if verified.get("count") == requested:
+                    return requested
+            # Last resort for plus_missing: click just right of the count digit
+            # (the circular + icon in Pregnancy Details).
+            if action == "plus" and await _click_pregnancy_babies_plus_by_offset(
+                page, member_name=member_name
+            ):
+                pass  # fall through to the post-click verify loop below
+            else:
+                raise RuntimeError(
+                    f"PREGNANCY_CLARIFY: I couldn't use the {action} control for "
+                    f"Number of babies expected ({reason or 'missing'})."
+                )
         before = current
-        deadline = time.monotonic() + 2
+        deadline = time.monotonic() + 2.5
         while time.monotonic() < deadline:
-            await page.wait_for_timeout(100)
+            await page.wait_for_timeout(120)
             state = await _pregnancy_details_state(page, member_name=member_name)
             value = state.get("count")
             if isinstance(value, int) and value != before:
                 current = value
                 break
         if current == before:
+            # Click registered but UI ignored it — real mouse click on the + icon,
+            # then typing the value if still unchanged.
+            if action == "plus" and await _click_pregnancy_babies_plus_by_offset(
+                page, member_name=member_name
+            ):
+                deadline2 = time.monotonic() + 2.5
+                while time.monotonic() < deadline2:
+                    await page.wait_for_timeout(120)
+                    state = await _pregnancy_details_state(
+                        page, member_name=member_name
+                    )
+                    value = state.get("count")
+                    if isinstance(value, int) and value != before:
+                        current = value
+                        break
+                if current != before:
+                    continue
+            retry_set = await page.evaluate(
+                _PREGNANCY_DETAILS_JS,
+                {
+                    "action": "set",
+                    "memberName": member_name or "",
+                    "value": requested,
+                },
+            )
+            if isinstance(retry_set, dict) and retry_set.get("clicked"):
+                verified = await _pregnancy_details_state(
+                    page, member_name=member_name
+                )
+                if verified.get("count") == requested:
+                    return requested
             raise RuntimeError(
                 "PREGNANCY_CLARIFY: The displayed baby count did not change. "
                 "Please say the number again."
             )
-        if current == requested:
-            break
     final = await _pregnancy_details_state(page, member_name=member_name)
     if final.get("count") != requested:
         raise RuntimeError(
@@ -9784,6 +10365,7 @@ async def _submit_eligibility_answer(
     _mark(call_id, "browser_action", started)
     lowered = answer.lower()
     spoken_override: str | None = None
+    await_other_rel = False
 
     if step == "marital":
         await _click_exact_choice(page, answer)
@@ -9808,13 +10390,19 @@ async def _submit_eligibility_answer(
             await _wait_for_screen(page, ("children",), timeout_s=18)
             next_step = "children"
     elif step == "spouse_first":
-        await _strict_fill(page, "First Name", answer)
-        session.filled["spouse_first"] = answer
-        _remember_household_name(session, answer)
+        from .answer_parse import sanitize_person_name
+
+        cleaned_first = sanitize_person_name(answer) or (answer or "").strip()
+        await _strict_fill(page, "First Name", cleaned_first)
+        session.filled["spouse_first"] = cleaned_first
+        _remember_household_name(session, cleaned_first)
         next_step = "spouse_last"
     elif step == "spouse_last":
-        await _strict_fill(page, "Last Name", answer)
-        session.filled["spouse_last"] = answer
+        from .answer_parse import sanitize_person_name
+
+        cleaned_last = sanitize_person_name(answer) or (answer or "").strip()
+        await _strict_fill(page, "Last Name", cleaned_last)
+        session.filled["spouse_last"] = cleaned_last
         next_step = "spouse_role"
     elif step == "spouse_role":
         role = "Partner" if "partner" in lowered else "Spouse"
@@ -10008,6 +10596,24 @@ async def _submit_eligibility_answer(
                     f"YESNO_VERIFY: I tried to select {want}, but the form shows "
                     f"{selected}. Please say yes or no clearly again."
                 )
+            if selected not in ("yes", "no"):
+                # selected=none: navigated away (ok), still settling, or click missed.
+                # Poll briefly — a single 350ms check false-failed on slow Pointcare.
+                left_screen = False
+                for _ in range(8):
+                    await page.wait_for_timeout(300)
+                    landed_now = await _eligibility_screen(page)
+                    if landed_now != step:
+                        left_screen = True
+                        break
+                    selected = await _yes_no_selection_state(page)
+                    if selected in ("yes", "no"):
+                        break
+                if not left_screen and selected not in ("yes", "no"):
+                    raise RuntimeError(
+                        f"YESNO_VERIFY: I couldn't confirm a {want} selection "
+                        f"for {step}. Please say yes or no clearly again."
+                    )
             logger.info(
                 "Yes/No click verified call_id=%s step=%s want=%s selected=%s",
                 call_id,
@@ -10087,9 +10693,12 @@ async def _submit_eligibility_answer(
                     f"(screen={screen or 'unknown'}). Please wait a moment and "
                     "say the first name again."
                 )
-        await _strict_fill(page, "First Name", answer)
-        session.filled["child_first"] = answer
-        _remember_household_name(session, answer)
+        from .answer_parse import sanitize_person_name
+
+        cleaned_first = sanitize_person_name(answer) or (answer or "").strip()
+        await _strict_fill(page, "First Name", cleaned_first)
+        session.filled["child_first"] = cleaned_first
+        _remember_household_name(session, cleaned_first)
         next_step = "child_last"
     elif step == "child_last":
         if not await _name_field_visible(page, "Last Name"):
@@ -10097,8 +10706,11 @@ async def _submit_eligibility_answer(
                 raise RuntimeError(
                     "CHILD_FORM: I can't see the child's Last Name field on this screen."
                 )
-        await _strict_fill(page, "Last Name", answer)
-        session.filled["child_last"] = answer
+        from .answer_parse import sanitize_person_name
+
+        cleaned_last = sanitize_person_name(answer) or (answer or "").strip()
+        await _strict_fill(page, "Last Name", cleaned_last)
+        session.filled["child_last"] = cleaned_last
         next_step = "child_rel"
         spoken_override = await _relationship_speech_for_page(
             session, page, "child_rel"
@@ -10116,6 +10728,7 @@ async def _submit_eligibility_answer(
                 if other_prompt:
                     next_step = "child_rel"
                     spoken_override = other_prompt
+                    await_other_rel = True
                 else:
                     next_step = "child_age"
             else:
@@ -10138,6 +10751,7 @@ async def _submit_eligibility_answer(
             if other_prompt:
                 next_step = "child_rel"
                 spoken_override = other_prompt
+                await_other_rel = True
             else:
                 next_step = "child_age"
     elif step == "child_age":
@@ -10151,7 +10765,9 @@ async def _submit_eligibility_answer(
     elif step == "child_confirm":
         if _is_yes(answer):
             await _assert_member_form_ready_before_continue(session, page, "child")
+            # Stay on the child form and ask whether to click Add Another.
             next_step = "child_more"
+            spoken_override = ELIG_QUESTIONS["child_more"]
         elif _is_no(answer):
             next_step = "child_confirm"
             spoken_override = _confirm_which_field_speech()
@@ -10185,6 +10801,7 @@ async def _submit_eligibility_answer(
             )
     elif step == "child_more":
         if _is_yes(answer):
+            # Pointcare keeps the same child_form screen; Add Another blanks it.
             await _click_cta(page, "Add Another", attempts=3)
             await _wait_for_screen(page, ("child_form",))
             if not await _wait_for_child_form_ready(page, timeout_s=10):
@@ -10194,9 +10811,14 @@ async def _submit_eligibility_answer(
                 )
             # New blank child form: new instance id + first-name step.
             _bump_child_instance(session)
+            session.filled.pop("child_rel_options_speech", None)
+            session.filled.pop("rel_other_awaiting", None)
+            session.filled.pop("child_rel_other", None)
             session.elig_step = "child_first"
             await _clear_new_person_name_fields(page, session, kind="child")
             next_step = "child_first"
+            # Always re-ask the form from first name with the next-child intro.
+            spoken_override = _spoken_question_for_step(session, "child_first")
         else:
             before = await _eligibility_screen(page)
             try:
@@ -10217,13 +10839,19 @@ async def _submit_eligibility_answer(
                 raise
             next_step = "student"
     elif step == "person_first":
-        await _strict_fill(page, "First Name", answer)
-        session.filled["person_first"] = answer
-        _remember_household_name(session, answer)
+        from .answer_parse import sanitize_person_name
+
+        cleaned_first = sanitize_person_name(answer) or (answer or "").strip()
+        await _strict_fill(page, "First Name", cleaned_first)
+        session.filled["person_first"] = cleaned_first
+        _remember_household_name(session, cleaned_first)
         next_step = "person_last"
     elif step == "person_last":
-        await _strict_fill(page, "Last Name", answer)
-        session.filled["person_last"] = answer
+        from .answer_parse import sanitize_person_name
+
+        cleaned_last = sanitize_person_name(answer) or (answer or "").strip()
+        await _strict_fill(page, "Last Name", cleaned_last)
+        session.filled["person_last"] = cleaned_last
         next_step = "person_rel"
         spoken_override = await _relationship_speech_for_page(
             session, page, "person_rel"
@@ -10241,6 +10869,7 @@ async def _submit_eligibility_answer(
                 if other_prompt:
                     next_step = "person_rel"
                     spoken_override = other_prompt
+                    await_other_rel = True
                 else:
                     next_step = "person_age"
             else:
@@ -10288,6 +10917,7 @@ async def _submit_eligibility_answer(
                 if other_prompt:
                     next_step = "person_rel"
                     spoken_override = other_prompt
+                    await_other_rel = True
                 else:
                     next_step = "person_age"
     elif step == "person_age":
@@ -10303,10 +10933,9 @@ async def _submit_eligibility_answer(
     elif step == "person_confirm":
         if _is_yes(answer):
             await _assert_member_form_ready_before_continue(session, page, "person")
-            target = session.after_person or "income_when"
-            target_screen = "income" if target == "income_when" else target
-            await _click_continue_to(page, (target_screen,))
-            next_step = target
+            # Stay on the person form and ask whether to click Add Another.
+            next_step = "person_more"
+            spoken_override = _person_more_question(session)
         elif _is_no(answer):
             next_step = "person_confirm"
             spoken_override = _confirm_which_field_speech()
@@ -10338,6 +10967,41 @@ async def _submit_eligibility_answer(
                 "Please say Yes to confirm those details, No to change them, "
                 "or say the corrected relationship."
             )
+    elif step == "person_more":
+        if _is_yes(answer):
+            await _click_cta(page, "Add Another", attempts=3)
+            await _wait_for_screen(page, ("person_form", "child_form"))
+            if not await _name_field_visible(page, "First Name"):
+                if not await _wait_for_name_field(page, "First Name", timeout_s=10):
+                    raise RuntimeError(
+                        "PERSON_FORM: Add Another did not open a blank member form yet. "
+                        "Please say Yes again in a moment."
+                    )
+            _bump_person_instance(session)
+            session.elig_step = "person_first"
+            await _clear_new_person_name_fields(page, session, kind="person")
+            next_step = "person_first"
+            spoken_override = _spoken_question_for_step(session, "person_first")
+        else:
+            before = await _eligibility_screen(page)
+            target = session.after_person or "income_when"
+            target_screen = "income" if target == "income_when" else target
+            try:
+                await _assert_member_form_ready_before_continue(session, page, "person")
+                await _click_continue_to(page, (target_screen,))
+            except RuntimeError as exc:
+                landed = await _eligibility_screen(page)
+                hints = await _visible_validation_hints(page)
+                if landed in ("person_form", "child_form", before, "unknown", ""):
+                    raise RuntimeError(
+                        "PERSON_MORE_CLARIFY: I couldn't leave the member form after "
+                        "Continue"
+                        + (f" ({hints})" if hints else "")
+                        + ". Please make sure name, relationship, and age are filled, "
+                        "then say No again — or say Yes to add another member."
+                    ) from exc
+                raise
+            next_step = target
     elif step == "income_when":
         period = await _select_and_verify_income_period(page, answer)
         session.filled["income_when"] = period
@@ -10953,6 +11617,7 @@ async def _submit_eligibility_answer(
         next_step,
         f"Applied and verified eligibility step {step}.",
         spoken_override=spoken_override,
+        await_other_rel=await_other_rel,
     )
     _mark(call_id, "next_question", started)
     _mark(call_id, "tool_response", started)
@@ -12344,7 +13009,7 @@ async def _screen_signature(page: Page) -> str:
 
 def _choice_phrase(value: str) -> str:
     spoken = (value or "").strip()
-    lowered = spoken.lower()
+    lowered = spoken.lower().replace("-", " ")
     if re.match(r"^(yes|yeah|yep|yup)\b", lowered):
         return "Yes"
     if re.match(r"^(no|nope|nah|negative)\b", lowered):

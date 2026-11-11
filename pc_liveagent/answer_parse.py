@@ -191,10 +191,12 @@ def sanitize_person_name(raw: str) -> str:
     )
     if wrapped:
         text = wrapped.group(1).strip()
-    # Drop trailing sentence enders from ASR ("John." → "John").
-    text = re.sub(r"[.!?…]+$", "", text).strip()
-    # Collapse "John ." mid-token leftovers from ASR.
-    text = re.sub(r"\s+([.!?])\s*$", "", text).strip()
+    # Drop trailing sentence/list punctuation from ASR ("John." / "John," → "John").
+    # Commas must never land in Pointcare name fields — they break Q1 citizenship
+    # card matching (name lines reject ",") and leave Next hidden.
+    text = re.sub(r"[.!?,;:…]+$", "", text).strip()
+    # Collapse "John ." / "John ," mid-token leftovers from ASR.
+    text = re.sub(r"\s+([.!?,;:])\s*$", "", text).strip()
     # Spoken initials: "Angel r dot" → "Angel R"
     text = re.sub(
         r"\b([A-Za-z])\s*(?:dot|period)\b\.?",
@@ -207,6 +209,8 @@ def sanitize_person_name(raw: str) -> str:
     text = re.sub(r"\s+\b(or|and|uh|um|ah)\b\s*$", "", text, flags=re.I).strip()
     # Letter-by-letter spelling from ASR must not keep spaces between letters.
     text = _collapse_letter_by_letter_spelling(text)
+    # Final pass: strip any leftover trailing punctuation after spelling collapse.
+    text = re.sub(r"[.!?,;:…]+$", "", text).strip()
     return text
 
 
@@ -460,6 +464,7 @@ def resolve_answer(
     *,
     options: list[str] | None = None,
     meta: Any = None,
+    person_kind: str = "",
 ) -> ResolveResult:
     """Question-aware answer normalization against optional live options."""
     text = normalize_utterance(utterance)
@@ -599,7 +604,8 @@ def resolve_answer(
                     "person_rel" if step == "person_confirm" else "child_rel"
                 )
                 pool = list(options or []) or _default_relationship_options(
-                    rel_step
+                    rel_step,
+                    person_kind=person_kind if rel_step == "person_rel" else "",
                 )
                 mapped = _map_relationship_label(text, pool)
                 if mapped:
@@ -761,16 +767,53 @@ def resolve_answer(
         )
 
     if step == "marital" or (answer_type == "choice" and step == "marital"):
+        # Bare Yes/No is not a marital chip — _choice_phrase("no") → "No" used to
+        # pass because mapped != text (case), then Playwright failed to click it.
+        if re.fullmatch(
+            r"(yes|yeah|yep|yup|no|nope|nah|negative)[.!]?",
+            (text or "").strip(),
+            re.I,
+        ):
+            return ResolveResult(
+                clarify=_options_clarify(
+                    step,
+                    options,
+                    "Please say your marital status: Never Married, Married, Separated, "
+                    "Divorced, Widowed, Registered Domestic Partner, or Common Law Marriage.",
+                ),
+                detail="marital_yes_no_rejected",
+            )
         mapped = _choice_phrase(text)
-        if _MARITAL_HINTS.search(text) or mapped != text:
-            return ResolveResult(answer=mapped, detail="marital")
+        if mapped in ("Yes", "No"):
+            return ResolveResult(
+                clarify=_options_clarify(
+                    step,
+                    options,
+                    "Please say your marital status: Never Married, Married, Separated, "
+                    "Divorced, Widowed, Registered Domestic Partner, or Common Law Marriage.",
+                ),
+                detail="marital_yes_no_rejected",
+            )
+        marital_labels = {
+            "never married",
+            "married",
+            "separated",
+            "divorced",
+            "widowed",
+            "registered domestic partner",
+            "common law marriage",
+        }
         if re.search(r"\bsingle\b", text, re.I):
             return ResolveResult(answer="Never Married", detail="marital_single")
+        if mapped.strip().lower() in marital_labels:
+            return ResolveResult(answer=mapped, detail="marital")
         if options:
             lowered = text.lower()
             for label in options:
                 if label.lower() == lowered or label.lower() in lowered:
                     return ResolveResult(answer=label, detail="marital_option")
+        if _MARITAL_HINTS.search(text) and mapped.strip().lower() in marital_labels:
+            return ResolveResult(answer=mapped, detail="marital")
         return ResolveResult(
             clarify=_options_clarify(
                 step,
@@ -792,13 +835,12 @@ def resolve_answer(
         )
 
     if step in ("child_rel", "person_rel"):
-        rel_opts = options or [
-            "Child",
-            "Stepchild",
-            "Grandchild",
-            "Foster Child",
-            "Other",
-        ]
+        from .live_form import _default_relationship_options
+
+        rel_opts = list(options or []) or _default_relationship_options(
+            step,
+            person_kind=person_kind if step == "person_rel" else "",
+        )
         mapped_rel = _map_relationship_label(text, list(rel_opts))
         if mapped_rel:
             return ResolveResult(answer=mapped_rel, detail="relationship_mapped")
@@ -811,11 +853,16 @@ def resolve_answer(
                 "Other",
             )
             return ResolveResult(answer=other_hit, detail="relationship_mapped")
+        clarify_hint = (
+            "Please say the relationship, like Parent, Sibling, Child, or Other."
+            if step == "person_rel"
+            else "Please say the relationship, like Child, Stepchild, or Other."
+        )
         return ResolveResult(
             clarify=_options_clarify(
                 step,
                 list(rel_opts),
-                "Please say the relationship, like Child, Stepchild, or Other.",
+                clarify_hint,
             ),
             detail="relationship_unclear",
         )
@@ -1090,6 +1137,18 @@ def validate_claude_result(
         "income_range",
         *YES_NO_ELIG_STEPS,
     )
+    # Never accept bare Yes/No as a marital-status chip via Claude.
+    if step == "marital" and re.fullmatch(
+        r"(yes|yeah|yep|yup|no|nope|nah|negative)[.!]?",
+        candidate,
+        re.I,
+    ):
+        result.accepted = False
+        result.reject_reason = "marital_yes_no_rejected"
+        result.needs_clarify = True
+        result.answer = None
+        result.matched_option = None
+        return result
     if option_bound and options:
         matched = _match_option_against_list(candidate, options)
         if not matched and answer_type == "yes_no":

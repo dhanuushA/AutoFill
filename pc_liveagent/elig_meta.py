@@ -70,8 +70,12 @@ ELIG_FIELD_META: dict[str, FieldMeta] = {
     "person_last": _meta("text"),
     "person_rel": _meta(
         "choice",
-        # Default Pointcare person/relative form chips; live peek overrides when present.
+        # Student/disabled/relative/support forms use adult kinship chips.
+        # Live peek still overrides when present.
         options_hint=(
+            "Parent",
+            "Grandparent",
+            "Sibling",
             "Child",
             "Stepchild",
             "Grandchild",
@@ -81,6 +85,7 @@ ELIG_FIELD_META: dict[str, FieldMeta] = {
     ),
     "person_age": _meta("age"),
     "person_confirm": _meta("yes_no"),
+    "person_more": _meta("yes_no"),
     "income_when": _meta(
         "income_period",
         options_hint=("Annual", "Monthly", "Bi-weekly"),
@@ -107,6 +112,7 @@ def format_question(
     options: list[str] | None = None,
     period: str | None = None,
     include_choices: bool = False,
+    person_kind: str = "",
 ) -> str:
     """Full spoken question for the active step.
 
@@ -122,7 +128,11 @@ def format_question(
     elif step in ("child_rel", "person_rel", "spouse_role"):
         from .live_form import relationship_question_speech
 
-        return relationship_question_speech(step, options)
+        return relationship_question_speech(
+            step,
+            options,
+            person_kind=person_kind if step == "person_rel" else "",
+        )
     else:
         base = (ELIG_QUESTIONS.get(step) or "").strip()
     if not base:

@@ -67,6 +67,7 @@ from .live_form import (
     EMAIL_SECURE_RETRY,
     _age_option_labels,
     _child_instance_id,
+    _person_instance_id,
     _detect_income_period_switch,
     _is_no,
     _is_yes,
@@ -109,11 +110,14 @@ _SLOW_ELIG_STEPS = frozenset(
         "person_rel",
         "person_age",
         "person_confirm",
+        "person_more",
         "income_when",
         "income_range",
         "special",
         "special_person",
         "special_more",
+        "babies_count",
+        "due_date",
         "programs",
         "proceed_application",
         "confirm_start_application",
@@ -654,6 +658,8 @@ class CallController:
     pending_correction: dict[str, str] | None = None
     # Browser eligibility op in flight — ignore answers until it finishes.
     elig_op_in_progress: bool = False
+    # Step currently being applied by Playwright (for pending-name guards).
+    elig_op_step: str = ""
     # Bumped on go-back / superseded browser ops so late Playwright results die.
     elig_nav_epoch: int = 0
     last_question_delivery_key: str = ""
@@ -672,6 +678,10 @@ class CallController:
     # (higher user index) may repeat the same words, such as Yes after a
     # failed confirmation. A replay of the consumed index is still dropped.
     last_elig_attempt_failed: bool = False
+    # Set to elig_nav_epoch when the browser task has delivered speech (ok or
+    # fail). Prevents optimistic WS replies after the task pops itself from
+    # ``_elig_browser_tasks`` and the dict lookup returns None.
+    elig_browser_delivered_epoch: int = -1
     # Last response_id we already answered (provider-level event dedupe).
     last_handled_response_id: int | None = None
 
@@ -727,6 +737,7 @@ def _begin_elig_navigation(ctrl: CallController) -> int:
     """Invalidate in-flight eligibility browser work and stale transcript answers."""
     ctrl.elig_nav_epoch += 1
     ctrl.elig_op_in_progress = False
+    ctrl.elig_op_step = ""
     ctrl.pending_op_id = ""
     ctrl.pending_elig_utterance = ""
     ctrl.pending_elig_for_step = ""
@@ -948,6 +959,9 @@ async def _run_eligibility_browser_background(
             next_step = str((session.elig_step if session else "") or "")
         if not result.get("ok"):
             ctrl.last_elig_attempt_failed = True
+            # Never let a stale optimistic next-question leak after a failed click.
+            ctrl.optimistic_elig_step = ""
+            ctrl.optimistic_elig_speech = ""
             # Prefer live session step (special_person stays special_person on clarify).
             live_step = (
                 str(result.get("step") or "")
@@ -974,6 +988,7 @@ async def _run_eligibility_browser_background(
                 turn_id=turn_id,
                 reason=str(result.get("error") or "")[:80],
             )
+            ctrl.elig_browser_delivered_epoch = epoch
             await _deliver_question_once(
                 call_id, speech, key=f"fail:{live_step}:{turn_id}"
             )
@@ -1035,24 +1050,48 @@ async def _run_eligibility_browser_background(
             and bool((ctrl.optimistic_elig_speech or "").strip())
             and not result.get("await_field_correction")
         )
-        # Never suppress live relationship options — optimistic text uses defaults
-        # (often Child chips) that can disagree with the spouse/partner page.
-        if already_spoken and str(next_step) in (
-            "child_rel",
-            "person_rel",
-            "spouse_role",
-        ):
+        # If browser-backed speech disagrees with the optimistic prediction,
+        # always re-deliver (relationship chips, income, etc.).
+        if already_spoken:
             browser_spoken = (spoken or "").strip()
             optimistic = (ctrl.optimistic_elig_speech or "").strip()
-            if browser_spoken and browser_spoken != optimistic:
+            if browser_spoken and optimistic and browser_spoken != optimistic:
                 already_spoken = False
-        # Always deliver the section intro + first-name ask from the browser.
-        if str(next_step) in _MEMBER_FIRST_STEPS:
+        # Always deliver section intro / first name / last name from the browser.
+        # Last name was silent when optimistic marked already_spoken while the WS
+        # reply returned empty (elig_fast_complete).
+        if str(next_step) in _MEMBER_FIRST_STEPS or str(next_step) in _MEMBER_LAST_STEPS or str(next_step) in (
+            "income_when",
+            "income_range",
+            "child_more",
+            "person_more",
+            "babies_count",
+            "due_date",
+        ):
             already_spoken = False
             # Do not auto-apply a name spoken during form open before the intro.
-            if (ctrl.pending_elig_for_step or "") == str(next_step):
+            if (
+                str(next_step) in (_MEMBER_FIRST_STEPS | _MEMBER_LAST_STEPS)
+                and (ctrl.pending_elig_for_step or "") == str(next_step)
+            ):
                 ctrl.pending_elig_utterance = ""
                 ctrl.pending_elig_for_step = ""
+        # First → last: drop any word captured during the first-name fill so we
+        # actually ask for the last name on a dedicated turn.
+        if (
+            step in _MEMBER_FIRST_STEPS
+            and str(next_step) in _MEMBER_LAST_STEPS
+        ):
+            ctrl.pending_elig_utterance = ""
+            ctrl.pending_elig_for_step = ""
+        # Other relationship stays on person_rel/child_rel — never treat a prior
+        # optimistic age ask as already covering this prompt.
+        if result.get("await_other_rel") or (
+            str(next_step) in _RELATIONSHIP_CHIP_STEPS
+            and (spoken or "").strip()
+            and "other relationship" in (spoken or "").lower()
+        ):
+            already_spoken = False
         if result.get("await_field_correction"):
             ctrl.pending_correction = {
                 "field": "",
@@ -1083,6 +1122,7 @@ async def _run_eligibility_browser_background(
             # Next question was already returned on the WebSocket turn.
             ctrl.optimistic_elig_step = ""
             ctrl.optimistic_elig_speech = ""
+            ctrl.elig_browser_delivered_epoch = epoch
             await _flush_pending_elig_utterance(
                 call_id,
                 ctrl,
@@ -1093,11 +1133,12 @@ async def _run_eligibility_browser_background(
             return
         ctrl.optimistic_elig_step = ""
         ctrl.optimistic_elig_speech = ""
+        ctrl.elig_browser_delivered_epoch = epoch
         await _deliver_question_once(
             call_id, speech, key=f"next:{next_step}:{turn_id}"
         )
-        # First-name steps: ask once after intro; do not flush a premature name.
-        if str(next_step) not in _MEMBER_FIRST_STEPS:
+        # First/last-name steps: ask once; do not flush a premature name.
+        if str(next_step) not in (_MEMBER_FIRST_STEPS | _MEMBER_LAST_STEPS):
             await _flush_pending_elig_utterance(
                 call_id,
                 ctrl,
@@ -1127,7 +1168,10 @@ async def _run_eligibility_browser_background(
         logger.exception("elig_browser_failed call_id=%s step=%s", call_id, step)
         if not _aborted():
             ctrl.last_elig_attempt_failed = True
+            ctrl.optimistic_elig_step = ""
+            ctrl.optimistic_elig_speech = ""
             try:
+                ctrl.elig_browser_delivered_epoch = epoch
                 await _deliver_question_once(
                     call_id,
                     format_question(step),
@@ -1139,6 +1183,7 @@ async def _run_eligibility_browser_background(
         async with ctrl.lock:
             if not _aborted():
                 ctrl.elig_op_in_progress = False
+                ctrl.elig_op_step = ""
                 ctrl.pending_op_id = ""
         task = _elig_browser_tasks.get(call_id)
         if task is asyncio.current_task():
@@ -1199,6 +1244,60 @@ _MEMBER_FIRST_STEPS = frozenset(
         "person_first",
     }
 )
+_MEMBER_LAST_STEPS = frozenset(
+    {
+        "spouse_last",
+        "child_last",
+        "person_last",
+    }
+)
+# Last-name targets must not capture speech while the matching first-name fill
+# is still running (that stole the next word as last name without asking).
+_LAST_NAME_BLOCKED_WHILE_FIRST = {
+    "spouse_last": "spouse_first",
+    "child_last": "child_first",
+    "person_last": "person_first",
+}
+# Relationship chips can stay on the same step for Other free-text — never
+# optimistic-speak age from these answers.
+_RELATIONSHIP_CHIP_STEPS = frozenset({"person_rel", "child_rel"})
+# Never speak these before Playwright lands on the live screen.
+# Yes/No gates can skip (relatives No → income_when, not support); relationship
+# chips need a live peek; income/confirm/first-name intros must not race the UI.
+_NO_OPTIMISTIC_SPEECH_STEPS = frozenset(
+    {
+        "spouse_confirm",
+        "child_confirm",
+        "person_confirm",
+        "spouse_role",
+        "child_rel",
+        "person_rel",
+        # Age after relationship: Other can stay on rel and must ask custom text
+        # before age. Optimistic age raced that prompt on live calls.
+        "spouse_age",
+        "child_age",
+        "person_age",
+        "children",
+        "child_more",
+        "person_more",
+        "student",
+        "disabled",
+        "relatives",
+        "support",
+        "income_when",
+        "income_range",
+        "special",
+        "special_person",
+        "special_more",
+        "babies_count",
+        "due_date",
+        "programs",
+        "proceed_application",
+        "confirm_start_application",
+    }
+    # Last name must be a dedicated spoken ask — optimistic + already_spoken
+    # caused silent skips while the next word was still auto-applied.
+) | _MEMBER_FIRST_STEPS | _MEMBER_LAST_STEPS
 
 
 def _stash_pending_elig_utterance(ctrl: CallController, text: str) -> bool:
@@ -1211,6 +1310,29 @@ def _stash_pending_elig_utterance(ctrl: CallController, text: str) -> bool:
         return False
     target = (ctrl.optimistic_elig_step or "").strip()
     if target not in _PENDING_NAME_STEPS:
+        return False
+    # Never auto-capture last names. Callers must hear "what is their last
+    # name?" and answer on a real turn — pending flush caused silent skips.
+    if target in _MEMBER_LAST_STEPS:
+        logger.info(
+            "elig_pending_skipped_last_name call_id=%s target=%s answer=%r",
+            ctrl.call_id,
+            target,
+            raw[:40],
+        )
+        return False
+    # While first-name Playwright is running, ignore last-name candidates —
+    # callers often keep talking before hearing "what is their last name?".
+    blocked_while = _LAST_NAME_BLOCKED_WHILE_FIRST.get(target)
+    if blocked_while and (ctrl.elig_op_step or "") == blocked_while:
+        logger.info(
+            "elig_pending_skipped_during_first call_id=%s target=%s op_step=%s "
+            "answer=%r",
+            ctrl.call_id,
+            target,
+            ctrl.elig_op_step,
+            raw[:40],
+        )
         return False
     try:
         name = sanitize_person_name(raw)
@@ -1255,6 +1377,7 @@ async def _flush_pending_elig_utterance(
     turn_id = f"{call_id}:pending:{new_epoch}"
     commit_key = f"pending:{next_step}:{pending.lower()}"
     ctrl.elig_op_in_progress = True
+    ctrl.elig_op_step = next_step
     ctrl.pending_op_id = turn_id
     logger.info(
         "elig_pending_flush call_id=%s step=%s answer=%r epoch=%s",
@@ -1283,7 +1406,11 @@ async def _flush_pending_elig_utterance(
                 predicted_next = str(_next_elig_step(session, pending) or "").strip()
             finally:
                 session.elig_step = saved
-            if predicted_next and predicted_next != next_step:
+            if (
+                predicted_next
+                and predicted_next != next_step
+                and predicted_next not in _NO_OPTIMISTIC_SPEECH_STEPS
+            ):
                 optimistic_speech = (format_question(predicted_next) or "").strip()
     except Exception:
         logger.info(
@@ -4157,6 +4284,11 @@ async def process_user_turn(
                 if session is not None
                 else ""
             )
+            person_kind_now = (
+                str((session.filled.get("person_kind") or "")).strip()
+                if session is not None
+                else ""
+            )
             if awaiting_other in ("person_rel", "child_rel") and step == awaiting_other:
                 cleaned_other = re.sub(r"\s+", " ", (text or "").strip()).strip(" .")
                 if cleaned_other and detect_control_intent(cleaned_other).kind == "none":
@@ -4166,11 +4298,19 @@ async def process_user_turn(
                     )
                 else:
                     resolved = resolve_answer(
-                        step, text, options=resolve_opts, meta=meta
+                        step,
+                        text,
+                        options=resolve_opts,
+                        meta=meta,
+                        person_kind=person_kind_now,
                     )
             else:
                 resolved = resolve_answer(
-                    step, text, options=resolve_opts, meta=meta
+                    step,
+                    text,
+                    options=resolve_opts,
+                    meta=meta,
+                    person_kind=person_kind_now,
                 )
             answer, clarify = resolved.answer, resolved.clarify
             resolver_used = "python"
@@ -4382,6 +4522,10 @@ async def process_user_turn(
                 commit_key = (
                     f"{step}:{_child_instance_id(session_for_key)}:{answer.lower()}"
                 )
+            elif step.startswith("person_"):
+                commit_key = (
+                    f"{step}:{_person_instance_id(session_for_key)}:{answer.lower()}"
+                )
             else:
                 commit_key = f"{step}:{answer.lower()}"
             prior = [
@@ -4433,6 +4577,7 @@ async def process_user_turn(
                 ctrl.elig_nav_epoch += 1
                 epoch = ctrl.elig_nav_epoch
                 ctrl.elig_op_in_progress = True
+                ctrl.elig_op_step = step
                 predicted_next = ""
                 optimistic_speech = ""
                 try:
@@ -4449,15 +4594,16 @@ async def process_user_turn(
                         finally:
                             sess_pred.elig_step = saved_step
                         if predicted_next and predicted_next != step:
-                            # Confirm + member-first steps need browser-backed
-                            # speech (section intro / detail readback). Asking
-                            # "What is their first name?" early dropped the
-                            # "Let's learn more…" intro and raced the form open.
-                            if predicted_next in (
-                                "spouse_confirm",
-                                "child_confirm",
-                                "person_confirm",
-                            ) or predicted_next in _MEMBER_FIRST_STEPS:
+                            # Confirm / member-first / income / programs need
+                            # browser-backed speech. Asking household income
+                            # early raced the support/person screens and leaked
+                            # mid-flow questions that were not on screen.
+                            # Relationship chips: Other stays on the same step and
+                            # must ask custom text before age — never optimistic.
+                            if (
+                                step in _RELATIONSHIP_CHIP_STEPS
+                                or predicted_next in _NO_OPTIMISTIC_SPEECH_STEPS
+                            ):
                                 optimistic_speech = ""
                             else:
                                 optimistic_speech = (
@@ -4490,7 +4636,11 @@ async def process_user_turn(
                     commit_key=commit_key,
                     epoch=epoch,
                 )
+                # Keep a local Task ref — the background finally block pops the
+                # dict entry when done, so re-fetching can return None and falsely
+                # allow optimistic speech over an already-delivered interrupt.
                 task = _elig_browser_tasks.get(call_id)
+                scheduled_task = task
                 fast_done = False
                 if task is not None:
                     try:
@@ -4500,17 +4650,36 @@ async def process_user_turn(
                         fast_done = False
                     except Exception:
                         fast_done = False
-                if fast_done and ctrl.elig_nav_epoch == epoch:
-                    # Background already interrupted the next/clarify speech.
+                    if not fast_done and task.done() and not task.cancelled():
+                        fast_done = True
+
+                def _browser_owns_speech() -> bool:
+                    if ctrl.elig_nav_epoch != epoch:
+                        return True
+                    if ctrl.last_elig_attempt_failed:
+                        return True
+                    if ctrl.elig_browser_delivered_epoch == epoch:
+                        return True
+                    if (
+                        scheduled_task is not None
+                        and scheduled_task.done()
+                        and not scheduled_task.cancelled()
+                    ):
+                        return True
+                    return False
+
+                if _browser_owns_speech():
                     speech = (ctrl.last_speech or "").strip()
                     if speech and speech != ELIG_PROGRESS_ACK:
                         logger.info(
                             "elig_fast_complete call_id=%s step=%s turn_id=%s "
-                            "epoch=%s speech=%r",
+                            "epoch=%s failed=%s delivered=%s speech=%r",
                             call_id,
                             step,
                             turn_id,
                             epoch,
+                            int(ctrl.last_elig_attempt_failed),
+                            int(ctrl.elig_browser_delivered_epoch == epoch),
                             speech[:60],
                         )
                         trace_event(
@@ -4520,6 +4689,7 @@ async def process_user_turn(
                             step=step,
                             epoch=epoch,
                             phase=ctrl.phase,
+                            failed=ctrl.last_elig_attempt_failed,
                         )
                         return TurnResult(
                             speech="",
@@ -4527,7 +4697,12 @@ async def process_user_turn(
                             turn_id=turn_id,
                             detail="elig_fast_complete",
                         )
-                if optimistic_speech:
+                if (
+                    optimistic_speech
+                    and not _browser_owns_speech()
+                    and (ctrl.optimistic_elig_step or "") == predicted_next
+                    and (ctrl.optimistic_elig_speech or "").strip()
+                ):
                     logger.info(
                         "elig_optimistic_next call_id=%s step=%s next=%s turn_id=%s "
                         "epoch=%s",
@@ -4589,6 +4764,11 @@ async def process_user_turn(
             ctrl.pending_op_id = ""
             spoken = _strip_ask(str(result.get("spoken") or result.get("message") or ""))
             if not result.get("ok"):
+                # Allow the same spoken answer (e.g. "Two.") to retry after a
+                # sync Playwright clarify — otherwise duplicate_utterance blocks it.
+                ctrl.last_elig_attempt_failed = True
+                ctrl.optimistic_elig_step = ""
+                ctrl.optimistic_elig_speech = ""
                 session2 = await get_session(call_id)
                 step2 = (session2.elig_step if session2 else step) or step
                 speech = spoken or format_question(step2) or ctrl.last_speech

@@ -477,6 +477,7 @@ _STEP_QUESTION_CUES: dict[str, str] = {
     "relatives": r"other relatives|in-laws|step-family|step family",
     "support": r"more than half of your support|half of your support",
     "child_more": r"another child",
+    "person_more": r"another (student|disabled|relative|person|household member)|another .* to add",
     "programs": r"continue to the application|qualify for programs|Medi-Cal",
     "proceed_application": (
         r"start the application|eligibility check is finished|can i start"
