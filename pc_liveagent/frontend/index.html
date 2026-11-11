@@ -87,58 +87,158 @@
       gap: 0.7rem;
       font-weight: 600;
       font-size: 0.92rem;
+      transition:
+        background-color 0.22s ease,
+        color 0.22s ease,
+        transform 0.22s ease,
+        box-shadow 0.22s ease;
     }
-    .nav button:hover { background: #f5f8fc; }
+    .nav button:hover { background: #f5f8fc; transform: translateX(2px); }
     .nav button.active {
       background: var(--blue-soft);
       color: var(--navy);
     }
-    .nav svg { width: 18px; height: 18px; opacity: 0.9; flex: 0 0 auto; }
+    .nav button:active { transform: translateX(1px) scale(0.98); }
+    .nav svg {
+      width: 18px;
+      height: 18px;
+      opacity: 0.9;
+      flex: 0 0 auto;
+      transition: transform 0.22s ease;
+    }
+    .nav button:hover svg { transform: scale(1.08); }
 
     .main { display: flex; flex-direction: column; min-width: 0; }
-    .topbar {
-      height: 56px;
-      background: var(--white);
-      border-bottom: 1px solid var(--line);
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 0 1.25rem;
-    }
-    .icon-btn {
-      border: 0;
-      background: transparent;
-      width: 36px;
-      height: 36px;
-      border-radius: 8px;
-      cursor: pointer;
-      color: var(--muted);
-    }
-    .icon-btn:hover { background: #f0f4f8; }
-    .user {
-      display: flex;
-      align-items: center;
-      gap: 0.65rem;
-      color: var(--muted);
-      font-size: 0.88rem;
-    }
-    .avatar {
-      width: 34px;
-      height: 34px;
-      border-radius: 50%;
-      background: var(--navy);
-      color: white;
-      display: grid;
-      place-items: center;
-      font-weight: 700;
-      font-size: 0.78rem;
-    }
 
     .content {
       padding: 1.5rem 1.25rem 2.5rem;
-      max-width: 920px;
+      max-width: 1040px;
       width: 100%;
       margin: 0 auto;
+    }
+
+    .mode-tabs {
+      display: inline-flex;
+      gap: 0.35rem;
+      padding: 0.25rem;
+      background: #eef3f8;
+      border-radius: 10px;
+      margin: 0 0 1.25rem;
+    }
+    .mode-tabs button {
+      border: 0;
+      background: transparent;
+      padding: 0.55rem 0.95rem;
+      border-radius: 8px;
+      font-weight: 700;
+      font-size: 0.9rem;
+      color: var(--muted);
+      cursor: pointer;
+      transition:
+        background-color 0.22s ease,
+        color 0.22s ease,
+        box-shadow 0.22s ease,
+        transform 0.22s cubic-bezier(0.22, 1, 0.36, 1);
+    }
+    .mode-tabs button:hover:not(.active) {
+      color: var(--navy);
+      background: rgba(255, 255, 255, 0.55);
+    }
+    .mode-tabs button.active {
+      background: var(--white);
+      color: var(--navy);
+      box-shadow: 0 1px 3px rgba(15, 40, 80, 0.12);
+    }
+    .mode-tabs button:active { transform: scale(0.97); }
+    .mode-panel { display: none; }
+    .mode-panel.active { display: block; }
+
+    .upload-zone {
+      border: 1.5px dashed var(--blue-mid);
+      border-radius: 12px;
+      background: #f8fbff;
+      padding: 1.25rem 1rem;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color 0.15s ease, background 0.15s ease;
+    }
+    .upload-zone:hover,
+    .upload-zone.dragover {
+      border-color: var(--blue);
+      background: var(--blue-soft);
+    }
+    .upload-zone strong { display: block; margin-bottom: 0.25rem; color: var(--navy); }
+    .upload-zone span { color: var(--muted); font-size: 0.86rem; }
+    .upload-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.65rem;
+      justify-content: center;
+      margin-top: 0.85rem;
+    }
+    .file-chip {
+      display: none;
+      margin-top: 0.75rem;
+      font-size: 0.85rem;
+      color: var(--muted);
+    }
+    .file-chip.show { display: block; }
+
+    .bulk-table-wrap {
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      margin-top: 0.85rem;
+    }
+    table.bulk-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.88rem;
+      min-width: 640px;
+    }
+    table.bulk-table th,
+    table.bulk-table td {
+      padding: 0.65rem 0.75rem;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: middle;
+    }
+    table.bulk-table th {
+      background: #f5f8fc;
+      color: var(--muted);
+      font-size: 0.76rem;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }
+    table.bulk-table tr:last-child td { border-bottom: 0; }
+    .status-pill {
+      display: inline-block;
+      border-radius: 999px;
+      padding: 0.15rem 0.55rem;
+      font-size: 0.75rem;
+      font-weight: 700;
+      background: #eef2f7;
+      color: var(--muted);
+    }
+    .status-pill.ok { background: #eaf7ef; color: var(--ok); }
+    .status-pill.err { background: #fef3f2; color: var(--danger); }
+    .status-pill.run { background: var(--blue-soft); color: var(--navy); }
+    .bulk-summary {
+      margin-top: 0.75rem;
+      font-size: 0.88rem;
+      color: var(--muted);
+    }
+    .bulk-manual {
+      margin-top: 1.1rem;
+      padding: 1rem;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #fbfcfe;
+    }
+    .bulk-manual h3 {
+      margin: 0 0 0.75rem;
+      font-size: 0.95rem;
+      color: var(--ink);
     }
 
     .card {
@@ -210,8 +310,100 @@
 
     .phone-row {
       display: grid;
-      grid-template-columns: 92px 1fr;
+      grid-template-columns: 128px 1fr;
       gap: 0.55rem;
+      align-items: stretch;
+    }
+
+    .cc-picker {
+      position: relative;
+      width: 100%;
+    }
+    .cc-trigger {
+      width: 100%;
+      height: 100%;
+      min-height: 44px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      color: var(--ink);
+      padding: 0.55rem 0.55rem 0.55rem 0.65rem;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 0.9rem;
+      transition:
+        border-color 0.2s ease,
+        box-shadow 0.2s ease,
+        background-color 0.2s ease;
+    }
+    .cc-trigger:hover,
+    .cc-picker.open .cc-trigger {
+      border-color: var(--blue-mid);
+      box-shadow: 0 0 0 3px rgba(26, 95, 173, 0.12);
+    }
+    .cc-flag {
+      font-size: 1.15rem;
+      line-height: 1;
+      width: 1.25rem;
+      text-align: center;
+      flex: 0 0 auto;
+    }
+    .cc-code { flex: 1 1 auto; text-align: left; }
+    .cc-caret {
+      width: 0;
+      height: 0;
+      border-left: 4px solid transparent;
+      border-right: 4px solid transparent;
+      border-top: 5px solid var(--muted);
+      margin-left: 0.15rem;
+      transition: transform 0.2s ease;
+    }
+    .cc-picker.open .cc-caret { transform: rotate(180deg); }
+    .cc-menu {
+      display: none;
+      position: absolute;
+      top: calc(100% + 6px);
+      left: 0;
+      min-width: 220px;
+      z-index: 40;
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      box-shadow: 0 12px 28px rgba(15, 40, 80, 0.12);
+      padding: 0.35rem;
+      overflow: hidden;
+    }
+    .cc-picker.open .cc-menu { display: block; }
+    .cc-option {
+      width: 100%;
+      border: 0;
+      background: transparent;
+      border-radius: 8px;
+      padding: 0.55rem 0.65rem;
+      display: flex;
+      align-items: center;
+      gap: 0.55rem;
+      cursor: pointer;
+      color: var(--ink);
+      text-align: left;
+      font-size: 0.88rem;
+      transition: background-color 0.15s ease;
+    }
+    .cc-option:hover,
+    .cc-option[aria-selected="true"] {
+      background: var(--blue-soft);
+    }
+    .cc-option .cc-name {
+      flex: 1 1 auto;
+      color: var(--muted);
+      font-weight: 500;
+    }
+    .cc-option .cc-dial {
+      font-weight: 700;
+      color: var(--ink);
     }
 
     .actions {
@@ -240,6 +432,32 @@
       font-weight: 700;
       cursor: pointer;
       min-width: 132px;
+      position: relative;
+      overflow: hidden;
+      transform: translateY(0) scale(1);
+      transition:
+        background-color 0.25s ease,
+        color 0.25s ease,
+        box-shadow 0.25s ease,
+        transform 0.25s cubic-bezier(0.22, 1, 0.36, 1),
+        opacity 0.2s ease;
+    }
+    .btn::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(120deg, transparent 20%, rgba(255, 255, 255, 0.28) 45%, transparent 70%);
+      transform: translateX(-120%);
+      transition: transform 0.55s ease;
+      pointer-events: none;
+    }
+    .btn:hover:not(:disabled)::after { transform: translateX(120%); }
+    .btn:hover:not(:disabled) {
+      transform: translateY(-2px) scale(1.02);
+    }
+    .btn:active:not(:disabled) {
+      transform: translateY(0) scale(0.97);
+      transition-duration: 0.12s;
     }
     .btn-sm {
       min-width: 0;
@@ -247,17 +465,33 @@
       font-size: 0.88rem;
       flex: 0 0 auto;
     }
-    .btn:disabled { opacity: 0.55; cursor: not-allowed; }
+    .btn:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+      transform: none;
+      box-shadow: none;
+    }
     .btn-secondary {
       background: #e9eef4;
       color: var(--ink);
+      box-shadow: 0 1px 0 rgba(15, 40, 80, 0.04);
     }
-    .btn-secondary:hover:not(:disabled) { background: #dde5ee; }
+    .btn-secondary:hover:not(:disabled) {
+      background: #dde5ee;
+      box-shadow: 0 8px 18px rgba(15, 40, 80, 0.1);
+    }
     .btn-primary {
       background: var(--navy);
       color: white;
+      box-shadow: 0 6px 14px rgba(11, 58, 110, 0.22);
     }
-    .btn-primary:hover:not(:disabled) { background: var(--navy-deep); }
+    .btn-primary:hover:not(:disabled) {
+      background: var(--navy-deep);
+      box-shadow: 0 10px 22px rgba(11, 58, 110, 0.28);
+    }
+    .btn-primary:active:not(:disabled) {
+      box-shadow: 0 3px 8px rgba(11, 58, 110, 0.2);
+    }
     .btn-ghost-blue {
       background: var(--blue-soft);
       color: var(--navy);
@@ -269,7 +503,29 @@
       gap: 0.45rem;
       font-weight: 700;
     }
-    .btn-ghost-blue:hover { background: var(--blue-mid); }
+    .btn-ghost-blue:hover:not(:disabled) {
+      background: var(--blue-mid);
+      box-shadow: 0 8px 18px rgba(26, 95, 173, 0.14);
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .btn,
+      .btn::after,
+      .nav button,
+      .nav svg,
+      .mode-tabs button {
+        transition: none !important;
+      }
+      .btn:hover:not(:disabled),
+      .btn:active:not(:disabled),
+      .nav button:hover,
+      .nav button:active,
+      .mode-tabs button:active {
+        transform: none;
+      }
+      .btn:hover:not(:disabled)::after { transform: none; }
+      .cc-caret { transition: none; }
+    }
 
     .banner {
       display: none;
@@ -483,20 +739,118 @@
       color: var(--muted);
       padding: 2rem 1rem;
     }
-    .session-list { display: flex; flex-direction: column; gap: 0.75rem; }
-    .session-item {
+    .calls-table-wrap {
+      overflow: auto;
       border: 1px solid var(--line);
       border-radius: 10px;
-      padding: 0.9rem 1rem;
-      background: #fbfcfe;
     }
-    .session-item strong { display: block; margin-bottom: 0.25rem; }
-    .session-item .row {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 0.75rem;
-      font-size: 0.85rem;
+    table.calls-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.9rem;
+      min-width: 720px;
+    }
+    table.calls-table th,
+    table.calls-table td {
+      padding: 0.8rem 0.85rem;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: middle;
+    }
+    table.calls-table th {
+      background: #f5f8fc;
       color: var(--muted);
+      font-size: 0.76rem;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+      font-weight: 700;
+    }
+    table.calls-table tbody tr:last-child > td { border-bottom: 0; }
+    table.calls-table td.name-cell { font-weight: 700; color: var(--ink); }
+    table.calls-table td.time-cell {
+      white-space: nowrap;
+      color: var(--muted);
+      font-size: 0.86rem;
+    }
+    table.calls-table tr.transcript-row > td {
+      background: #fbfcfe;
+      padding: 0;
+      border-bottom: 1px solid var(--line);
+    }
+    table.calls-table tr.transcript-row:last-child > td { border-bottom: 0; }
+    .call-status {
+      display: inline-block;
+      border-radius: 999px;
+      padding: 0.2rem 0.65rem;
+      font-size: 0.75rem;
+      font-weight: 700;
+      background: #eef2f7;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+    .call-status.in-progress { background: #fff8eb; color: #8a5a00; }
+    .call-status.voice-agent { background: var(--blue-soft); color: var(--navy); }
+    .call-status.successful { background: #eaf7ef; color: var(--ok); }
+    .call-status.no-answer,
+    .call-status.declined { background: #fef3f2; color: var(--danger); }
+    .call-status.voicemail { background: #f3eefc; color: #5b3d9a; }
+    .transcript-panel {
+      display: none;
+      padding: 0.95rem 1rem 1.05rem;
+    }
+    .transcript-panel.open { display: block; }
+    .transcript-meta {
+      font-size: 0.8rem;
+      color: var(--muted);
+      margin-bottom: 0.65rem;
+    }
+    .transcript-thread {
+      display: flex;
+      flex-direction: column;
+      gap: 0.55rem;
+      max-height: 360px;
+      overflow: auto;
+      padding-right: 0.25rem;
+    }
+    .bubble {
+      max-width: 92%;
+      padding: 0.55rem 0.75rem;
+      border-radius: 12px;
+      font-size: 0.88rem;
+      line-height: 1.4;
+      white-space: pre-wrap;
+    }
+    .bubble .who {
+      display: block;
+      font-size: 0.72rem;
+      font-weight: 700;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+      margin-bottom: 0.2rem;
+      opacity: 0.8;
+    }
+    .bubble.agent {
+      align-self: flex-start;
+      background: var(--blue-soft);
+      color: var(--navy);
+      border: 1px solid var(--blue-mid);
+    }
+    .bubble.user {
+      align-self: flex-end;
+      background: #eef2f7;
+      color: var(--ink);
+      border: 1px solid var(--line);
+    }
+    .bubble.other {
+      align-self: flex-start;
+      background: #fff8eb;
+      color: #8a5a00;
+      border: 1px solid #f5d48a;
+    }
+    .transcript-empty {
+      color: var(--muted);
+      font-size: 0.88rem;
+      padding: 0.5rem 0;
     }
 
     @media (max-width: 860px) {
@@ -559,81 +913,158 @@
     </aside>
 
     <div class="main">
-      <header class="topbar">
-        <button type="button" class="icon-btn" aria-label="Menu" title="Menu">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M4 7h16M4 12h16M4 17h16"/>
-          </svg>
-        </button>
-        <div class="user">
-          <span>admin@dataterrain.com</span>
-          <div class="avatar" aria-hidden="true">AD</div>
-        </div>
-      </header>
-
       <main class="content">
         <!-- Start call -->
         <section id="view-start" class="panel active">
           <div class="card">
             <h1>AI Medicaid Assist</h1>
             <p class="lede">
-              Add a patient and start an outreach call for Medicaid Renewal and form help.
+              Place a single outreach call, or upload a patient list for bulk calling.
             </p>
 
-            <form id="call-form" novalidate>
+            <div class="mode-tabs" role="tablist" aria-label="Start call mode">
+              <button type="button" class="active" data-mode="single" role="tab" aria-selected="true">Single call</button>
+              <button type="button" data-mode="bulk" role="tab" aria-selected="false">Bulk call</button>
+            </div>
+
+            <div id="mode-single" class="mode-panel active">
+              <form id="call-form" novalidate>
+                <div class="section" style="border-top:0;padding-top:0;margin-top:0;">
+                  <div class="section-title">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
+                      <circle cx="12" cy="7" r="4"/>
+                    </svg>
+                    Patient information
+                  </div>
+                  <div class="grid">
+                    <div class="field">
+                      <label for="first_name">First name <span class="req">*</span></label>
+                      <input id="first_name" name="first_name" autocomplete="given-name" placeholder="Enter first name" required />
+                    </div>
+                    <div class="field">
+                      <label for="last_name">Last name <span class="req">*</span></label>
+                      <input id="last_name" name="last_name" autocomplete="family-name" placeholder="Enter last name" required />
+                    </div>
+                    <div class="field full">
+                      <label for="form_name">Reason for call</label>
+                      <input id="form_name" name="form_name" placeholder="e.g. Medicaid eligibility and application" />
+                    </div>
+                  </div>
+                </div>
+
+                <div class="section">
+                  <div class="section-title">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6A19.79 19.79 0 0 1 2.12 4.18 2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.12.9.33 1.77.62 2.6a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.48-1.19a2 2 0 0 1 2.11-.45c.83.29 1.7.5 2.6.62A2 2 0 0 1 22 16.92z"/>
+                    </svg>
+                    Contact information
+                  </div>
+                  <div class="grid">
+                    <div class="field full">
+                      <label for="phone_local">Patient phone <span class="req">*</span></label>
+                      <div class="phone-row">
+                        <div class="cc-picker" data-cc-picker data-input-id="phone_cc" data-value="+1"></div>
+                        <input id="phone_local" name="phone_local" inputmode="tel" autocomplete="tel-national" placeholder="(302) 555-0199" required />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="actions">
+                  <button type="button" class="btn btn-secondary" id="btn-cancel">Cancel</button>
+                  <button type="submit" class="btn btn-primary" id="btn-submit">Start call</button>
+                </div>
+              </form>
+
+              <div id="banner" class="banner" role="status" aria-live="polite"></div>
+            </div>
+
+            <div id="mode-bulk" class="mode-panel">
               <div class="section" style="border-top:0;padding-top:0;margin-top:0;">
                 <div class="section-title">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
-                    <circle cx="12" cy="7" r="4"/>
+                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                    <path d="M14 2v6h6M8 13h8M8 17h8M8 9h2"/>
                   </svg>
-                  Patient information
+                  Upload patient list
                 </div>
-                <div class="grid">
-                  <div class="field">
-                    <label for="first_name">First name <span class="req">*</span></label>
-                    <input id="first_name" name="first_name" autocomplete="given-name" placeholder="Enter first name" required />
+                <div id="upload-zone" class="upload-zone" tabindex="0" role="button" aria-label="Upload Excel or CSV">
+                  <strong>Drop Excel or CSV here</strong>
+                  <span>Accepted: .xlsx, .csv · Columns: first_name, last_name, phone (or name, phone)</span>
+                  <div class="upload-actions">
+                    <button type="button" class="btn btn-secondary btn-sm" id="btn-choose-file">Choose file</button>
+                    <a class="btn btn-ghost-blue btn-sm" href="/form-filler/bulk/template.csv" style="width:auto;min-width:0;">Download template</a>
                   </div>
-                  <div class="field">
-                    <label for="last_name">Last name <span class="req">*</span></label>
-                    <input id="last_name" name="last_name" autocomplete="family-name" placeholder="Enter last name" required />
-                  </div>
-                  <div class="field full">
-                    <label for="form_name">Reason for call</label>
-                    <input id="form_name" name="form_name" placeholder="e.g. Medicaid eligibility and application" />
-                  </div>
+                  <input id="bulk-file" type="file" accept=".csv,.txt,.xlsx,.xlsm,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" hidden />
+                  <div id="file-chip" class="file-chip"></div>
                 </div>
               </div>
 
               <div class="section">
                 <div class="section-title">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6A19.79 19.79 0 0 1 2.12 4.18 2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.12.9.33 1.77.62 2.6a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.48-1.19a2 2 0 0 1 2.11-.45c.83.29 1.7.5 2.6.62A2 2 0 0 1 22 16.92z"/>
+                    <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
+                    <circle cx="9" cy="7" r="4"/>
+                    <path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/>
                   </svg>
-                  Contact information
+                  Bulk patient list
                 </div>
+                <div id="bulk-empty" class="empty">No patients yet. Upload a file or add one manually below.</div>
+                <div id="bulk-table-wrap" class="bulk-table-wrap" style="display:none;">
+                  <table class="bulk-table" aria-label="Bulk patients">
+                    <thead>
+                      <tr>
+                        <th>#</th>
+                        <th>Name</th>
+                        <th>Phone</th>
+                        <th>Reason</th>
+                        <th>Status</th>
+                        <th></th>
+                      </tr>
+                    </thead>
+                    <tbody id="bulk-tbody"></tbody>
+                  </table>
+                </div>
+                <div id="bulk-summary" class="bulk-summary"></div>
+              </div>
+
+              <div class="bulk-manual">
+                <h3>Manually add a patient</h3>
                 <div class="grid">
-                  <div class="field full">
-                    <label for="phone_local">Patient phone <span class="req">*</span></label>
+                  <div class="field">
+                    <label for="bulk_first_name">First name <span class="req">*</span></label>
+                    <input id="bulk_first_name" placeholder="Enter first name" />
+                  </div>
+                  <div class="field">
+                    <label for="bulk_last_name">Last name <span class="req">*</span></label>
+                    <input id="bulk_last_name" placeholder="Enter last name" />
+                  </div>
+                  <div class="field">
+                    <label for="bulk_phone_local">Patient phone <span class="req">*</span></label>
                     <div class="phone-row">
-                      <select id="phone_cc" aria-label="Country code">
-                        <option value="+1" selected>+1</option>
-                        <option value="+91">+91</option>
-                      </select>
-                      <input id="phone_local" name="phone_local" inputmode="tel" autocomplete="tel-national" placeholder="(302) 555-0199" required />
+                      <div class="cc-picker" data-cc-picker data-input-id="bulk_phone_cc" data-value="+1"></div>
+                      <input id="bulk_phone_local" inputmode="tel" placeholder="(302) 555-0199" />
                     </div>
                   </div>
+                  <div class="field">
+                    <label for="bulk_form_name">Reason for call</label>
+                    <input id="bulk_form_name" placeholder="Optional" />
+                  </div>
+                </div>
+                <div class="actions end" style="margin-top:1rem;">
+                  <button type="button" class="btn btn-secondary" id="btn-bulk-add">Add to list</button>
                 </div>
               </div>
 
               <div class="actions">
-                <button type="button" class="btn btn-secondary" id="btn-cancel">Cancel</button>
-                <button type="submit" class="btn btn-primary" id="btn-submit">Start call</button>
+                <button type="button" class="btn btn-secondary" id="btn-bulk-clear">Clear list</button>
+                <button type="button" class="btn btn-primary" id="btn-bulk-start">Start bulk calls</button>
               </div>
-            </form>
 
-            <div id="banner" class="banner" role="status" aria-live="polite"></div>
-            <div id="meta" class="meta"></div>
+              <div id="bulk-banner" class="banner" role="status" aria-live="polite"></div>
+              <div id="bulk-meta" class="meta"></div>
+            </div>
           </div>
         </section>
 
@@ -666,14 +1097,26 @@
             <div class="panel-head">
               <div>
                 <h1>Calls</h1>
-                <p class="lede">Patients you have started from AI Medicaid Assist.</p>
+                <p class="lede">Patients you have started from AI Medicaid Assist. Open a transcript to pull the Retell recording of the conversation.</p>
               </div>
               <button type="button" class="btn btn-secondary btn-sm" id="btn-clear-calls">
                 Clear call log
               </button>
             </div>
             <div id="calls-empty" class="empty">No calls yet.</div>
-            <div id="calls-list" class="session-list"></div>
+            <div id="calls-table-wrap" class="calls-table-wrap" style="display:none;">
+              <table class="calls-table" aria-label="Call log">
+                <thead>
+                  <tr>
+                    <th>Name</th>
+                    <th>Status</th>
+                    <th>Date and time</th>
+                    <th>Transcript</th>
+                  </tr>
+                </thead>
+                <tbody id="calls-list"></tbody>
+              </table>
+            </div>
           </div>
         </section>
 
@@ -681,12 +1124,34 @@
         <section id="view-settings" class="panel">
           <div class="card">
             <h1>Settings</h1>
-            <p class="lede">Account and notification preferences.</p>
+            <p class="lede">Calling preferences and account details.</p>
+
+            <div class="section" style="border-top:0;padding-top:0;margin-top:0;">
+              <div class="section-title">Bulk calling</div>
+              <div class="grid">
+                <div class="field">
+                  <label for="max_concurrent">Calls at once <span class="req">*</span></label>
+                  <input
+                    id="max_concurrent"
+                    type="number"
+                    min="1"
+                    max="20"
+                    step="1"
+                    value="20"
+                  />
+                  <div class="hint">How many outbound calls to place in parallel during a bulk run. Default and maximum is 20.</div>
+                </div>
+              </div>
+              <div class="actions end" style="margin-top:1rem;">
+                <button type="button" class="btn btn-primary" id="btn-settings-save">Save settings</button>
+              </div>
+              <div id="settings-banner" class="banner" role="status" aria-live="polite"></div>
+            </div>
+
             <div class="section">
               <div class="section-title">Organization</div>
               <p style="margin:0;color:var(--muted);font-size:0.92rem;line-height:1.55;">
-                DataTerrain · AI Medicaid Assist<br />
-                Signed in as admin@dataterrain.com
+                DataTerrain · AI Medicaid Assist
               </p>
             </div>
           </div>
@@ -699,21 +1164,134 @@
     (function () {
       const AGENTS_KEY = "pcff_live_agents_v1";
       const CALLS_KEY = "pcff_calls";
+      const SETTINGS_KEY = "pcff_settings_v1";
+      const DEFAULT_SETTINGS = { maxConcurrent: 20 };
+      const COUNTRY_CODES = [
+        { value: "+1", flag: "🇺🇸", name: "United States", dial: "+1" },
+        { value: "+91", flag: "🇮🇳", name: "India", dial: "+91" },
+      ];
       const DEFAULT_AGENTS = [
         { id: "a1", name: "Kadher", cc: "+91", phone: "(730) 523-0194", active: true },
         { id: "a2", name: "Bharath", cc: "+91", phone: "(987) 654-3210", active: false },
       ];
 
+      function countryByValue(value) {
+        return COUNTRY_CODES.find((c) => c.value === value) || COUNTRY_CODES[0];
+      }
+
+      function mountCcPicker(root, opts) {
+        if (!root) return null;
+        const options = opts || {};
+        const inputId = options.inputId || root.dataset.inputId || "";
+        let current = options.value || root.dataset.value || "+1";
+        const onChange = typeof options.onChange === "function" ? options.onChange : null;
+
+        root.innerHTML = "";
+        root.classList.add("cc-picker");
+        root.classList.remove("open");
+
+        const hidden = document.createElement("input");
+        hidden.type = "hidden";
+        if (inputId) hidden.id = inputId;
+        hidden.value = current;
+
+        const trigger = document.createElement("button");
+        trigger.type = "button";
+        trigger.className = "cc-trigger";
+        trigger.setAttribute("aria-label", "Country code");
+        trigger.setAttribute("aria-haspopup", "listbox");
+        trigger.setAttribute("aria-expanded", "false");
+
+        const menu = document.createElement("div");
+        menu.className = "cc-menu";
+        menu.setAttribute("role", "listbox");
+
+        function paintTrigger() {
+          const c = countryByValue(current);
+          trigger.innerHTML =
+            `<span class="cc-flag" aria-hidden="true">${c.flag}</span>` +
+            `<span class="cc-code">${escapeHtml(c.dial)}</span>` +
+            `<span class="cc-caret" aria-hidden="true"></span>`;
+        }
+
+        function paintMenu() {
+          menu.innerHTML = COUNTRY_CODES.map((c) => {
+            const selected = c.value === current ? "true" : "false";
+            return (
+              `<button type="button" class="cc-option" role="option" data-value="${escapeAttr(c.value)}" aria-selected="${selected}">` +
+              `<span class="cc-flag" aria-hidden="true">${c.flag}</span>` +
+              `<span class="cc-name">${escapeHtml(c.name)}</span>` +
+              `<span class="cc-dial">${escapeHtml(c.dial)}</span>` +
+              `</button>`
+            );
+          }).join("");
+          menu.querySelectorAll(".cc-option").forEach((btn) => {
+            btn.addEventListener("click", (ev) => {
+              ev.preventDefault();
+              ev.stopPropagation();
+              current = btn.getAttribute("data-value") || "+1";
+              hidden.value = current;
+              root.dataset.value = current;
+              paintTrigger();
+              paintMenu();
+              close();
+              if (onChange) onChange(current);
+              hidden.dispatchEvent(new Event("change", { bubbles: true }));
+            });
+          });
+        }
+
+        function open() {
+          document.querySelectorAll(".cc-picker.open").forEach((el) => {
+            if (el !== root) el.classList.remove("open");
+          });
+          root.classList.add("open");
+          trigger.setAttribute("aria-expanded", "true");
+        }
+        function close() {
+          root.classList.remove("open");
+          trigger.setAttribute("aria-expanded", "false");
+        }
+
+        trigger.addEventListener("click", (ev) => {
+          ev.preventDefault();
+          ev.stopPropagation();
+          if (root.classList.contains("open")) close();
+          else open();
+        });
+
+        paintTrigger();
+        paintMenu();
+        root.appendChild(hidden);
+        root.appendChild(trigger);
+        root.appendChild(menu);
+        return hidden;
+      }
+
+      function initCcPickers(scope) {
+        (scope || document).querySelectorAll("[data-cc-picker]").forEach((el) => {
+          mountCcPicker(el, {
+            inputId: el.dataset.inputId,
+            value: el.dataset.value || "+1",
+          });
+        });
+      }
+
       const form = document.getElementById("call-form");
       const banner = document.getElementById("banner");
-      const meta = document.getElementById("meta");
       const submitBtn = document.getElementById("btn-submit");
       const agentList = document.getElementById("agent-list");
       const agentsBanner = document.getElementById("agents-banner");
+      const bulkBanner = document.getElementById("bulk-banner");
+      const bulkMeta = document.getElementById("bulk-meta");
+      const settingsBanner = document.getElementById("settings-banner");
 
       let agents = loadAgents();
       let agentsSnapshot = JSON.stringify(agents);
       let calls = JSON.parse(sessionStorage.getItem(CALLS_KEY) || "[]");
+      let settings = loadSettings();
+      let bulkPatients = [];
+      let bulkBusy = false;
 
       function loadAgents() {
         try {
@@ -721,6 +1299,27 @@
           if (Array.isArray(raw) && raw.length) return raw;
         } catch (_) {}
         return DEFAULT_AGENTS.map((a) => ({ ...a }));
+      }
+
+      function loadSettings() {
+        try {
+          const raw = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "null");
+          if (raw && typeof raw === "object") {
+            const n = Number(raw.maxConcurrent);
+            return {
+              maxConcurrent: Number.isFinite(n) ? Math.min(20, Math.max(1, Math.round(n))) : 20,
+            };
+          }
+        } catch (_) {}
+        return { ...DEFAULT_SETTINGS };
+      }
+
+      function saveSettings(next) {
+        settings = {
+          maxConcurrent: Math.min(20, Math.max(1, Math.round(Number(next.maxConcurrent) || 20))),
+        };
+        localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+        return settings;
       }
 
       function uid() {
@@ -734,26 +1333,49 @@
         document.querySelectorAll(".nav button").forEach((btn) => {
           btn.classList.toggle("active", btn.dataset.view === name);
         });
-        if (name === "calls") renderCalls();
+        if (name === "calls") showCallsView();
         if (name === "agents") renderAgents();
+        if (name === "settings") fillSettingsForm();
       }
 
       document.querySelectorAll(".nav button").forEach((btn) => {
         btn.addEventListener("click", () => showView(btn.dataset.view));
       });
 
+      function setStartMode(mode) {
+        const next = mode === "bulk" ? "bulk" : "single";
+        document.querySelectorAll(".mode-tabs button").forEach((btn) => {
+          const on = btn.dataset.mode === next;
+          btn.classList.toggle("active", on);
+          btn.setAttribute("aria-selected", on ? "true" : "false");
+        });
+        document.getElementById("mode-single").classList.toggle("active", next === "single");
+        document.getElementById("mode-bulk").classList.toggle("active", next === "bulk");
+      }
+
+      document.querySelectorAll(".mode-tabs button").forEach((btn) => {
+        btn.addEventListener("click", () => setStartMode(btn.dataset.mode));
+      });
+
       function digitsOnly(value) {
         return String(value || "").replace(/\D/g, "");
       }
 
-      function buildE164() {
-        const cc = document.getElementById("phone_cc").value;
-        const local = digitsOnly(document.getElementById("phone_local").value);
+      function buildE164From(ccEl, localEl) {
+        const cc = ccEl.value;
+        const local = digitsOnly(localEl.value);
         if (!local) return "";
         if (local.length >= 10 && (local.startsWith("1") || local.startsWith("91"))) {
           return "+" + local;
         }
         return cc + local;
+      }
+
+      function buildE164() {
+        return buildE164From(
+          document.getElementById("phone_cc"),
+          document.getElementById("phone_local")
+        );
       }
 
       function setBanner(el, kind, html) {
@@ -766,12 +1388,53 @@
         el.innerHTML = "";
       }
 
+      function escapeHtml(s) {
+        return String(s)
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;");
+      }
+      function escapeAttr(s) {
+        return escapeHtml(s).replace(/'/g, "&#39;");
+      }
+
+      function activeAgentNumber() {
+        const activeAgent = (agents || []).find(
+          (a) => a && a.active && digitsOnly(a.phone || "").length >= 10
+        );
+        if (!activeAgent) return "";
+        const local = digitsOnly(activeAgent.phone);
+        const cc = (activeAgent.cc || "+1").replace(/\D/g, "") || "1";
+        return local.startsWith(cc) || local.startsWith("1") || local.startsWith("91")
+          ? "+" + local
+          : "+" + cc + local;
+      }
+
+      function fillSettingsForm() {
+        document.getElementById("max_concurrent").value = String(settings.maxConcurrent || 20);
+        clearBanner(settingsBanner);
+      }
+
+      document.getElementById("btn-settings-save").addEventListener("click", () => {
+        const raw = Number(document.getElementById("max_concurrent").value);
+        if (!Number.isFinite(raw) || raw < 1 || raw > 20) {
+          setBanner(settingsBanner, "err", "Enter a number between 1 and 20 for calls at once.");
+          return;
+        }
+        saveSettings({ maxConcurrent: raw });
+        fillSettingsForm();
+        setBanner(
+          settingsBanner,
+          "ok",
+          `Saved. Bulk calling will place up to <strong>${settings.maxConcurrent}</strong> calls at once.`
+        );
+      });
+
       /* ---- Start call (existing form-filler outbound) ---- */
       document.getElementById("btn-cancel").addEventListener("click", () => {
         form.reset();
         clearBanner(banner);
-        meta.className = "meta";
-        meta.innerHTML = "";
       });
 
       form.addEventListener("submit", async (ev) => {
@@ -796,23 +1459,12 @@
           form_name: formName || "AI Medicaid Assist",
         };
         // First active Live agent number → same-call cold transfer if caller chooses that mode.
-        const activeAgent = (agents || []).find(
-          (a) => a && a.active && digitsOnly(a.phone || "").length >= 10
-        );
-        if (activeAgent) {
-          const local = digitsOnly(activeAgent.phone);
-          const cc = (activeAgent.cc || "+1").replace(/\D/g, "") || "1";
-          payload.agent_number =
-            local.startsWith(cc) || local.startsWith("1") || local.startsWith("91")
-              ? "+" + local
-              : "+" + cc + local;
-        }
+        const agentNumber = activeAgentNumber();
+        if (agentNumber) payload.agent_number = agentNumber;
 
         submitBtn.disabled = true;
         submitBtn.textContent = "Calling…";
         setBanner(banner, "ok", "Placing call…");
-        meta.className = "meta";
-        meta.innerHTML = "";
 
         try {
           const res = await fetch("/form-filler/outbound/", {
@@ -838,20 +1490,18 @@
             msg += `<br/><span style="color:var(--danger)">${data.browser.error}</span>`;
           }
           setBanner(banner, "ok", msg);
-          meta.className = "meta show";
-          meta.innerHTML =
-            `call_id: <code>${callId || "—"}</code>` +
-            (data.from_number ? ` · from: <code>${data.from_number}</code>` : "") +
-            (data.status ? ` · status: <code>${data.status}</code>` : "");
 
+          const now = new Date();
           calls.push({
             name: payload.name,
             phone: payload.phone_number,
             call_id: callId,
             chrome_url: chrome,
-            when: new Date().toLocaleString(),
+            when_iso: now.toISOString(),
+            when: formatCallDateTime(now),
+            status: "In progress",
           });
-          sessionStorage.setItem(CALLS_KEY, JSON.stringify(calls.slice(-20)));
+          sessionStorage.setItem(CALLS_KEY, JSON.stringify(calls.slice(-100)));
         } catch (err) {
           setBanner(banner, "err", err.message || "Failed to place call.");
         } finally {
@@ -860,33 +1510,230 @@
         }
       });
 
+      function formatDuration(ms) {
+        const n = Number(ms);
+        if (!Number.isFinite(n) || n <= 0) return "";
+        const sec = Math.round(n / 1000);
+        const m = Math.floor(sec / 60);
+        const s = sec % 60;
+        return m ? `${m}m ${s}s` : `${s}s`;
+      }
+
+      function formatCallDateTime(value) {
+        const d = value instanceof Date ? value : new Date(value);
+        if (Number.isNaN(d.getTime())) return "—";
+        const months = [
+          "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+          "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ];
+        const dd = String(d.getDate()).padStart(2, "0");
+        const mon = months[d.getMonth()];
+        const yy = String(d.getFullYear()).slice(-2);
+        let hours = d.getHours();
+        const minutes = String(d.getMinutes()).padStart(2, "0");
+        const ampm = hours >= 12 ? "PM" : "AM";
+        hours = hours % 12;
+        if (hours === 0) hours = 12;
+        const hh = String(hours).padStart(2, "0");
+        return `${dd} ${mon} ${yy}, ${hh}:${minutes} ${ampm}`;
+      }
+
+      function statusClass(label) {
+        const key = String(label || "").trim().toLowerCase();
+        if (key === "in progress") return "in-progress";
+        if (key === "voice agent") return "voice-agent";
+        if (key === "successful") return "successful";
+        if (key === "no answer") return "no-answer";
+        if (key === "declined") return "declined";
+        if (key === "voicemail") return "voicemail";
+        return "";
+      }
+
+      function persistCalls() {
+        sessionStorage.setItem(CALLS_KEY, JSON.stringify(calls.slice(-100)));
+      }
+
+      function renderTranscriptPanel(panel, data) {
+        const metaBits = [];
+        if (data.status_label) metaBits.push(`status: <code>${escapeHtml(data.status_label)}</code>`);
+        else if (data.call_status) metaBits.push(`status: <code>${escapeHtml(data.call_status)}</code>`);
+        if (data.duration_ms) metaBits.push(`duration: <code>${escapeHtml(formatDuration(data.duration_ms))}</code>`);
+        if (data.recording_url) {
+          metaBits.push(
+            `<a href="${escapeAttr(data.recording_url)}" target="_blank" rel="noopener">Recording</a>`
+          );
+        }
+        if (data.public_log_url) {
+          metaBits.push(
+            `<a href="${escapeAttr(data.public_log_url)}" target="_blank" rel="noopener">Retell log</a>`
+          );
+        }
+        const turns = Array.isArray(data.turns) ? data.turns : [];
+        let body = "";
+        if (turns.length) {
+          body =
+            `<div class="transcript-thread">` +
+            turns
+              .map((t) => {
+                const role = String(t.role || "other").toLowerCase();
+                const klass = role === "agent" || role === "user" ? role : "other";
+                const who = role === "agent" ? "Agent" : role === "user" ? "Patient" : role;
+                return (
+                  `<div class="bubble ${klass}">` +
+                  `<span class="who">${escapeHtml(who)}</span>` +
+                  `${escapeHtml(t.content || "")}` +
+                  `</div>`
+                );
+              })
+              .join("") +
+            `</div>`;
+        } else if (data.transcript) {
+          body =
+            `<div class="transcript-thread">` +
+            `<div class="bubble other"><span class="who">Transcript</span>${escapeHtml(
+              data.transcript
+            )}</div>` +
+            `</div>`;
+        } else {
+          body = `<div class="transcript-empty">${escapeHtml(
+            data.note || "No transcript is available yet."
+          )}</div>`;
+        }
+        panel.innerHTML =
+          (metaBits.length ? `<div class="transcript-meta">${metaBits.join(" · ")}</div>` : "") +
+          body;
+      }
+
+      async function toggleTranscript(callEntry, panel, button, statusEl) {
+        const callId = (callEntry && callEntry.call_id) || "";
+        if (!callId) {
+          panel.classList.add("open");
+          panel.innerHTML =
+            `<div class="transcript-empty">No call_id is available for this entry.</div>`;
+          return;
+        }
+        if (panel.classList.contains("open") && panel.dataset.loaded === "1") {
+          panel.classList.remove("open");
+          button.textContent = "View";
+          return;
+        }
+        panel.classList.add("open");
+        button.disabled = true;
+        button.textContent = "Loading…";
+        panel.innerHTML = `<div class="transcript-empty">Fetching transcript from Retell…</div>`;
+        try {
+          const res = await fetch(
+            `/form-filler/calls/${encodeURIComponent(callId)}/transcript`,
+            { headers: { Accept: "application/json" } }
+          );
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            const detail = data.detail || data.error || res.statusText || "Request failed";
+            throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+          }
+          if (data.status_label) {
+            callEntry.status = data.status_label;
+            if (statusEl) {
+              statusEl.textContent = data.status_label;
+              statusEl.className = "call-status " + statusClass(data.status_label);
+            }
+            persistCalls();
+          }
+          if (data.start_timestamp && !callEntry.when_iso) {
+            const ts = Number(data.start_timestamp);
+            const ms = ts > 1e12 ? ts : ts * 1000;
+            callEntry.when_iso = new Date(ms).toISOString();
+            callEntry.when = formatCallDateTime(ms);
+            persistCalls();
+          }
+          renderTranscriptPanel(panel, data);
+          panel.dataset.loaded = data.ready ? "1" : "0";
+          button.textContent = data.ready ? "Hide" : "Refresh";
+        } catch (err) {
+          panel.dataset.loaded = "0";
+          panel.innerHTML = `<div class="transcript-empty">${escapeHtml(
+            err.message || "Failed to load transcript."
+          )}</div>`;
+          button.textContent = "Retry";
+        } finally {
+          button.disabled = false;
+        }
+      }
+
+      async function refreshCallStatuses() {
+        const pending = calls.filter((c) => c && c.call_id);
+        await Promise.all(
+          pending.map(async (c) => {
+            try {
+              const res = await fetch(
+                `/form-filler/calls/${encodeURIComponent(c.call_id)}/transcript`,
+                { headers: { Accept: "application/json" } }
+              );
+              if (!res.ok) return;
+              const data = await res.json().catch(() => ({}));
+              if (data.status_label) c.status = data.status_label;
+              if (data.start_timestamp) {
+                const ts = Number(data.start_timestamp);
+                if (Number.isFinite(ts) && ts > 0) {
+                  const ms = ts > 1e12 ? ts : ts * 1000;
+                  c.when_iso = new Date(ms).toISOString();
+                  c.when = formatCallDateTime(ms);
+                }
+              }
+            } catch (_) {}
+          })
+        );
+        persistCalls();
+      }
+
       function renderCalls() {
         const empty = document.getElementById("calls-empty");
+        const wrap = document.getElementById("calls-table-wrap");
         const list = document.getElementById("calls-list");
         const clearBtn = document.getElementById("btn-clear-calls");
         list.innerHTML = "";
         clearBtn.disabled = !calls.length;
         if (!calls.length) {
           empty.style.display = "block";
+          wrap.style.display = "none";
           return;
         }
         empty.style.display = "none";
+        wrap.style.display = "block";
         calls.slice().reverse().forEach((c) => {
-          const item = document.createElement("div");
-          item.className = "session-item";
-          const chrome = c.chrome_url
-            ? `<a href="${c.chrome_url}" target="_blank" rel="noopener">Open Chrome</a>`
-            : "—";
-          item.innerHTML =
-            `<strong>${c.name || "Patient"}</strong>` +
-            `<div class="row">` +
-            `<span>${c.phone || ""}</span>` +
-            `<span>call_id: <code>${c.call_id || "—"}</code></span>` +
-            `<span>${c.when || ""}</span>` +
-            `<span>${chrome}</span>` +
-            `</div>`;
-          list.appendChild(item);
+          if (!c.when && c.when_iso) c.when = formatCallDateTime(c.when_iso);
+          if (!c.when) c.when = "—";
+          if (!c.status) c.status = "In progress";
+          const callId = c.call_id || "";
+          const tr = document.createElement("tr");
+          tr.innerHTML =
+            `<td class="name-cell">${escapeHtml(c.name || "Patient")}</td>` +
+            `<td><span class="call-status ${statusClass(c.status)}" data-role="status">${escapeHtml(
+              c.status
+            )}</span></td>` +
+            `<td class="time-cell">${escapeHtml(c.when)}</td>` +
+            `<td>` +
+            `<button type="button" class="btn btn-secondary btn-sm" data-role="transcript"${
+              callId ? "" : " disabled"
+            }>View</button>` +
+            `</td>`;
+          const trPanel = document.createElement("tr");
+          trPanel.className = "transcript-row";
+          trPanel.innerHTML =
+            `<td colspan="4"><div class="transcript-panel" data-role="transcript-panel"></div></td>`;
+          const btn = tr.querySelector('[data-role="transcript"]');
+          const statusEl = tr.querySelector('[data-role="status"]');
+          const panel = trPanel.querySelector('[data-role="transcript-panel"]');
+          btn.addEventListener("click", () => toggleTranscript(c, panel, btn, statusEl));
+          list.appendChild(tr);
+          list.appendChild(trPanel);
         });
+      }
+
+      async function showCallsView() {
+        renderCalls();
+        await refreshCallStatuses();
+        renderCalls();
       }
 
       document.getElementById("btn-clear-calls").addEventListener("click", () => {
@@ -896,6 +1743,340 @@
         sessionStorage.removeItem(CALLS_KEY);
         renderCalls();
       });
+
+      /* ---- Bulk call ---- */
+      const uploadZone = document.getElementById("upload-zone");
+      const bulkFileInput = document.getElementById("bulk-file");
+      const fileChip = document.getElementById("file-chip");
+      const bulkTbody = document.getElementById("bulk-tbody");
+      const bulkEmpty = document.getElementById("bulk-empty");
+      const bulkTableWrap = document.getElementById("bulk-table-wrap");
+      const bulkSummary = document.getElementById("bulk-summary");
+      const btnBulkStart = document.getElementById("btn-bulk-start");
+
+      function renderBulkList() {
+        bulkTbody.innerHTML = "";
+        if (!bulkPatients.length) {
+          bulkEmpty.style.display = "block";
+          bulkTableWrap.style.display = "none";
+          bulkSummary.textContent = "";
+          return;
+        }
+        bulkEmpty.style.display = "none";
+        bulkTableWrap.style.display = "block";
+        bulkPatients.forEach((p, idx) => {
+          const tr = document.createElement("tr");
+          const status = p.status || (p.error ? "error" : "ready");
+          const pillClass =
+            status === "placed" || status === "ok"
+              ? "ok"
+              : status === "error" || status === "failed"
+                ? "err"
+                : status === "calling"
+                  ? "run"
+                  : "";
+          const statusLabel =
+            status === "placed" || status === "ok"
+              ? "Placed"
+              : status === "error" || status === "failed"
+                ? "Failed"
+                : status === "calling"
+                  ? "Calling…"
+                  : p.error
+                    ? "Invalid"
+                    : "Ready";
+          tr.innerHTML =
+            `<td>${idx + 1}</td>` +
+            `<td>${escapeHtml(p.name || "")}</td>` +
+            `<td>${escapeHtml(p.phone_number || "")}</td>` +
+            `<td>${escapeHtml(p.form_name || "")}</td>` +
+            `<td><span class="status-pill ${pillClass}" title="${escapeAttr(p.error || p.call_id || "")}">${statusLabel}</span></td>` +
+            `<td><button type="button" class="icon-trash" data-idx="${idx}" title="Remove" aria-label="Remove patient">` +
+            `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">` +
+            `<path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/></svg></button></td>`;
+          bulkTbody.appendChild(tr);
+        });
+        bulkTbody.querySelectorAll(".icon-trash").forEach((btn) => {
+          btn.addEventListener("click", () => {
+            const i = Number(btn.getAttribute("data-idx"));
+            if (!Number.isFinite(i)) return;
+            bulkPatients.splice(i, 1);
+            renderBulkList();
+          });
+        });
+        const ready = bulkPatients.filter((p) => !p.error).length;
+        const bad = bulkPatients.length - ready;
+        bulkSummary.textContent =
+          `${bulkPatients.length} patient${bulkPatients.length === 1 ? "" : "s"}` +
+          ` · ${ready} ready` +
+          (bad ? ` · ${bad} need attention` : "") +
+          ` · up to ${settings.maxConcurrent || 20} calls at once`;
+      }
+
+      function mergePatients(incoming) {
+        const seen = new Set(
+          bulkPatients.map((p) => `${digitsOnly(p.phone_number)}|${(p.name || "").toLowerCase()}`)
+        );
+        let added = 0;
+        (incoming || []).forEach((raw) => {
+          const phone = String(raw.phone_number || raw.phone || "").trim();
+          const name = String(raw.name || "").trim() ||
+            [raw.first_name, raw.last_name].filter(Boolean).join(" ").trim();
+          const key = `${digitsOnly(phone)}|${name.toLowerCase()}`;
+          if (seen.has(key)) return;
+          seen.add(key);
+          bulkPatients.push({
+            id: uid(),
+            first_name: String(raw.first_name || "").trim(),
+            last_name: String(raw.last_name || "").trim(),
+            name,
+            phone_number: phone,
+            form_name: String(raw.form_name || "").trim() || "AI Medicaid Assist",
+            error: raw.ok === false ? String(raw.error || "Invalid row") : String(raw.error || ""),
+            status: raw.ok === false ? "error" : "ready",
+            call_id: "",
+          });
+          added += 1;
+        });
+        renderBulkList();
+        return added;
+      }
+
+      async function handleBulkFile(file) {
+        if (!file) return;
+        clearBanner(bulkBanner);
+        bulkMeta.className = "meta";
+        bulkMeta.innerHTML = "";
+        fileChip.className = "file-chip show";
+        fileChip.textContent = `Selected: ${file.name}`;
+        setBanner(bulkBanner, "info", "Parsing file…");
+        const body = new FormData();
+        body.append("file", file);
+        try {
+          const res = await fetch("/form-filler/bulk/parse", {
+            method: "POST",
+            body,
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            const detail = data.detail || data.error || res.statusText || "Parse failed";
+            throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+          }
+          const rows = Array.isArray(data.patients) ? data.patients : [];
+          const added = mergePatients(rows);
+          const valid = Number(data.valid_count || 0);
+          const errs = Number(data.error_count || 0);
+          let msg = `Loaded <strong>${added}</strong> patient${added === 1 ? "" : "s"} from ${escapeHtml(file.name)}.`;
+          if (errs) msg += ` ${errs} row${errs === 1 ? "" : "s"} had issues.`;
+          if (!valid && !added) msg = data.error || "No valid patients found in that file.";
+          setBanner(bulkBanner, valid || added ? "ok" : "err", msg);
+          if (Array.isArray(data.errors) && data.errors.length) {
+            bulkMeta.className = "meta show";
+            bulkMeta.innerHTML = data.errors
+              .slice(0, 8)
+              .map((e) => escapeHtml(e))
+              .join("<br/>");
+          }
+        } catch (err) {
+          setBanner(bulkBanner, "err", err.message || "Could not parse file.");
+        }
+      }
+
+      document.getElementById("btn-choose-file").addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        bulkFileInput.click();
+      });
+      uploadZone.addEventListener("click", (ev) => {
+        if (ev.target.closest("a,button,input")) return;
+        bulkFileInput.click();
+      });
+      uploadZone.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter" || ev.key === " ") {
+          ev.preventDefault();
+          bulkFileInput.click();
+        }
+      });
+      bulkFileInput.addEventListener("change", () => {
+        const file = bulkFileInput.files && bulkFileInput.files[0];
+        handleBulkFile(file);
+        bulkFileInput.value = "";
+      });
+      ["dragenter", "dragover"].forEach((evt) => {
+        uploadZone.addEventListener(evt, (ev) => {
+          ev.preventDefault();
+          uploadZone.classList.add("dragover");
+        });
+      });
+      ["dragleave", "drop"].forEach((evt) => {
+        uploadZone.addEventListener(evt, (ev) => {
+          ev.preventDefault();
+          uploadZone.classList.remove("dragover");
+        });
+      });
+      uploadZone.addEventListener("drop", (ev) => {
+        const file = ev.dataTransfer && ev.dataTransfer.files && ev.dataTransfer.files[0];
+        handleBulkFile(file);
+      });
+
+      document.getElementById("btn-bulk-add").addEventListener("click", () => {
+        const first = document.getElementById("bulk_first_name").value.trim();
+        const last = document.getElementById("bulk_last_name").value.trim();
+        const phone = buildE164From(
+          document.getElementById("bulk_phone_cc"),
+          document.getElementById("bulk_phone_local")
+        );
+        const formName = document.getElementById("bulk_form_name").value.trim();
+        if (!first || !last) {
+          setBanner(bulkBanner, "err", "First name and last name are required to add a patient.");
+          return;
+        }
+        if (digitsOnly(phone).length < 10) {
+          setBanner(bulkBanner, "err", "Enter a valid patient phone number (at least 10 digits).");
+          return;
+        }
+        mergePatients([
+          {
+            ok: true,
+            first_name: first,
+            last_name: last,
+            name: (first + " " + last).replace(/\s+/g, " ").trim(),
+            phone_number: phone,
+            form_name: formName || "AI Medicaid Assist",
+          },
+        ]);
+        document.getElementById("bulk_first_name").value = "";
+        document.getElementById("bulk_last_name").value = "";
+        document.getElementById("bulk_phone_local").value = "";
+        document.getElementById("bulk_form_name").value = "";
+        setBanner(bulkBanner, "ok", "Patient added to the bulk list.");
+      });
+
+      document.getElementById("btn-bulk-clear").addEventListener("click", () => {
+        if (!bulkPatients.length) return;
+        if (!window.confirm("Clear the bulk patient list?")) return;
+        bulkPatients = [];
+        fileChip.className = "file-chip";
+        fileChip.textContent = "";
+        clearBanner(bulkBanner);
+        bulkMeta.className = "meta";
+        bulkMeta.innerHTML = "";
+        renderBulkList();
+      });
+
+      btnBulkStart.addEventListener("click", async () => {
+        if (bulkBusy) return;
+        const ready = bulkPatients.filter((p) => !p.error && digitsOnly(p.phone_number).length >= 10);
+        if (!ready.length) {
+          setBanner(bulkBanner, "err", "Add at least one valid patient before starting bulk calls.");
+          return;
+        }
+        const maxConcurrent = settings.maxConcurrent || 20;
+        bulkBusy = true;
+        btnBulkStart.disabled = true;
+        btnBulkStart.textContent = "Calling…";
+        ready.forEach((p) => {
+          p.status = "calling";
+          p.error = "";
+        });
+        renderBulkList();
+        setBanner(
+          bulkBanner,
+          "info",
+          `Placing ${ready.length} call${ready.length === 1 ? "" : "s"}` +
+            ` (up to ${maxConcurrent} at once)…`
+        );
+        bulkMeta.className = "meta";
+        bulkMeta.innerHTML = "";
+
+        try {
+          const res = await fetch("/form-filler/outbound/bulk/", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Accept: "application/json" },
+            body: JSON.stringify({
+              patients: ready.map((p) => ({
+                first_name: p.first_name || "",
+                last_name: p.last_name || "",
+                name: p.name || "",
+                phone_number: p.phone_number,
+                form_name: p.form_name || "AI Medicaid Assist",
+              })),
+              max_concurrent: maxConcurrent,
+              form_name: "AI Medicaid Assist",
+              agent_number: activeAgentNumber(),
+            }),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            const detail = data.detail || data.error || res.statusText || "Bulk call failed";
+            throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+          }
+
+          const byPhone = new Map();
+          (data.results || []).forEach((r) => {
+            byPhone.set(digitsOnly(r.phone_number), r);
+          });
+          ready.forEach((p) => {
+            const r = byPhone.get(digitsOnly(p.phone_number));
+            if (!r) {
+              p.status = "failed";
+              p.error = "No result returned.";
+              return;
+            }
+            p.call_id = r.call_id || "";
+            p.chrome_url = r.chrome_url || "";
+            if (r.ok) {
+              p.status = "placed";
+              p.error = "";
+              const now = new Date();
+              calls.push({
+                name: p.name,
+                phone: p.phone_number,
+                call_id: p.call_id,
+                chrome_url: p.chrome_url,
+                when_iso: now.toISOString(),
+                when: formatCallDateTime(now),
+                status: "In progress",
+              });
+            } else {
+              p.status = "failed";
+              p.error = r.error || "Failed to place call.";
+            }
+          });
+          sessionStorage.setItem(CALLS_KEY, JSON.stringify(calls.slice(-100)));
+          renderBulkList();
+          const placed = Number(data.placed || 0);
+          const failed = Number(data.failed || 0);
+          setBanner(
+            bulkBanner,
+            placed ? "ok" : "err",
+            `Bulk run finished: <strong>${placed}</strong> placed` +
+              (failed ? `, <strong>${failed}</strong> failed` : "") +
+              ` (concurrency ${data.max_concurrent || maxConcurrent}).`
+          );
+          bulkMeta.className = "meta show";
+          bulkMeta.innerHTML =
+            `attempted: <code>${data.attempted || ready.length}</code>` +
+            ` · placed: <code>${placed}</code>` +
+            ` · failed: <code>${failed}</code>`;
+        } catch (err) {
+          ready.forEach((p) => {
+            if (p.status === "calling") {
+              p.status = "failed";
+              p.error = err.message || "Failed";
+            }
+          });
+          renderBulkList();
+          setBanner(bulkBanner, "err", err.message || "Failed to place bulk calls.");
+        } finally {
+          bulkBusy = false;
+          btnBulkStart.disabled = false;
+          btnBulkStart.textContent = "Start bulk calls";
+        }
+      });
+
+      renderBulkList();
+      fillSettingsForm();
 
       /* ---- Live agents ---- */
       function renderAgents() {
@@ -932,10 +2113,7 @@
             `<div class="field full">` +
             `<label>Phone Number</label>` +
             `<div class="phone-row">` +
-            `<select data-role="cc">` +
-            `<option value="+1"${agent.cc === "+1" ? " selected" : ""}>+1</option>` +
-            `<option value="+91"${agent.cc === "+91" ? " selected" : ""}>+91</option>` +
-            `</select>` +
+            `<div class="cc-picker" data-role="cc-picker"></div>` +
             `<input data-role="phone" value="${escapeAttr(agent.phone || "")}" inputmode="tel" placeholder="(730) 523-0194" />` +
             `</div></div></div>`;
 
@@ -943,8 +2121,15 @@
           const titleEl = card.querySelector('[data-role="title"]');
           const activeInput = card.querySelector('[data-role="active"]');
           const activeLabel = card.querySelector('[data-role="active-label"]');
-          const ccSelect = card.querySelector('[data-role="cc"]');
+          const ccPickerRoot = card.querySelector('[data-role="cc-picker"]');
           const phoneInput = card.querySelector('[data-role="phone"]');
+          const ccHidden = mountCcPicker(ccPickerRoot, {
+            value: agent.cc || "+1",
+            onChange: (value) => {
+              agent.cc = value;
+            },
+          });
+          if (ccHidden) ccHidden.setAttribute("data-role", "cc");
 
           nameInput.addEventListener("input", () => {
             agent.name = nameInput.value;
@@ -953,9 +2138,6 @@
           activeInput.addEventListener("change", () => {
             agent.active = activeInput.checked;
             activeLabel.textContent = agent.active ? "Active" : "Inactive";
-          });
-          ccSelect.addEventListener("change", () => {
-            agent.cc = ccSelect.value;
           });
           phoneInput.addEventListener("input", () => {
             agent.phone = phoneInput.value;
@@ -968,17 +2150,6 @@
 
           agentList.appendChild(card);
         });
-      }
-
-      function escapeHtml(s) {
-        return String(s)
-          .replace(/&/g, "&amp;")
-          .replace(/</g, "&lt;")
-          .replace(/>/g, "&gt;")
-          .replace(/"/g, "&quot;");
-      }
-      function escapeAttr(s) {
-        return escapeHtml(s).replace(/'/g, "&#39;");
       }
 
       document.getElementById("btn-add-agent").addEventListener("click", () => {
@@ -1033,6 +2204,19 @@
         renderAgents();
       });
 
+      document.addEventListener("click", (ev) => {
+        document.querySelectorAll(".cc-picker.open").forEach((picker) => {
+          if (!picker.contains(ev.target)) picker.classList.remove("open");
+        });
+      });
+      document.addEventListener("keydown", (ev) => {
+        if (ev.key !== "Escape") return;
+        document.querySelectorAll(".cc-picker.open").forEach((picker) => {
+          picker.classList.remove("open");
+        });
+      });
+
+      initCcPickers();
       renderAgents();
       renderCalls();
     })();

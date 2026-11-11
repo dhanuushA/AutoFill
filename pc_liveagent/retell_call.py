@@ -662,6 +662,199 @@ def fetch_retell_call(call_id: str) -> dict[str, Any]:
     return {}
 
 
+def _utterance_text(turn: dict[str, Any]) -> str:
+    content = turn.get("content")
+    if content is None:
+        content = turn.get("content_text")
+    if isinstance(content, str) and content.strip():
+        return content.strip()
+    if isinstance(content, list):
+        bits: list[str] = []
+        for part in content:
+            if isinstance(part, dict):
+                bits.append(str(part.get("text") or part.get("content") or "").strip())
+            else:
+                bits.append(str(part or "").strip())
+        joined = " ".join(b for b in bits if b).strip()
+        if joined:
+            return joined
+    words = turn.get("words")
+    if isinstance(words, list) and words:
+        bits = []
+        for item in words:
+            if isinstance(item, dict):
+                bits.append(str(item.get("word") or item.get("text") or ""))
+            else:
+                bits.append(str(item or ""))
+        return " ".join(b for b in bits if b).strip()
+    return ""
+
+
+def transcript_turns_from_call(call: dict[str, Any]) -> list[dict[str, Any]]:
+    """Readable agent/user turns from a Retell get-call payload."""
+    turns: list[dict[str, Any]] = []
+    raw = call.get("transcript_object") or call.get("transcript_with_tool_calls") or []
+    if not isinstance(raw, list):
+        raw = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or item.get("speaker") or "").strip().lower()
+        if role in ("tool_call_invocation", "tool_call_result", "dtmf", "tool"):
+            continue
+        text = _utterance_text(item)
+        if not text:
+            continue
+        if role in ("agent", "assistant", "bot"):
+            speaker = "agent"
+        elif role in ("user", "caller", "human", "patient"):
+            speaker = "user"
+        else:
+            speaker = role or "speaker"
+        entry: dict[str, Any] = {"role": speaker, "content": text}
+        for key in ("start", "end", "words"):
+            if key in item:
+                entry[key] = item.get(key)
+        turns.append(entry)
+    return turns
+
+
+def transcript_text_from_call(call: dict[str, Any]) -> str:
+    text = str(call.get("transcript") or "").strip()
+    if text:
+        return text
+    lines = []
+    for turn in transcript_turns_from_call(call):
+        role = str(turn.get("role") or "speaker").strip()
+        content = str(turn.get("content") or "").strip()
+        if content:
+            label = "Agent" if role == "agent" else ("User" if role == "user" else role.title())
+            lines.append(f"{label}: {content}")
+    return "\n".join(lines).strip()
+
+
+def call_status_label(call: dict[str, Any] | None) -> str:
+    """Map Retell call_status + disconnection_reason to call-log labels."""
+    data = call or {}
+    status = str(data.get("call_status") or data.get("status") or "").strip().lower()
+    reason = str(data.get("disconnection_reason") or "").strip().lower()
+
+    if status in ("registered", "ringing", "in_progress"):
+        return "In progress"
+    if status == "ongoing":
+        return "Voice agent"
+    if reason in ("dial_no_answer", "no_answer"):
+        return "No answer"
+    if reason in (
+        "dial_busy",
+        "dial_failed",
+        "user_declined",
+        "marked_as_spam",
+        "invalid_destination",
+        "telephony_provider_permission_denied",
+        "telephony_provider_unavailable",
+        "sip_routing_error",
+        "network_blocked",
+    ):
+        return "Declined"
+    if reason in ("voicemail_reached", "voicemail"):
+        return "Voicemail"
+    if reason in ("call_take_over", "transfer_bridged", "transfer_completed"):
+        return "Voice agent"
+    if status == "not_connected":
+        if "no_answer" in reason:
+            return "No answer"
+        if reason:
+            return "Declined"
+        return "No answer"
+    if status == "error":
+        return "Declined"
+    if status == "ended":
+        # Connected AI voice call that finished normally.
+        if reason in ("user_hangup", "agent_hangup", "inactivity", "max_duration_reached"):
+            return "Successful"
+        if reason:
+            return "Successful"
+        return "Successful"
+    return "In progress"
+
+
+def fetch_call_transcript(call_id: str) -> dict[str, Any]:
+    """Pull transcript + metadata for a call from Retell's get-call API."""
+    cid = (call_id or "").strip()
+    if not cid:
+        return {
+            "ok": False,
+            "error": "call_id is required.",
+            "status_code": 400,
+        }
+    if not config.PC_FORMFILLER_RETELL_API_KEY:
+        return {
+            "ok": False,
+            "error": "PC_FORMFILLER_RETELL_API_KEY is not set in .env",
+            "status_code": 503,
+        }
+
+    last_err = ""
+    last_status = 502
+    parsed: Any = None
+    for path in (f"/v2/get-call/{cid}", f"/get-call/{cid}"):
+        status_code, body, err = _request("GET", path)
+        last_status = status_code
+        last_err = err or ""
+        if status_code < 400 and isinstance(body, dict):
+            parsed = body
+            break
+    if not isinstance(parsed, dict):
+        return {
+            "ok": False,
+            "call_id": cid,
+            "error": last_err or f"Retell get-call failed ({last_status}).",
+            "status_code": last_status if last_status >= 400 else 502,
+        }
+
+    turns = transcript_turns_from_call(parsed)
+    transcript = transcript_text_from_call(parsed)
+    call_status = str(
+        parsed.get("call_status") or parsed.get("status") or ""
+    ).strip()
+    disconnection_reason = str(parsed.get("disconnection_reason") or "").strip()
+    status_label = call_status_label(parsed)
+    duration_ms = parsed.get("duration_ms")
+    try:
+        duration_ms_i = int(duration_ms) if duration_ms is not None else None
+    except (TypeError, ValueError):
+        duration_ms_i = None
+
+    ready = bool(transcript or turns)
+    note = ""
+    if not ready:
+        if call_status in ("registered", "ongoing", "in_progress", "ringing"):
+            note = "Transcript is not ready yet. Refresh after the call ends."
+        else:
+            note = "No transcript is available for this call yet."
+
+    return {
+        "ok": True,
+        "call_id": cid,
+        "call_status": call_status,
+        "disconnection_reason": disconnection_reason,
+        "status_label": status_label,
+        "duration_ms": duration_ms_i,
+        "start_timestamp": parsed.get("start_timestamp"),
+        "end_timestamp": parsed.get("end_timestamp"),
+        "from_number": parsed.get("from_number") or "",
+        "to_number": parsed.get("to_number") or "",
+        "recording_url": parsed.get("recording_url") or "",
+        "public_log_url": parsed.get("public_log_url") or "",
+        "transcript": transcript,
+        "turns": turns,
+        "ready": ready,
+        "note": note,
+        "source": "retell",
+    }
+
+
 def nudge_agent_speak(call_id: str, question: str) -> bool:
     """Ask the live Retell agent to speak the next eligibility question.
 

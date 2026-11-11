@@ -4,14 +4,14 @@ import re
 import sys
 import time
 from pathlib import Path
-
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, WebSocket
-from fastapi.responses import HTMLResponse
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket
+from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import config
 from .browser import close_browser
+from .bulk_outbound import parse_upload, patients_from_payload, place_bulk_calls
 from .call_turn import register_outbound_caller
 from .form_bridge import (
     enrich_webhook_call,
@@ -26,7 +26,7 @@ from .form_bridge import (
     transcript_from_call,
 )
 from .live_form import ELIG_QUESTIONS, describe_live_browser, get_session
-from .retell_call import place_form_filler_call
+from .retell_call import fetch_call_transcript, place_form_filler_call
 from .retell_llm_ws import handle_retell_llm_websocket
 
 if sys.platform == "win32":
@@ -61,6 +61,24 @@ class FormFillerCallIn(BaseModel):
 
 
 class WelcomeTestIn(BaseModel):
+    form_url: str | None = None
+
+
+class BulkPatientIn(BaseModel):
+    first_name: str = ""
+    last_name: str = ""
+    name: str = ""
+    phone_number: str = ""
+    phone: str = ""
+    form_name: str = ""
+
+
+class BulkOutboundIn(BaseModel):
+    patients: list[BulkPatientIn] = Field(default_factory=list)
+    max_concurrent: int = Field(default=20, ge=1, le=20)
+    form_name: str = ""
+    agent_id: str = ""
+    agent_number: str = ""
     form_url: str | None = None
 
 
@@ -156,6 +174,84 @@ async def form_filler_outbound(
     return result
 
 
+@app.get("/form-filler/bulk/template.csv")
+def form_filler_bulk_template():
+    """Downloadable CSV template for bulk outreach."""
+    body = (
+        "first_name,last_name,phone,reason\n"
+        "Jane,Doe,+13025550199,Medicaid renewal\n"
+        "John,Smith,+13025550188,Eligibility check\n"
+    )
+    return Response(
+        content=body,
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": 'attachment; filename="bulk-call-template.csv"'
+        },
+    )
+
+
+@app.post("/form-filler/bulk/parse")
+async def form_filler_bulk_parse(
+    file: UploadFile = File(...),
+    form_name: str = Form(""),
+):
+    """Parse an uploaded CSV/Excel file into patient rows for the bulk UI."""
+    filename = (file.filename or "").strip() or "upload.csv"
+    lower = filename.lower()
+    if not lower.endswith((".csv", ".txt", ".xlsx", ".xlsm")):
+        raise HTTPException(
+            status_code=400,
+            detail="Upload a .csv or .xlsx file.",
+        )
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    if len(data) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File too large (max 5 MB).")
+    try:
+        parsed = parse_upload(
+            filename, data, default_form_name=(form_name or "").strip()
+        )
+    except Exception as exc:
+        logger.exception("bulk parse failed for %s", filename)
+        raise HTTPException(
+            status_code=400, detail=f"Could not parse file: {exc}"
+        ) from exc
+    return parsed
+
+
+@app.post("/form-filler/outbound/bulk/")
+async def form_filler_outbound_bulk(payload: BulkOutboundIn, request: Request):
+    """Place outbound calls for many patients, capped by max_concurrent."""
+    default_form = (payload.form_name or "").strip() or "AI Medicaid Assist"
+    patients = patients_from_payload(
+        [p.model_dump() for p in payload.patients],
+        default_form_name=default_form,
+    )
+    valid = [p for p in patients if p.get("ok")]
+    if not valid:
+        raise HTTPException(
+            status_code=400,
+            detail=patients[0].get("error") if patients else "No patients provided.",
+        )
+    base = _request_base_url(request)
+    form_url = (payload.form_url or "").strip() or config.POINTCARE_URL
+
+    def _chrome(cid: str) -> str:
+        return _chrome_session_url(base, cid)
+
+    result = await place_bulk_calls(
+        patients=patients,
+        max_concurrent=payload.max_concurrent,
+        agent_number=payload.agent_number or "",
+        form_url=form_url,
+        agent_id=payload.agent_id or "",
+        chrome_url_builder=_chrome,
+    )
+    return result
+
+
 @app.post("/form-filler/welcome/")
 async def form_filler_welcome(
     request: Request, payload: WelcomeTestIn | None = None
@@ -182,6 +278,18 @@ async def form_filler_welcome(
         "browser": browser,
         "chrome_url": browser.get("open_url") or browser.get("url") or "",
     }
+
+
+@app.get("/form-filler/calls/{call_id}/transcript")
+async def form_filler_call_transcript(call_id: str):
+    """Fetch the Retell-stored transcript for a placed outbound call."""
+    result = await asyncio.to_thread(fetch_call_transcript, call_id)
+    if not result.get("ok"):
+        raise HTTPException(
+            status_code=int(result.get("status_code") or 502),
+            detail=result.get("error") or "Failed to fetch transcript from Retell.",
+        )
+    return result
 
 
 @app.get("/form-filler/sessions/{call_id}")

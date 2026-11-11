@@ -6,7 +6,9 @@ from dotenv import load_dotenv
 import os
 
 ROOT = Path(__file__).resolve().parent.parent
+# Prefer repo-root .env; also load pc_liveagent/.env for local layouts.
 load_dotenv(ROOT / ".env")
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
 # Fast Collect Mode semantic resolver (Haiku 5.5 + low effort).
